@@ -27,20 +27,47 @@ pub fn service_or_404(app: &AppState, a: &Auth, id: &str, role: Role) -> ApiResu
     Ok(s)
 }
 
+/// Each visible service's state, from one container listing per server.
+async fn states(app: &AppState, services: &[Service]) -> ApiResult<BTreeMap<String, Value>> {
+    let mut reps = crate::runtime::all_replicas(app).await?;
+    Ok(services.iter().map(|s| (s.id.clone(), crate::runtime::status_of(app, s, reps.remove(&s.id).unwrap_or_default()))).collect())
+}
+
 pub async fn list_projects(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
     let visible = a.0.visible_projects();
     let all = store::projects(&app)?;
-    let services = store::services(&app, None)?;
+    let services: Vec<Service> = store::services(&app, None)?.into_iter().filter(|s| a.0.can(&s.project_id, Role::Viewer)).collect();
+    let status = states(&app, &services).await?;
     let out: Vec<Value> = all
         .into_iter()
         .filter(|p| visible.as_ref().is_none_or(|v| v.contains(&p.id)))
         .map(|p| {
-            let count = services.iter().filter(|s| s.project_id == p.id).count();
+            let mine: Vec<&Service> = services.iter().filter(|s| s.project_id == p.id).collect();
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for s in &mine {
+                let state = status.get(&s.id).and_then(|v| v["state"].as_str()).unwrap_or("unknown");
+                *counts.entry(state.to_string()).or_default() += 1;
+            }
             json!({ "id": p.id, "name": p.name, "description": p.description, "created_at": p.created_at,
-                    "services": count, "role": a.0.role_in(&p.id).map(|r| r.as_str()) })
+                    "services": mine.len(), "states": counts, "role": a.0.role_in(&p.id).map(|r| r.as_str()) })
         })
         .collect();
     Ok(Json(json!({ "projects": out })))
+}
+
+/// Every service the caller can see, across projects.
+pub async fn list_services(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    let services: Vec<Service> = store::services(&app, None)?.into_iter().filter(|s| a.0.can(&s.project_id, Role::Viewer)).collect();
+    let mut status = states(&app, &services).await?;
+    let out: Vec<Value> = services
+        .into_iter()
+        .map(|s| {
+            let st = status.remove(&s.id).unwrap_or_default();
+            json!({ "id": s.id, "name": s.name, "project": s.project, "project_id": s.project_id, "kind": s.kind,
+                    "state": st["state"], "running": st["running"], "desired": st["desired"] })
+        })
+        .collect();
+    Ok(Json(json!({ "services": out })))
 }
 
 #[derive(Deserialize)]
@@ -68,9 +95,11 @@ pub async fn create_project(State(app): State<AppState>, a: Auth, Json(b): Json<
 
 pub async fn get_project(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let p = project_or_404(&app, &a, &id, Role::Viewer)?;
+    let list = store::services(&app, Some(&p.id))?;
+    let mut status = states(&app, &list).await?;
     let mut services = vec![];
-    for s in store::services(&app, Some(&p.id))? {
-        let status = crate::runtime::service_status(&app, &s).await;
+    for s in list {
+        let status = status.remove(&s.id).unwrap_or_default();
         services.push(json!({ "id": s.id, "name": s.name, "kind": s.kind, "source": s.spec.source, "status": status }));
     }
     let vars: Vec<String> = store::project_vars(&app, &p.id)?.into_keys().collect();
@@ -346,9 +375,11 @@ pub async fn get_service(State(app): State<AppState>, a: Auth, Path(id): Path<St
     let env = store::env_names(&app, &s.id)?;
     let files: Vec<String> = store::files(&app, &s.id)?.into_iter().map(|(t, _)| t).collect();
     let last = crate::deploy::recent(&app, &s.id, 1)?.into_iter().next();
+    // Ports the running image declares (EXPOSE), to suggest a domain's port.
+    let exposed: Vec<u16> = app.db.get_state(&format!("exposed:{}", s.id))?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     Ok(Json(json!({
         "service": s, "status": status, "domains": domains, "env": env, "files": files, "last_deploy": last,
-        "role": a.0.role_in(&s.project_id).map(|r| r.as_str()),
+        "exposed_ports": exposed, "role": a.0.role_in(&s.project_id).map(|r| r.as_str()),
     })))
 }
 
@@ -461,7 +492,9 @@ pub struct DomainBody {
     host: Option<String>,
     path: Option<String>,
     port: Option<u16>,
-    container: Option<String>,
+    /// Compose container the domain points at; null clears it.
+    #[serde(default, deserialize_with = "super::present")]
+    container: Option<Option<String>>,
     https: Option<bool>,
     via_tunnel: Option<bool>,
     options: Option<DomainOptions>,
@@ -470,6 +503,21 @@ pub struct DomainBody {
 pub async fn list_domains(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Viewer)?;
     Ok(Json(json!({ "domains": store::domains(&app, Some(&s.id))? })))
+}
+
+/// New basic-auth passwords become Argon2 hashes; users sent without one keep theirs.
+fn hash_basic_auth(mut opts: DomainOptions, previous: Option<&DomainOptions>) -> ApiResult<DomainOptions> {
+    for u in &mut opts.basic_auth {
+        match u.password.take().filter(|p| !p.is_empty()) {
+            Some(p) => u.hash = crate::auth::hash_password(&p)?,
+            None if !u.hash.is_empty() => {}
+            None => {
+                let kept = previous.and_then(|p| p.basic_auth.iter().find(|o| o.user == u.user)).map(|o| o.hash.clone());
+                u.hash = kept.ok_or_else(|| ApiError::bad_request(format!("set a password for {}", u.user)))?;
+            }
+        }
+    }
+    Ok(opts)
 }
 
 fn validate_domain(host: &str, path: &str, port: u16, opts: &DomainOptions) -> ApiResult<()> {
@@ -496,13 +544,13 @@ pub async fn create_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
     let host = b.host.unwrap_or_default().trim().to_lowercase();
     let path = b.path.unwrap_or_else(|| "/".into());
     let port = b.port.or_else(|| s.spec.database.as_ref().map(|d| databases::preset(d.engine).port)).unwrap_or(0);
-    let opts = b.options.unwrap_or_default();
+    let opts = hash_basic_auth(b.options.unwrap_or_default(), None)?;
     validate_domain(&host, &path, port, &opts)?;
     let did = util::id();
     let opts_json = serde_json::to_string(&opts)?;
     app.db.conn().execute(
         "INSERT INTO domains (id, service_id, host, path, port, container, https, via_tunnel, options, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![did, s.id, host, path, port, b.container, b.https.unwrap_or(true), b.via_tunnel.unwrap_or(false), opts_json, util::now()],
+        params![did, s.id, host, path, port, b.container.flatten(), b.https.unwrap_or(true), b.via_tunnel.unwrap_or(false), opts_json, util::now()],
     )?;
     app.audit(Some(&a.0), "domain.create", Some(&s.project_id), Some(&s.id), Some(&host), None);
     crate::proxy::reload(&app);
@@ -516,12 +564,15 @@ pub async fn update_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
     let host = b.host.map(|h| h.trim().to_lowercase()).unwrap_or(d.host);
     let path = b.path.unwrap_or(d.path);
     let port = b.port.unwrap_or(d.port);
-    let opts = b.options.unwrap_or(d.options);
+    let opts = match b.options {
+        Some(o) => hash_basic_auth(o, Some(&d.options))?,
+        None => d.options,
+    };
     validate_domain(&host, &path, port, &opts)?;
     let opts_json = serde_json::to_string(&opts)?;
     app.db.conn().execute(
         "UPDATE domains SET host = ?1, path = ?2, port = ?3, container = ?4, https = ?5, via_tunnel = ?6, options = ?7 WHERE id = ?8",
-        params![host, path, port, b.container.or(d.container), b.https.unwrap_or(d.https), b.via_tunnel.unwrap_or(d.via_tunnel), opts_json, id],
+        params![host, path, port, b.container.unwrap_or(d.container), b.https.unwrap_or(d.https), b.via_tunnel.unwrap_or(d.via_tunnel), opts_json, id],
     )?;
     app.audit(Some(&a.0), "domain.update", Some(&s.project_id), Some(&s.id), Some(&host), None);
     crate::proxy::reload(&app);
@@ -542,7 +593,22 @@ pub async fn delete_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
 fn new_hook_url(app: &AppState, service_id: &str, headers: &HeaderMap) -> ApiResult<String> {
     let token = util::token(32);
     app.db.conn().execute("UPDATE services SET deploy_token_hash = ?1 WHERE id = ?2", params![util::sha256_hex(&token), service_id])?;
+    // Kept sealed too, so people allowed to read secrets can see the URL again.
+    let key = format!("hook:{service_id}");
+    app.db.set_state(&key, &crate::crypto::b64(&app.keys.seal_str(&key, &token)?))?;
     Ok(format!("{}/api/hooks/deploy/{token}", base_url(headers)))
+}
+
+/// The current deploy webhook URL (it deploys the service, so it needs secrets:read).
+pub async fn get_hook(State(app): State<AppState>, a: Auth, headers: HeaderMap, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let s = service_or_404(&app, &a, &id, Role::Operator)?;
+    if !a.0.can_read_secrets(&s.project_id) {
+        return Err(ApiError::forbidden("the webhook URL is a secret; it needs the secrets:read grant"));
+    }
+    let key = format!("hook:{}", s.id);
+    let sealed = app.db.get_state(&key)?.ok_or_else(|| ApiError::not_found("this webhook was made before URLs were kept; rotate it to get a new one"))?;
+    let token = app.keys.open_str(&key, &crate::crypto::unb64(&sealed)?)?;
+    Ok(Json(json!({ "url": format!("{}/api/hooks/deploy/{}", base_url(&headers), token.as_str()) })))
 }
 
 /// Replace the service's deploy webhook URL (the old one stops working).

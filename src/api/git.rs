@@ -86,6 +86,9 @@ pub async fn github_manifest(State(app): State<AppState>, a: Auth, headers: Head
         "url": base,
         "hook_attributes": { "url": format!("{base}/api/hooks/git/{id}"), "active": true },
         "redirect_url": format!("{base}/api/git/github/callback"),
+        // After installing on repositories, GitHub sends people back to the panel.
+        "setup_url": format!("{base}/settings/git"),
+        "setup_on_update": true,
         "public": false,
         "default_permissions": { "contents": "read", "metadata": "read", "statuses": "write", "pull_requests": "read" },
         "default_events": ["push"],

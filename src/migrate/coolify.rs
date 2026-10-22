@@ -332,7 +332,7 @@ pub fn map(rows: &HashMap<String, Vec<Value>>, running: &[Running], key: &[u8; 3
         if a["is_http_basic_auth_enabled"].as_bool() == Some(true) {
             let pw = ctx.secret(a, "http_basic_auth_password", &mut n.notes);
             match crate::auth::hash_password(&pw) {
-                Ok(hash) => options.basic_auth.push(BasicUser { user: st(a, "http_basic_auth_username").into(), hash }),
+                Ok(hash) => options.basic_auth.push(BasicUser { user: st(a, "http_basic_auth_username").into(), hash, password: None }),
                 Err(e) => n.notes.push(format!("basic auth was not moved: {e:#}")),
             }
         }

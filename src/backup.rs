@@ -187,6 +187,15 @@ fn summary(json_lines: &str) -> (Option<String>, Option<i64>) {
     (None, None)
 }
 
+/// Runs left mid-way by a crash or restart: mark them failed.
+pub fn recover_interrupted(app: &App) -> Result<()> {
+    app.db.conn().execute(
+        "UPDATE backup_runs SET status = 'failed', error = 'Tugport restarted during this run', finished_at = ?1 WHERE status = 'running'",
+        [util::now()],
+    )?;
+    Ok(())
+}
+
 /// Run a backup job now. Returns the run id.
 pub async fn run_job(app: &AppState, job_id: &str) -> Result<String> {
     let j = job(app, job_id)?;

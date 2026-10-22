@@ -61,30 +61,33 @@ async fn watch_on(app: AppState, docker: bollard::Docker) {
     use futures_util::StreamExt;
     let mut exits: HashMap<String, VecDeque<i64>> = HashMap::new();
     let mut quiet_until: HashMap<String, i64> = HashMap::new();
-    {
-        let filters = HashMap::from([
-            ("type".to_string(), vec!["container".to_string()]),
-            ("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)]),
-        ]);
-        let mut events = docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
-        while let Some(Ok(e)) = events.next().await {
-            let action = e.action.clone().unwrap_or_default();
-            let attrs = e.actor.and_then(|a| a.attributes).unwrap_or_default();
-            let Some(service_id) = attrs.get(runtime::L_SERVICE).cloned() else { continue };
-            let name = attrs.get("name").cloned().unwrap_or_default();
-            let Ok(Some(s)) = store::service(&app, &service_id) else { continue };
-            let now = util::now();
-            match action.as_str() {
-                "oom" => {
-                    app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "oom", "container": name }));
-                    crate::notify::event(&app, "service.oom", &format!("{}/{} ran out of memory", s.project, s.name), &format!("Container {name} was killed for using too much memory."), Some(&s)).await;
-                }
-                "die" => {
-                    let code = attrs.get("exitCode").cloned().unwrap_or_default();
-                    app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "exit", "container": name, "code": code }));
-                    if code == "0" {
-                        continue;
-                    }
+    // Containers being stopped on purpose (Docker sends them a kill first): their exit is no crash.
+    let mut stopping: HashMap<String, i64> = HashMap::new();
+    let filters = HashMap::from([
+        ("type".to_string(), vec!["container".to_string()]),
+        ("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)]),
+    ]);
+    let mut events = docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
+    while let Some(Ok(e)) = events.next().await {
+        let action = e.action.clone().unwrap_or_default();
+        let attrs = e.actor.and_then(|a| a.attributes).unwrap_or_default();
+        let Some(service_id) = attrs.get(runtime::L_SERVICE).cloned() else { continue };
+        let name = attrs.get("name").cloned().unwrap_or_default();
+        let Ok(Some(s)) = store::service(&app, &service_id) else { continue };
+        let now = util::now();
+        match action.as_str() {
+            "kill" => {
+                stopping.retain(|_, t| now - *t < 120);
+                stopping.insert(name.clone(), now);
+            }
+            "oom" => {
+                crate::notify::event(&app, "service.oom", &format!("{}/{} ran out of memory", s.project, s.name), &format!("Container {name} was killed for using too much memory."), Some(&s)).await;
+            }
+            "die" => {
+                let code = attrs.get("exitCode").cloned().unwrap_or_default();
+                let deliberate = stopping.remove(&name).is_some_and(|t| now - t < 120);
+                if code != "0" && !deliberate {
+                    *util::lock(&app.metrics.restarts).entry(service_id.clone()).or_default() += 1;
                     let q = exits.entry(service_id.clone()).or_default();
                     q.push_back(now);
                     while q.front().is_some_and(|t| now - t > 600) {
@@ -102,12 +105,21 @@ async fn watch_on(app: AppState, docker: bollard::Docker) {
                         .await;
                     }
                 }
-                "start" => app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "start", "container": name })),
-                a if a.starts_with("health_status") => {
-                    app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": a, "container": name }))
-                }
-                _ => {}
             }
+            _ => {}
+        }
+        if matches!(action.as_str(), "start" | "die" | "oom" | "pause" | "unpause") || action.starts_with("health_status") {
+            status_changed(&app, &s, &action, &name);
         }
     }
+}
+
+/// Tell watchers the service's state after one of its containers changed.
+fn status_changed(app: &AppState, s: &store::Service, event: &str, container: &str) {
+    let (app, s, event, container) = (app.clone(), s.clone(), event.to_string(), container.to_string());
+    tokio::spawn(async move {
+        let st = runtime::service_status(&app, &s).await;
+        let data = serde_json::json!({ "event": event, "container": container, "state": st["state"], "running": st["running"], "desired": st["desired"] });
+        app.emit("service.status", Some(&s.project_id), Some(&s.id), data);
+    });
 }

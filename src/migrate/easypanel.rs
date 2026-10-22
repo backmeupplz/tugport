@@ -514,7 +514,7 @@ fn map_domains(svc: &Value, mine: &[&Value], notes: &mut Vec<String>, placeholde
     let mut options = crate::model::DomainOptions::default();
     for u in svc["basicAuth"].as_array().into_iter().flatten() {
         match crate::auth::hash_password(st(u, "password")) {
-            Ok(hash) => options.basic_auth.push(BasicUser { user: st(u, "username").into(), hash }),
+            Ok(hash) => options.basic_auth.push(BasicUser { user: st(u, "username").into(), hash, password: None }),
             Err(e) => notes.push(format!("basic auth user {} was not moved: {e:#}", st(u, "username"))),
         }
     }

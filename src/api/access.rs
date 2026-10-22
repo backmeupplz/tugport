@@ -263,17 +263,29 @@ pub struct AccessSpec {
 }
 
 fn apply_access(conn: &rusqlite::Connection, user_id: &str, a: &AccessSpec) -> ApiResult<()> {
-    for g in &a.grants {
-        if !GRANTS.contains(&g.as_str()) {
+    apply_access_parts(conn, user_id, Some(a.all_projects_role), Some(&a.projects), Some(&a.grants))
+}
+
+/// Change only the parts of a user's access that were given.
+fn apply_access_parts(
+    conn: &rusqlite::Connection,
+    user_id: &str,
+    all_projects_role: Option<Option<Role>>,
+    projects: Option<&BTreeMap<String, Role>>,
+    grants: Option<&[String]>,
+) -> ApiResult<()> {
+    if let Some(grants) = grants {
+        if let Some(g) = grants.iter().find(|g| !GRANTS.contains(&g.as_str())) {
             return Err(ApiError::bad_request(format!("unknown grant {g}; known: {}", GRANTS.join(", "))));
         }
+        conn.execute("UPDATE users SET grants = ?1 WHERE id = ?2", params![serde_json::to_string(grants)?, user_id])?;
     }
-    conn.execute(
-        "UPDATE users SET all_projects_role = ?1, grants = ?2 WHERE id = ?3",
-        params![a.all_projects_role.map(|r| r.as_str()), serde_json::to_string(&a.grants)?, user_id],
-    )?;
+    if let Some(role) = all_projects_role {
+        conn.execute("UPDATE users SET all_projects_role = ?1 WHERE id = ?2", params![role.map(|r| r.as_str()), user_id])?;
+    }
+    let Some(projects) = projects else { return Ok(()) };
     conn.execute("DELETE FROM project_access WHERE user_id = ?1", [user_id])?;
-    for (project, role) in &a.projects {
+    for (project, role) in projects {
         let exists: bool = conn.query_row("SELECT COUNT(*) > 0 FROM projects WHERE id = ?1 OR name = ?1", [project], |r| r.get(0))?;
         if !exists {
             return Err(ApiError::bad_request(format!("no project {project}")));
@@ -341,6 +353,7 @@ fn new_user(
     Ok(id)
 }
 
+/// Fields left out stay as they are; `all_projects_role: null` removes that role.
 #[derive(Deserialize)]
 pub struct UpdateUserBody {
     name: Option<String>,
@@ -348,13 +361,17 @@ pub struct UpdateUserBody {
     password: Option<String>,
     description: Option<String>,
     disabled: Option<bool>,
-    #[serde(flatten)]
-    access: Option<AccessSpec>,
+    #[serde(default, deserialize_with = "super::present")]
+    all_projects_role: Option<Option<Role>>,
+    projects: Option<BTreeMap<String, Role>>,
+    grants: Option<Vec<String>>,
 }
+
 
 pub async fn update_user(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Json(b): Json<UpdateUserBody>) -> ApiResult<Json<Value>> {
     let own = a.0.user_id == id;
-    if !a.0.is_owner && !(own && b.access.is_none() && b.disabled.is_none()) {
+    let changes_access = b.all_projects_role.is_some() || b.projects.is_some() || b.grants.is_some();
+    if !a.0.is_owner && !(own && !changes_access && b.disabled.is_none()) {
         return Err(ApiError::forbidden("only the owner can change other users or access"));
     }
     if own && b.disabled == Some(true) {
@@ -382,9 +399,7 @@ pub async fn update_user(State(app): State<AppState>, a: Auth, Path(id): Path<St
             tx.execute("DELETE FROM sessions WHERE user_id = ?1", [&id])?;
         }
     }
-    if let Some(access) = &b.access {
-        apply_access(&tx, &id, access)?;
-    }
+    apply_access_parts(&tx, &id, b.all_projects_role, b.projects.as_ref(), b.grants.as_deref())?;
     tx.commit()?;
     let u = read_user(&conn, &id)?.ok_or_else(|| ApiError::not_found("no such user"))?;
     drop(conn);
@@ -612,18 +627,6 @@ pub async fn audit(State(app): State<AppState>, a: Auth, Query(q): Query<AuditQu
     Ok(Json(json!({ "entries": rows })))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::merge;
-    use serde_json::json;
-
-    #[test]
-    fn merge_patch() {
-        let mut v = json!({ "a": 1, "b": { "c": 2, "d": 3 } });
-        merge(&mut v, &json!({ "b": { "c": 9, "d": null }, "e": true }));
-        assert_eq!(v, json!({ "a": 1, "b": { "c": 9 }, "e": true }));
-    }
-}
 
 pub async fn update_status(State(_app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
     a.require_owner()?;
@@ -648,4 +651,27 @@ pub async fn update_apply(State(app): State<AppState>, a: Auth) -> ApiResult<Jso
         }
     });
     Ok(Json(json!({ "updating_to": latest.version })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UpdateUserBody, merge};
+    use serde_json::json;
+
+    #[test]
+    fn merge_patch() {
+        let mut v = json!({ "a": 1, "b": { "c": 2, "d": 3 } });
+        merge(&mut v, &json!({ "b": { "c": 9, "d": null }, "e": true }));
+        assert_eq!(v, json!({ "a": 1, "b": { "c": 9 }, "e": true }));
+    }
+
+    #[test]
+    fn user_updates_leave_unsent_access_alone() {
+        let b: UpdateUserBody = serde_json::from_value(json!({ "description": "x" })).unwrap();
+        assert!(b.all_projects_role.is_none() && b.projects.is_none() && b.grants.is_none());
+        let b: UpdateUserBody = serde_json::from_value(json!({ "all_projects_role": null })).unwrap();
+        assert_eq!(b.all_projects_role, Some(None));
+        let b: UpdateUserBody = serde_json::from_value(json!({ "all_projects_role": "viewer", "grants": [] })).unwrap();
+        assert!(matches!(b.all_projects_role, Some(Some(_))) && b.grants == Some(vec![]));
+    }
 }

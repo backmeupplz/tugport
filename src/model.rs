@@ -430,8 +430,21 @@ pub struct Redirect {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BasicUser {
     pub user: String,
-    /// Argon2 hash of the password.
+    /// Argon2 hash of the password. Never shown to people or agents.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub hash: String,
+    /// A new password: hashed when saved, never stored. Leave it out to keep the current one.
+    #[serde(default, skip_serializing)]
+    pub password: Option<String>,
+}
+
+/// Domain options as shown to people and agents: without password hashes.
+pub fn public_options<S: serde::Serializer>(o: &DomainOptions, s: S) -> Result<S::Ok, S::Error> {
+    let mut o = o.clone();
+    for u in &mut o.basic_auth {
+        u.hash.clear();
+    }
+    o.serialize(s)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

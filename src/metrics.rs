@@ -82,6 +82,8 @@ pub struct Metrics {
     pub latest: Mutex<Snapshot>,
     /// Latest snapshot of each other server.
     pub nodes: Mutex<HashMap<String, Snapshot>>,
+    /// Crashes per service since the last sample (from container events on every server).
+    pub restarts: Mutex<HashMap<String, u64>>,
     series: Mutex<HashMap<(String, String, String), i64>>,
 }
 
@@ -149,6 +151,12 @@ pub async fn sample_loop(app: AppState, keep: bool) {
             *crate::util::lock(&app.metrics.latest) = snap;
             continue;
         }
+        let mut crashes = std::mem::take(&mut *crate::util::lock(&app.metrics.restarts));
+        for sv in &mut snap.services {
+            sv.restarts = crashes.remove(&sv.id).unwrap_or(0);
+        }
+        // Services crashing elsewhere count here too (charts add up every server).
+        snap.services.extend(crashes.into_iter().map(|(id, restarts)| ServiceUsage { id, restarts, ..Default::default() }));
         if let Err(e) = store_for(&app, "local", &snap) {
             tracing::warn!("storing metrics: {e:#}");
         }
@@ -334,7 +342,8 @@ pub fn store_for(app: &App, node: &str, s: &Snapshot) -> Result<()> {
         points.push((scope.clone(), "cpu".into(), sv.cpu));
         points.push((scope.clone(), "memory".into(), sv.memory as f64));
         points.push((scope.clone(), "net_rx".into(), sv.net_rx));
-        points.push((scope, "net_tx".into(), sv.net_tx));
+        points.push((scope.clone(), "net_tx".into(), sv.net_tx));
+        points.push((scope, "restarts".into(), sv.restarts as f64));
     }
     let mut conn = app.db.conn();
     let tx = conn.transaction()?;

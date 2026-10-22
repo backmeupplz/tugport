@@ -177,16 +177,16 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
           </Field>
         </div>
         {isCompose && (
-          <Field label="Compose service" hint="The container in the stack that receives this domain's traffic.">
+          <Field label="Compose service" hint="Pick the container in the stack that receives this domain's traffic.">
             <Select value={f.container} onChange={(container) => set({ container })} options={[["", "Choose…"], ...composeServices.map((n): [string, string] => [n, n])]} />
           </Field>
         )}
-        <Check checked={f.https} onChange={(https) => set({ https })} label="HTTPS" hint="Gets a Let's Encrypt certificate and redirects plain HTTP to HTTPS." />
+        <Check checked={f.https} onChange={(https) => set({ https })} label="HTTPS" hint="The domain gets a Let's Encrypt certificate, and plain HTTP redirects to HTTPS." />
         <Check
           checked={f.via_tunnel}
           onChange={(via_tunnel) => set({ via_tunnel })}
           label="Through the Cloudflare Tunnel"
-          hint="Serves this domain through the tunnel from Settings instead of the server's public address."
+          hint="Traffic for this domain arrives through the tunnel from Settings instead of the server's public address."
         />
 
         <details open={advanced} class="rounded-md border border-line px-3 py-2">
@@ -276,7 +276,7 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
               <input class="input font-mono" type="url" placeholder="http://auth:4181/verify" {...text("faUrl")} />
             </Field>
             {f.faUrl && (
-              <Field label="Headers to copy from the auth response" hint="One header per line, like X-Forwarded-User.">
+              <Field label="Headers to copy from the auth response" hint="Write one header per line, like X-Forwarded-User.">
                 <textarea class="input h-20" spellcheck={false} {...text("faHeaders")} />
               </Field>
             )}

@@ -139,7 +139,7 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
           <Field label="Email for Let's Encrypt" hint="Let's Encrypt writes here about certificate problems.">
             <input class="input" type="email" {...text("acmeEmail")} />
           </Field>
-          <Field label="Trusted proxies" hint="Only these addresses may set the client IP through X-Forwarded-For, like Cloudflare or a load balancer. One range per line.">
+          <Field label="Trusted proxies" hint="Only these addresses may set the client IP through X-Forwarded-For, like Cloudflare or a load balancer; write one range per line.">
             <textarea class="input h-20" spellcheck={false} placeholder="173.245.48.0/20" {...text("trusted")} />
           </Field>
         </div>
@@ -175,7 +175,7 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
             checked={f.dcEnabled}
             onChange={(dcEnabled) => set({ dcEnabled })}
             label="Clean up Docker automatically"
-            hint="Removes unused images and caps the build cache. It keeps the images of running services and the last few for rollbacks, and it never touches volumes."
+            hint="Tugport removes unused images and caps the build cache, but it keeps the images of running services and the last few for rollbacks, and it never touches volumes."
           />
           {f.dcEnabled && (
             <div class="grid gap-4 sm:grid-cols-2">
@@ -816,7 +816,7 @@ function JobForm(props: { targets: Target[]; services: [string, string][] | null
           <Field label="Target">
             <Select value={f.target} onChange={(target) => upd({target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
           </Field>
-          <Field label="Schedule" hint="Cron format in the server's time zone.">
+          <Field label="Schedule" hint="Use cron format in the server's time zone.">
             <input class="input font-mono" required value={f.schedule} onInput={(e) => upd({schedule: e.currentTarget.value })} />
           </Field>
           <Field label="Keep the last">

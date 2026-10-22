@@ -1,5 +1,5 @@
 import type { ComponentChildren } from "preact";
-import { useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import { ApiError, post } from "../api";
 import { ErrorBox, Field, useForm, useSubmit } from "../ui";
 
@@ -22,7 +22,12 @@ function AuthCard(props: { title: string; sub?: string; children: ComponentChild
 }
 
 export function Setup(props: { onDone: () => void }) {
-  const token = location.hash.slice(1);
+  const [token, setToken] = useState(location.hash.slice(1));
+  useEffect(() => {
+    const read = () => setToken(location.hash.slice(1));
+    window.addEventListener("hashchange", read);
+    return () => window.removeEventListener("hashchange", read);
+  }, []);
   const { f, bind } = useForm({ name: "", email: "", password: "" });
   const s = useSubmit(async () => {
     await post("/setup", { token, name: f.name.trim(), email: f.email.trim() || undefined, password: f.password });

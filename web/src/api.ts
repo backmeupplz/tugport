@@ -29,9 +29,16 @@ export async function api<T = any>(method: string, path: string, body?: unknown)
   } catch {
     throw new ApiError(0, "Tugport is not reachable right now; check the connection and try again.");
   }
-  const data = await res.json().catch(() => ({}));
+  const text = await res.text().catch(() => "");
+  let data: any = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    // Axum's body rejections (400/415/422) arrive as plain text rather than {"error": ...}.
+    data = { error: text.trim() };
+  }
   if (!res.ok) {
-    const message = typeof data?.error === "string" ? data.error : `${res.status} ${res.statusText}`;
+    const message = typeof data?.error === "string" && data.error ? data.error : `${res.status} ${res.statusText}`;
     if (res.status === 401 && !path.startsWith("/auth/") && !path.startsWith("/setup")) unauthorized();
     throw new ApiError(res.status, message);
   }
@@ -52,10 +59,10 @@ export const isPlanned = (e: unknown) => e instanceof ApiError && e.status === 4
 export type Role = "viewer" | "deployer" | "operator" | "admin";
 export const ROLES: Role[] = ["viewer", "deployer", "operator", "admin"];
 export const ROLE_HELP: Record<Role, string> = {
-  viewer: "Sees status, charts, logs and the names of environment variables.",
-  deployer: "Can also deploy, restart, stop, start and roll back.",
-  operator: "Can also change environment, domains, mounts and settings, and create services.",
-  admin: "Can also delete things and manage project members.",
+  viewer: "A viewer sees status, charts, logs and the names of environment variables.",
+  deployer: "A deployer can also deploy, restart, stop, start and roll back.",
+  operator: "An operator can also change environment, domains, mounts and settings, and create services.",
+  admin: "An admin can also delete things and manage project members.",
 };
 const rank = (r: string | null | undefined) => (r === "owner" ? 5 : ROLES.indexOf(r as Role) + 1);
 export const atLeast = (r: string | null | undefined, need: Role) => rank(r) >= rank(need);

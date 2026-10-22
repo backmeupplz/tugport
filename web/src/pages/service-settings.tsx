@@ -177,7 +177,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Source">
           {isDb ? (
-            <Field label="Image" hint="Pinned to an exact version. Major upgrades are manual, so take a backup before changing the major version.">
+            <Field label="Image" hint="The image is pinned to an exact version, and major upgrades are manual, so take a backup before changing the major version.">
               <input class="input font-mono" spellcheck={false} {...text("image")} />
             </Field>
           ) : (
@@ -224,7 +224,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                         <input class="input font-mono" spellcheck={false} {...text("composeFile")} />
                       </Field>
                     ) : (
-                      <Field label="Path" hint="The build context inside the repository.">
+                      <Field label="Path" hint="This is the build context inside the repository.">
                         <input class="input font-mono" spellcheck={false} {...text("path")} />
                       </Field>
                     )}
@@ -276,7 +276,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                 <input class="input font-mono" spellcheck={false} {...text("builder")} />
               </Field>
             )}
-            <Field label="Variables passed as build arguments" hint="Names of environment variables, one per line, in addition to the ARGs the Dockerfile declares.">
+            <Field label="Variables passed as build arguments" hint="List environment variable names, one per line, to pass in addition to the ARGs the Dockerfile declares.">
               <textarea class="input h-16" spellcheck={false} {...text("buildArgs")} />
             </Field>
           </Section>
@@ -284,7 +284,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Runtime">
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="Command" hint="Overrides the image's command; quote arguments that contain spaces.">
+            <Field label="Command" hint="This replaces the image's command; quote arguments that contain spaces.">
               <input class="input font-mono" spellcheck={false} placeholder="npm run start" {...text("command")} />
             </Field>
             <Field label="Entrypoint">
@@ -366,7 +366,14 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
         </Section>
 
         <Section title="Rollout">
-          <Field label="Strategy" hint={f.strategy === "stop_first" ? "Stops the old version first, for workers that must never run twice, like bots." : "Starts the new version, moves traffic once it is healthy, then stops the old one."}>
+          <Field
+            label="Strategy"
+            hint={
+              f.strategy === "stop_first"
+                ? "The old version stops first, which suits workers that must never run twice, like bots."
+                : "The new version starts, gets traffic once it is healthy, and then the old one stops."
+            }
+          >
             <Select
               value={f.strategy}
               onChange={(strategy) => set({ strategy })}
@@ -378,13 +385,13 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             />
           </Field>
           <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
-            <Field label="Drain time (s)" hint="How long old replicas finish requests.">
+            <Field label="Drain time (s)" hint="Old replicas get this long to finish their requests.">
               <input class="input" type="number" min={0} {...text("drain")} />
             </Field>
-            <Field label="Health timeout (s)" hint="How long a new version may take to become healthy.">
+            <Field label="Health timeout (s)" hint="A new version gets this long to become healthy.">
               <input class="input" type="number" min={1} {...text("healthTimeout")} />
             </Field>
-            <Field label="Images kept" hint="For one-click rollbacks.">
+            <Field label="Images kept" hint="Old images stay for one-click rollbacks.">
               <input class="input" type="number" min={1} {...text("keepImages")} />
             </Field>
           </div>
@@ -468,22 +475,22 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             checked={f.nnp}
             onChange={(nnp) => set({ nnp })}
             label="No new privileges"
-            hint="Stops setuid programs from gaining privileges inside the container. Leave it on unless the app needs sudo or something similar."
+            hint="This stops setuid programs from gaining privileges inside the container, so leave it on unless the app needs sudo or something similar."
           />
-          <Check checked={f.gpu} onChange={(gpu) => set({ gpu })} label="GPU access" hint="Gives the containers the server's GPUs." />
+          <Check checked={f.gpu} onChange={(gpu) => set({ gpu })} label="GPU access" hint="The containers get access to the server's GPUs." />
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="Add capabilities" hint="One per line, like NET_ADMIN. Adding them needs the destroy grant.">
+            <Field label="Add capabilities" hint="Write one per line, like NET_ADMIN; adding them needs the destroy grant.">
               <textarea class="input h-16" spellcheck={false} {...text("capAdd")} />
             </Field>
-            <Field label="Drop capabilities" hint="One per line, like ALL.">
+            <Field label="Drop capabilities" hint="Write one per line, like ALL.">
               <textarea class="input h-16" spellcheck={false} {...text("capDrop")} />
             </Field>
           </div>
           <div class="space-y-3 rounded-md border border-bad/40 p-3">
             <p class="text-xs text-bad">These switches give the service control over the whole server. Turning them on needs the admin role and the destroy grant.</p>
             <Check checked={f.privileged} onChange={(privileged) => set({ privileged })} label="Privileged mode" />
-            <Check checked={f.socket} onChange={(socket) => set({ socket })} label="Docker socket" hint="Lets the service start and stop any container on the server." />
-            <Check checked={f.hostNet} onChange={(hostNet) => set({ hostNet })} label="Host networking" hint="Shares the server's network stack instead of the project network." />
+            <Check checked={f.socket} onChange={(socket) => set({ socket })} label="Docker socket" hint="The service can then start and stop any container on the server." />
+            <Check checked={f.hostNet} onChange={(hostNet) => set({ hostNet })} label="Host networking" hint="The service then shares the server's network stack instead of the project network." />
           </div>
         </Section>
 
@@ -534,7 +541,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 }
 
 const HEALTH_HELP: Record<string, string> = {
-  auto: "Uses the image's HEALTHCHECK if it has one, then an HTTP check on the first domain's port, and otherwise only checks that the container keeps running.",
+  auto: "Tugport uses the image's HEALTHCHECK if it has one, then an HTTP check on the first domain's port, and otherwise only checks that the container keeps running.",
   http: "A new version gets traffic once this path answers with a 2xx or 3xx status.",
   tcp: "A new version gets traffic once the port accepts connections.",
   command: "A new version gets traffic once this command exits with status 0.",

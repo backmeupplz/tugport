@@ -136,6 +136,14 @@ function Overview({ c }: { c: Ctx }) {
           actions={
             canDeploy && (
               <>
+                {st.live_deploy && (
+                  <Action
+                    confirm="Roll back to the previous image?"
+                    run={async () => c.openLog((await post<{ deploy_id: string }>(`/services/${id}/rollback`, {})).deploy_id)}
+                  >
+                    Roll back
+                  </Action>
+                )}
                 <Action run={() => post(`/services/${id}/restart`).then(c.reload)} disabled={st.running === 0} done="Restarted.">
                   Restart
                 </Action>

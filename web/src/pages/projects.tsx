@@ -76,7 +76,7 @@ export function Projects(_: { path?: string }) {
                     <h2 class="min-w-0 truncate font-semibold">{p.name}</h2>
                     {p.role && <span class="chip">{p.role}</span>}
                   </div>
-                  <p class="mt-1 line-clamp-2 min-h-10 text-dim">{p.description || "No description."}</p>
+                  <p class="mt-1 line-clamp-2 min-h-10 text-dim">{p.description || "This project has no description yet."}</p>
                   <p class="mt-3 text-xs text-muted">
                     {p.services} {p.services === 1 ? "service" : "services"}
                   </p>
@@ -253,7 +253,7 @@ function Description(props: { project: ProjectDetail["project"]; canEdit: boolea
   }
   return (
     <p class="mb-6 text-dim">
-      {props.project.description || "No description."}{" "}
+      {props.project.description || "This project has no description yet."}{" "}
       {props.canEdit && (
         <button
           class="link"

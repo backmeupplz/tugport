@@ -78,9 +78,7 @@ function AccessEditor(props: { value: Access; onChange: (a: Access) => void; pro
         {a.mode === "some" && (
           <ul class="ml-7 space-y-0.5 text-xs text-muted">
             {ROLES.map((r) => (
-              <li key={r}>
-                <span class="font-medium text-dim">{r}</span>: {ROLE_HELP[r]}
-              </li>
+              <li key={r}>{ROLE_HELP[r]}</li>
             ))}
           </ul>
         )}
@@ -93,7 +91,7 @@ function AccessEditor(props: { value: Access; onChange: (a: Access) => void; pro
           <input type="checkbox" class="mt-1 size-4" checked={a.secrets} onChange={(e) => set({ secrets: e.currentTarget.checked })} />
           <span>
             <span class="font-medium">Read secrets</span> <code class="text-xs text-muted">secrets:read</code>
-            <span class="hint">Lets {props.who} read environment values and files back. Writing them never needs this grant.</span>
+            <span class="hint">The grant lets {props.who} read environment values and files back, while writing them never needs it.</span>
           </span>
         </label>
         {a.secrets && (
@@ -105,7 +103,7 @@ function AccessEditor(props: { value: Access; onChange: (a: Access) => void; pro
           <input type="checkbox" class="mt-1 size-4" checked={a.destroy} onChange={(e) => set({ destroy: e.currentTarget.checked })} />
           <span>
             <span class="font-medium">Destroy</span> <code class="text-xs text-muted">destroy</code>
-            <span class="hint">Lets an admin delete services, volumes and databases, and turn on privileged mode, the Docker socket, host networking, bind mounts and extra capabilities.</span>
+            <span class="hint">The grant lets an admin delete services, volumes and databases, and turn on privileged mode, the Docker socket, host networking, bind mounts and extra capabilities.</span>
           </span>
         </label>
         {a.destroy && (
@@ -132,7 +130,7 @@ function KeyFields(props: { expires: string; setExpires: (v: string) => void; ip
       <Field label="Key expires">
         <Select value={props.expires} onChange={props.setExpires} options={EXPIRY} />
       </Field>
-      <Field label="Allowed addresses (optional)" hint="Addresses or ranges separated by commas or new lines, like 203.0.113.7 or 10.0.0.0/8. Leave this empty to allow any address.">
+      <Field label="Allowed addresses (optional)" hint="Write addresses or ranges separated by commas or new lines, like 203.0.113.7 or 10.0.0.0/8, or leave this empty to allow any address.">
         <textarea class="input h-16" spellcheck={false} value={props.ips} onInput={(e) => props.setIps(e.currentTarget.value)} />
       </Field>
     </div>
@@ -539,7 +537,7 @@ function Keys(props: { user: User; self: boolean }) {
       </Loaded>
       <Modal open={creating} onClose={() => setCreating(false)} title="New API key" wide>
         <form class="space-y-4" onSubmit={s.submit}>
-          <Field label="Key name" hint="Helps you tell keys apart, like the machine or pipeline that uses it.">
+          <Field label="Key name" hint="A name helps you tell keys apart, like the machine or pipeline that uses the key.">
             <input class="input" autoFocus placeholder="laptop" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
           </Field>
           <KeyFields expires={f.expires} setExpires={(expires) => upd({expires })} ips={f.ips} setIps={(ips) => upd({ips })} />

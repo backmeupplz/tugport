@@ -296,7 +296,7 @@ function GitFields(props: { form: ReturnType<typeof useForm<Form>>; compose?: bo
             <input class="input font-mono" spellcheck={false} {...bind("file")} />
           </Field>
         ) : (
-          <Field label="Path (optional)" hint="The build context inside the repository.">
+          <Field label="Path (optional)" hint="This is the build context inside the repository.">
             <input class="input font-mono" placeholder="apps/api" spellcheck={false} {...bind("path")} />
           </Field>
         )}

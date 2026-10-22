@@ -96,6 +96,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/hooks/git/{provider}", post(hooks::git_hook))
         // Easypanel's deploy webhook path, so migrated repositories keep deploying.
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .fallback(crate::web::static_handler)
         .layer(axum::middleware::from_fn(json_errors))
         .with_state(app)
@@ -120,6 +121,7 @@ pub fn hooks_router(app: AppState) -> Router {
         .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .route("/api/hooks/git/{provider}", post(hooks::git_hook))
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .with_state(app)
 }
 

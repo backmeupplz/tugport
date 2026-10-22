@@ -312,7 +312,7 @@ async fn execute(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> Re
     }
     let image = match (&d.image, &s.spec.source) {
         (Some(image), _) => {
-            log.line(&format!("Rolling back to {image}"));
+            log.line(&format!("{} {image}", if d.trigger == "migration" { "Taking over the running image" } else { "Rolling back to" }));
             if app.docker.inspect_image(image).await.is_err() {
                 runtime::pull(app, image, &|l| log.line(l)).await?;
             }

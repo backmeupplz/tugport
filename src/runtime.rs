@@ -98,8 +98,11 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
             let nets = c.network_settings.as_ref().and_then(|n| n.networks.clone()).unwrap_or_default();
             let ip_of = |e: &EndpointSettings| e.ip_address.clone().filter(|ip| !ip.is_empty());
             // The proxy on the replica's server reaches it on the ingress bridge, or on any
-            // bridge it is on (overlay addresses are not reachable from the host).
-            let ip = nets.get(INGRESS).and_then(ip_of).or_else(|| nets.iter().filter(|(k, _)| !k.starts_with("tpm-")).find_map(|(_, e)| ip_of(e)));
+            // bridge it is on (overlay addresses are not reachable from the host), Tugport's
+            // own first (during a migration a container also sits on the old panel's overlays).
+            let mut bridges: Vec<_> = nets.iter().filter(|(k, _)| !k.starts_with("tpm-")).collect();
+            bridges.sort_by_key(|(k, _)| !k.starts_with("tp-"));
+            let ip = nets.get(INGRESS).and_then(ip_of).or_else(|| bridges.into_iter().find_map(|(_, e)| ip_of(e)));
             let health = c.status.as_deref().and_then(|s| {
                 ["(healthy)", "(unhealthy)", "(health: starting)"].iter().find(|h| s.contains(*h)).map(|h| h.trim_matches(['(', ')']).replace("health: ", ""))
             });

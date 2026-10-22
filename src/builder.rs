@@ -70,7 +70,7 @@ pub async fn build(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> 
         Build::Railpack => railpack(app, s, &context, &image, sha.as_deref(), &env, log).await?,
         Build::Nixpacks => nixpacks(app, s, &context, &image, sha.as_deref(), &env, log).await?,
         Build::Buildpacks { builder } => buildpacks(app, s, &context, &image, builder, &env, log).await?,
-        Build::Auto => unreachable!(),
+        Build::Auto => bail!("no build method could be chosen"),
     }
     drop(permit);
     log.line(&format!("Built {image} in {:.1}s", started.elapsed().as_secs_f32()));
@@ -99,8 +99,15 @@ fn build_slice() -> Option<&'static str> {
 }
 
 pub fn declared_args(dockerfile: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"(?mi)^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-    re.captures_iter(dockerfile).map(|c| c[1].to_string()).collect()
+    dockerfile
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let rest = l.get(..4).filter(|kw| kw.eq_ignore_ascii_case("ARG ")).map(|_| l[4..].trim_start())?;
+            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            (!name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit())).then_some(name)
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

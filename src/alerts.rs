@@ -1,0 +1,106 @@
+//! Alerts: thresholds that hold for a while, crash loops and out-of-memory kills.
+
+use crate::app::{App, AppState};
+use crate::metrics::Snapshot;
+use crate::{runtime, store, util};
+use rusqlite::{OptionalExtension, params};
+use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
+
+pub async fn evaluate(app: &App, s: &Snapshot) {
+    let a = app.settings().alerts;
+    let pct = |u: &crate::metrics::Usage| u.used as f64 / u.total.max(1) as f64 * 100.0;
+    let mut checks: Vec<(String, bool, String)> = vec![
+        ("cpu".into(), s.cpu > a.cpu_percent, format!("CPU is at {:.0}%", s.cpu)),
+        ("memory".into(), pct(&s.memory) > a.memory_percent, format!("Memory is at {:.0}%", pct(&s.memory))),
+    ];
+    for d in &s.disks {
+        let p = d.used as f64 / d.total.max(1) as f64 * 100.0;
+        checks.push((format!("disk:{}", d.mount), p > a.disk_percent, format!("Disk {} is {:.0}% full", d.mount, p)));
+    }
+    for g in &s.gpus {
+        if let Some(t) = g.temp {
+            checks.push((format!("gpu-temp:{}", g.index), t > a.gpu_temp_c, format!("GPU {} ({}) is at {:.0}°C", g.index, g.name, t)));
+        }
+    }
+    let now = util::now();
+    for (key, firing, msg) in checks {
+        let row: Option<(i64, Option<i64>)> =
+            app.db.conn().query_row("SELECT since, last_notified FROM alerts WHERE key = ?1", [&key], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
+        match (firing, row) {
+            (true, None) => {
+                let _ = app.db.conn().execute("INSERT INTO alerts (key, firing, since, message) VALUES (?1, 1, ?2, ?3)", params![key, now, msg]);
+            }
+            (true, Some((since, None))) if now - since >= a.for_minutes as i64 * 60 => {
+                crate::notify::event(app, "alert", &format!("Alert: {msg}"), &format!("It has lasted {} minutes.", (now - since) / 60), None).await;
+                let _ = app.db.conn().execute("UPDATE alerts SET last_notified = ?1, message = ?2 WHERE key = ?3", params![now, msg, key]);
+                app.emit("alert", None, None, serde_json::json!({ "key": key, "message": msg, "firing": true }));
+            }
+            (false, Some((_, notified))) => {
+                if notified.is_some() {
+                    crate::notify::event(app, "alert", &format!("Resolved: {key}"), "Back to normal.", None).await;
+                    app.emit("alert", None, None, serde_json::json!({ "key": key, "firing": false }));
+                }
+                let _ = app.db.conn().execute("DELETE FROM alerts WHERE key = ?1", [&key]);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Crash loops (3+ exits in 10 minutes) and out-of-memory kills of managed containers.
+pub async fn watch_events(app: AppState) {
+    use futures_util::StreamExt;
+    let mut exits: HashMap<String, VecDeque<i64>> = HashMap::new();
+    let mut quiet_until: HashMap<String, i64> = HashMap::new();
+    loop {
+        let filters = HashMap::from([
+            ("type".to_string(), vec!["container".to_string()]),
+            ("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)]),
+        ]);
+        let mut events = app.docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
+        while let Some(Ok(e)) = events.next().await {
+            let action = e.action.clone().unwrap_or_default();
+            let attrs = e.actor.and_then(|a| a.attributes).unwrap_or_default();
+            let Some(service_id) = attrs.get(runtime::L_SERVICE).cloned() else { continue };
+            let name = attrs.get("name").cloned().unwrap_or_default();
+            let Ok(Some(s)) = store::service(&app, &service_id) else { continue };
+            let now = util::now();
+            match action.as_str() {
+                "oom" => {
+                    app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "oom", "container": name }));
+                    crate::notify::event(&app, "service.oom", &format!("{}/{} ran out of memory", s.project, s.name), &format!("Container {name} was killed for using too much memory."), Some(&s)).await;
+                }
+                "die" => {
+                    let code = attrs.get("exitCode").cloned().unwrap_or_default();
+                    app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "exit", "container": name, "code": code }));
+                    if code == "0" {
+                        continue;
+                    }
+                    let q = exits.entry(service_id.clone()).or_default();
+                    q.push_back(now);
+                    while q.front().is_some_and(|t| now - t > 600) {
+                        q.pop_front();
+                    }
+                    if q.len() >= 3 && quiet_until.get(&service_id).is_none_or(|t| *t < now) {
+                        quiet_until.insert(service_id.clone(), now + 1800);
+                        crate::notify::event(
+                            &app,
+                            "service.crashing",
+                            &format!("{}/{} keeps crashing", s.project, s.name),
+                            &format!("It exited {} times in 10 minutes (last exit code {code}).", q.len()),
+                            Some(&s),
+                        )
+                        .await;
+                    }
+                }
+                "start" => app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "start", "container": name })),
+                a if a.starts_with("health_status") => {
+                    app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": a, "container": name }))
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}

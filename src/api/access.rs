@@ -89,13 +89,12 @@ pub async fn login(State(app): State<AppState>, ClientIp(ip): ClientIp, headers:
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let ok = row.as_ref().is_some_and(|(_, hash, _)| hash.as_deref().is_some_and(|h| auth::verify_password(&b.password, h)));
-    if !ok {
+    let verified = row.filter(|(_, hash, _)| hash.as_deref().is_some_and(|h| auth::verify_password(&b.password, h)));
+    let Some((id, _, totp_secret)) = verified else {
         app.audit(None, "auth.login_failed", None, None, Some(b.name.trim()), ip.map(|i| i.to_string()).as_deref());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return Err(ApiError::unauthorized("wrong name or password"));
-    }
-    let (id, _, totp_secret) = row.unwrap();
+    };
     if let Some(sealed) = totp_secret {
         let secret = app.keys.open(&format!("totp:{id}"), &sealed)?;
         let code = b.totp.as_deref().unwrap_or("").trim().to_string();
@@ -135,7 +134,7 @@ pub async fn totp_begin(State(app): State<AppState>, a: Auth) -> ApiResult<Json<
     }
     let secret = auth::new_totp_secret();
     let totp = auth::totp(&secret, &a.0.name)?;
-    let sealed = app.keys.seal(&format!("totp-pending:{}", a.0.user_id), &secret);
+    let sealed = app.keys.seal(&format!("totp-pending:{}", a.0.user_id), &secret)?;
     app.db.set_state(&format!("totp_pending:{}", a.0.user_id), &crate::crypto::b64(&sealed))?;
     Ok(Json(json!({ "secret": totp.get_secret_base32(), "url": totp.get_url() })))
 }
@@ -152,7 +151,7 @@ pub async fn totp_confirm(State(app): State<AppState>, a: Auth, Json(b): Json<Co
     if !auth::totp(&secret, &a.0.name)?.check_current(b.code.trim()).unwrap_or(false) {
         return Err(ApiError::bad_request("that code does not match; check the time on your phone"));
     }
-    let sealed = app.keys.seal(&format!("totp:{}", a.0.user_id), &secret);
+    let sealed = app.keys.seal(&format!("totp:{}", a.0.user_id), &secret)?;
     app.db.conn().execute("UPDATE users SET totp_secret = ?1 WHERE id = ?2", params![sealed, a.0.user_id])?;
     app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&key])?;
     app.audit(Some(&a.0), "auth.totp_enabled", None, None, None, None);
@@ -235,7 +234,7 @@ pub async fn list_users(State(app): State<AppState>, a: Auth) -> ApiResult<Json<
     for id in ids {
         if let Some(u) = read_user(&conn, &id)? {
             if a.0.is_owner || u.id == a.0.user_id {
-                out.push(serde_json::to_value(u).unwrap());
+                out.push(serde_json::to_value(u)?);
             } else {
                 out.push(json!({ "id": u.id, "kind": u.kind, "name": u.name }));
             }
@@ -249,7 +248,7 @@ pub async fn get_user(State(app): State<AppState>, a: Auth, Path(id): Path<Strin
         return Err(ApiError::forbidden("only the owner can see other users"));
     }
     let u = read_user(&app.db.conn(), &id)?.ok_or_else(|| ApiError::not_found("no such user"))?;
-    Ok(Json(serde_json::to_value(u).unwrap()))
+    Ok(Json(serde_json::to_value(u)?))
 }
 
 /// Access settings shared by user creation, agent creation and updates.
@@ -271,7 +270,7 @@ fn apply_access(conn: &rusqlite::Connection, user_id: &str, a: &AccessSpec) -> A
     }
     conn.execute(
         "UPDATE users SET all_projects_role = ?1, grants = ?2 WHERE id = ?3",
-        params![a.all_projects_role.map(|r| r.as_str()), serde_json::to_string(&a.grants).unwrap(), user_id],
+        params![a.all_projects_role.map(|r| r.as_str()), serde_json::to_string(&a.grants)?, user_id],
     )?;
     conn.execute("DELETE FROM project_access WHERE user_id = ?1", [user_id])?;
     for (project, role) in &a.projects {
@@ -302,7 +301,7 @@ pub async fn create_user(State(app): State<AppState>, a: Auth, Json(b): Json<Cre
     a.require_owner()?;
     let id = new_user(&app, &a, b.kind, &b.name, b.email.as_deref(), b.password.as_deref(), b.description.as_deref(), &b.access)?;
     let u = read_user(&app.db.conn(), &id)?;
-    Ok(Json(serde_json::to_value(u).unwrap()))
+    Ok(Json(serde_json::to_value(u)?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -390,7 +389,7 @@ pub async fn update_user(State(app): State<AppState>, a: Auth, Path(id): Path<St
     let u = read_user(&conn, &id)?.ok_or_else(|| ApiError::not_found("no such user"))?;
     drop(conn);
     app.audit(Some(&a.0), "user.update", None, None, Some(&u.name), None);
-    Ok(Json(serde_json::to_value(u).unwrap()))
+    Ok(Json(serde_json::to_value(u)?))
 }
 
 pub async fn delete_user(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -514,14 +513,14 @@ fn snippets(base: &str, token: &str) -> Value {
 }
 
 fn key_owner(app: &AppState, key_id: &str) -> ApiResult<(String, String, Option<i64>, Option<String>)> {
-    Ok(app
+    app
         .db
         .conn()
         .query_row("SELECT user_id, name, expires_at, allowed_ips FROM api_keys WHERE id = ?1", [key_id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })
         .optional()?
-        .ok_or_else(|| ApiError::not_found("no such key"))?)
+        .ok_or_else(|| ApiError::not_found("no such key"))
 }
 
 pub async fn revoke_key(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -553,7 +552,7 @@ pub async fn get_settings(State(app): State<AppState>, a: Auth) -> ApiResult<Jso
 
 pub async fn update_settings(State(app): State<AppState>, a: Auth, Json(patch): Json<Value>) -> ApiResult<Json<Settings>> {
     a.require_owner()?;
-    let mut current = serde_json::to_value(app.settings()).unwrap();
+    let mut current = serde_json::to_value(app.settings())?;
     merge(&mut current, &patch);
     let next: Settings = serde_json::from_value(current).map_err(|e| ApiError::bad_request(format!("invalid settings: {e}")))?;
     app.db.set_setting("instance", &next)?;
@@ -624,4 +623,29 @@ mod tests {
         merge(&mut v, &json!({ "b": { "c": 9, "d": null }, "e": true }));
         assert_eq!(v, json!({ "a": 1, "b": { "c": 9 }, "e": true }));
     }
+}
+
+pub async fn update_status(State(_app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    let latest = crate::updates::latest().await.ok();
+    let available = latest.as_ref().is_some_and(|r| crate::updates::newer(&r.version));
+    Ok(Json(json!({ "current": crate::VERSION, "latest": latest, "available": available })))
+}
+
+/// Install the newest release. Running deploys finish first; traffic keeps flowing.
+pub async fn update_apply(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    let latest = crate::updates::latest().await.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if !crate::updates::newer(&latest.version) {
+        return Err(ApiError::bad_request("Tugport is already up to date"));
+    }
+    app.audit(Some(&a.0), "tugport.update_requested", None, None, Some(&latest.version), None);
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::updates::apply(&app2).await {
+            tracing::error!("update failed: {e:#}");
+            app2.emit("warning", None, None, json!({ "message": format!("Update failed: {e:#}") }));
+        }
+    });
+    Ok(Json(json!({ "updating_to": latest.version })))
 }

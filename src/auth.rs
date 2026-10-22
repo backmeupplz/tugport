@@ -236,6 +236,7 @@ pub enum KeyCheck {
     IpNotAllowed,
 }
 
+#[allow(clippy::type_complexity)]
 pub fn check_key(db: &Db, token: &str, ip: Option<IpAddr>) -> Result<KeyCheck> {
     if !token.starts_with(KEY_PREFIX) {
         return Ok(KeyCheck::Unknown);

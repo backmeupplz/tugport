@@ -41,7 +41,7 @@ pub async fn create(State(app): State<AppState>, a: Auth, Json(b): Json<TokenPro
     let name = b.name.unwrap_or_else(|| base.trim_start_matches("https://").trim_end_matches('/').to_string());
     let config = json!({ "token": b.token.trim(), "webhook_secret": util::token(40) });
     let id = git::save_provider(&app, None, kind, &name, &base, &config)?;
-    let p = git::provider(&app, &id)?.unwrap();
+    let p = git::provider(&app, &id)?.ok_or_else(|| ApiError::not_found("the provider was not saved"))?;
     if let Err(e) = git::repos(&p).await {
         app.db.conn().execute("DELETE FROM git_providers WHERE id = ?1", [&id])?;
         return Err(ApiError::bad_request(format!("the token does not work: {e:#}")));
@@ -143,7 +143,7 @@ pub async fn deploy_key(State(app): State<AppState>, a: Auth, Path(id): Path<Str
     let out = res.and_then(|_| Ok((std::fs::read_to_string(&key)?, std::fs::read_to_string(dir.join("key.pub"))?)));
     let _ = std::fs::remove_dir_all(&dir);
     let (private, public) = out?;
-    let sealed = app.keys.seal_str(&format!("deploykey:{}", s.id), &private);
+    let sealed = app.keys.seal_str(&format!("deploykey:{}", s.id), &private)?;
     app.db.set_state(&format!("deploykey:{}", s.id), &crate::crypto::b64(&sealed))?;
     app.audit(Some(&a.0), "service.deploy_key", Some(&s.project_id), Some(&s.id), Some(&s.name), None);
     Ok(Json(json!({ "public_key": public.trim() })))

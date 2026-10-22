@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Build the web panel
+        run: |
+          if [ -f web/package.json ]; then cd web && npm ci && npm run build; else mkdir -p web/dist && echo '<!doctype html><title>Tugport</title>' > web/dist/index.html; fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - name: Build a static binary
+        env:
+          TUGPORT_COMMIT: ${{ github.sha }}
+        run: |
+          cargo build --locked --release --target ${{ matrix.arch }}-unknown-linux-musl
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/tugport tugport-linux-${{ matrix.arch }}
+          ./tugport-linux-${{ matrix.arch }} version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tugport-linux-${{ matrix.arch }}
+          path: tugport-linux-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - run: sha256sum tugport-linux-* > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            tugport-linux-x86_64
+            tugport-linux-aarch64
+            SHA256SUMS
+          generate_release_notes: true

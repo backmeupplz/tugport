@@ -162,7 +162,7 @@ pub fn set_env(app: &App, service_id: &str, key: &str, value: Option<&str>) -> R
     match value {
         Some(v) => app.db.conn().execute(
             "INSERT INTO service_env (service_id, key, value) VALUES (?1, ?2, ?3) ON CONFLICT(service_id, key) DO UPDATE SET value = excluded.value",
-            params![service_id, key, app.keys.seal_str(&env_context(service_id, key), v)],
+            params![service_id, key, app.keys.seal_str(&env_context(service_id, key), v)?],
         )?,
         None => app.db.conn().execute("DELETE FROM service_env WHERE service_id = ?1 AND key = ?2", params![service_id, key])?,
     };
@@ -182,7 +182,7 @@ pub fn set_project_var(app: &App, project_id: &str, key: &str, value: Option<&st
     match value {
         Some(v) => app.db.conn().execute(
             "INSERT INTO project_vars (project_id, key, value) VALUES (?1, ?2, ?3) ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
-            params![project_id, key, app.keys.seal_str(&var_context(project_id, key), v)],
+            params![project_id, key, app.keys.seal_str(&var_context(project_id, key), v)?],
         )?,
         None => app.db.conn().execute("DELETE FROM project_vars WHERE project_id = ?1 AND key = ?2", params![project_id, key])?,
     };
@@ -209,7 +209,7 @@ pub fn set_file(app: &App, service_id: &str, target: &str, content: Option<&str>
     match content {
         Some(c) => app.db.conn().execute(
             "INSERT INTO service_files (service_id, target, content) VALUES (?1, ?2, ?3) ON CONFLICT(service_id, target) DO UPDATE SET content = excluded.content",
-            params![service_id, target, app.keys.seal_str(&format!("file:{service_id}:{target}"), c)],
+            params![service_id, target, app.keys.seal_str(&format!("file:{service_id}:{target}"), c)?],
         )?,
         None => app.db.conn().execute("DELETE FROM service_files WHERE service_id = ?1 AND target = ?2", params![service_id, target])?,
     };

@@ -20,7 +20,7 @@ pub async fn run(app: AppState) {
     }
 }
 
-fn load_stored(app: &App) {
+pub fn load_stored(app: &App) {
     let rows: Vec<(String, String, Vec<u8>)> = {
         let conn = app.db.conn();
         let mut stmt = match conn.prepare("SELECT host, cert_pem, key_pem FROM certificates WHERE cert_pem IS NOT NULL") {
@@ -30,7 +30,7 @@ fn load_stored(app: &App) {
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
     for (host, cert, key) in rows {
-        match app.keys.open_str(&format!("cert:{host}"), &key).map_err(anyhow::Error::from).and_then(|k| crate::proxy::certified_key(&cert, &k)) {
+        match app.keys.open_str(&format!("cert:{host}"), &key).and_then(|k| crate::proxy::certified_key(&cert, &k)) {
             Ok(ck) => app.proxy.set_cert(&host, ck),
             Err(e) => tracing::warn!("stored certificate for {host} is unusable: {e:#}"),
         }
@@ -66,7 +66,7 @@ async fn tick(app: &AppState) -> Result<()> {
                 app.db.conn().execute(
                     "INSERT INTO certificates (host, cert_pem, key_pem, not_after, source, last_error, next_attempt_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'acme', NULL, NULL, ?5)
                      ON CONFLICT(host) DO UPDATE SET cert_pem = excluded.cert_pem, key_pem = excluded.key_pem, not_after = excluded.not_after, last_error = NULL, next_attempt_at = NULL, updated_at = excluded.updated_at",
-                    params![host, cert, app.keys.seal_str(&format!("cert:{host}"), &key), expires, now],
+                    params![host, cert, app.keys.seal_str(&format!("cert:{host}"), &key)?, expires, now],
                 )?;
                 app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("acme_attempts:{host}")])?;
                 app.proxy.set_cert(&host, crate::proxy::certified_key(&cert, &key)?);
@@ -112,7 +112,7 @@ async fn account(app: &App) -> Result<Account> {
     let (acc, creds) = Account::builder()?
         .create(&NewAccount { contact: &contact, terms_of_service_agreed: true, only_return_existing: false }, directory.to_owned(), None)
         .await?;
-    let sealed = app.keys.seal_str("acme", &serde_json::to_string(&creds)?);
+    let sealed = app.keys.seal_str("acme", &serde_json::to_string(&creds)?)?;
     app.db.set_state("acme_account", &crate::crypto::b64(&sealed))?;
     Ok(acc)
 }
@@ -135,7 +135,7 @@ async fn issue(app: &App, host: &str) -> Result<(String, String)> {
                 other => bail!("authorization is {other:?}"),
             }
             let mut ch = a.challenge(ChallengeType::Http01).ok_or_else(|| anyhow!("no HTTP-01 challenge offered"))?;
-            app.proxy.challenges.lock().unwrap().insert(ch.token.clone(), ch.key_authorization().as_str().to_string());
+            crate::util::lock(&app.proxy.challenges).insert(ch.token.clone(), ch.key_authorization().as_str().to_string());
             tokens.push(ch.token.clone());
             ch.set_ready().await?;
         }
@@ -156,7 +156,7 @@ async fn issue(app: &App, host: &str) -> Result<(String, String)> {
         Ok((cert, key))
     }
     .await;
-    let mut ch = app.proxy.challenges.lock().unwrap();
+    let mut ch = crate::util::lock(&app.proxy.challenges);
     for t in tokens {
         ch.remove(&t);
     }
@@ -204,7 +204,7 @@ fn not_after(der: &[u8]) -> Option<i64> {
     let (tag, time, _) = tlv(after_before)?;
     let s = std::str::from_utf8(time).ok()?;
     let full = match tag {
-        0x17 => format!("{}{}", if s[..2].parse::<u32>().ok()? < 50 { "20" } else { "19" }, s),
+        0x17 => format!("{}{}", if s.get(..2)?.parse::<u32>().ok()? < 50 { "20" } else { "19" }, s),
         0x18 => s.to_string(),
         _ => return None,
     };

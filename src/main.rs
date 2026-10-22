@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod auth;
 mod autoupdate;
+mod backup;
 mod builder;
 mod cleanup;
 mod compose;
@@ -187,6 +188,7 @@ async fn serve() -> Result<()> {
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));
+    tokio::spawn(backup::scheduler(app.clone()));
     {
         let app = app.clone();
         let (http, https) = (port("TUGPORT_HTTP_PORT", 80), port("TUGPORT_HTTPS_PORT", 443));

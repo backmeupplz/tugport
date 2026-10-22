@@ -1,4 +1,5 @@
 mod access;
+mod backups;
 mod console;
 mod deploys;
 mod git;
@@ -68,6 +69,13 @@ pub fn router(app: AppState) -> Router {
         .route("/api/notifications/{id}/test", post(observe::test_channel))
         .route("/api/registries", get(observe::list_registries).post(observe::create_registry))
         .route("/api/registries/{id}", delete(observe::delete_registry))
+        .route("/api/backups/targets", get(backups::list_targets).post(backups::create_target))
+        .route("/api/backups/targets/{id}", delete(backups::delete_target))
+        .route("/api/backups/jobs", get(backups::list_jobs).post(backups::create_job))
+        .route("/api/backups/jobs/{id}", patch(backups::update_job).delete(backups::delete_job))
+        .route("/api/backups/jobs/{id}/run", post(backups::run_job))
+        .route("/api/backups/jobs/{id}/runs", get(backups::list_runs))
+        .route("/api/backups/runs/{id}/restore", post(backups::restore))
         .route("/api/git/providers", get(git::list).post(git::create))
         .route("/api/git/providers/{id}", delete(git::delete))
         .route("/api/git/providers/{id}/repos", get(git::repos))

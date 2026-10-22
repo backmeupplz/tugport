@@ -17,6 +17,8 @@ pub enum Client {
     },
     /// List projects.
     Projects,
+    /// List the servers and their status.
+    Servers,
     /// List the services of a project.
     Services { project: String },
     /// Show a service's status and replicas.
@@ -191,6 +193,24 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
             print(json, &v, |v| {
                 for p in v["projects"].as_array().into_iter().flatten() {
                     println!("{:<24} {:>3} services  {}", p["name"].as_str().unwrap_or(""), p["services"], p["role"].as_str().unwrap_or(""));
+                }
+            });
+            Ok(0)
+        }
+        Client::Servers => {
+            let v = api.get("/api/nodes").await?;
+            print(json, &v, |v| {
+                for n in v["nodes"].as_array().into_iter().flatten() {
+                    let i = &n["info"];
+                    println!(
+                        "{:<24} {:<12} {:<15} {:>3} cpus {:>6.1} GB  {}",
+                        n["name"].as_str().unwrap_or(""),
+                        n["status"].as_str().unwrap_or(""),
+                        n["mesh_ip"].as_str().unwrap_or("-"),
+                        i["cpus"].as_u64().unwrap_or(0),
+                        i["memory_total"].as_f64().unwrap_or(0.0) / 1e9,
+                        n["region"].as_str().unwrap_or(""),
+                    );
                 }
             });
             Ok(0)

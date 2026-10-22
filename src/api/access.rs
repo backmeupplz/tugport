@@ -624,3 +624,28 @@ mod tests {
         assert_eq!(v, json!({ "a": 1, "b": { "c": 9 }, "e": true }));
     }
 }
+
+pub async fn update_status(State(_app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    let latest = crate::updates::latest().await.ok();
+    let available = latest.as_ref().is_some_and(|r| crate::updates::newer(&r.version));
+    Ok(Json(json!({ "current": crate::VERSION, "latest": latest, "available": available })))
+}
+
+/// Install the newest release. Running deploys finish first; traffic keeps flowing.
+pub async fn update_apply(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    let latest = crate::updates::latest().await.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if !crate::updates::newer(&latest.version) {
+        return Err(ApiError::bad_request("Tugport is already up to date"));
+    }
+    app.audit(Some(&a.0), "tugport.update_requested", None, None, Some(&latest.version), None);
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::updates::apply(&app2).await {
+            tracing::error!("update failed: {e:#}");
+            app2.emit("warning", None, None, json!({ "message": format!("Update failed: {e:#}") }));
+        }
+    });
+    Ok(Json(json!({ "updating_to": latest.version })))
+}

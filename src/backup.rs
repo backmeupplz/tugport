@@ -101,7 +101,11 @@ fn repo(app: &App, t: &Target) -> Result<Repo> {
 }
 
 fn restic_cmd(repo: &Repo, extra_mounts: &[String], args: &[&str]) -> Command {
-    let mut c = Command::new("docker");
+    restic_on(Command::new("docker"), repo, extra_mounts, args)
+}
+
+/// Restic run by `docker` aimed at some server (volumes are read where they live).
+fn restic_on(mut c: Command, repo: &Repo, extra_mounts: &[String], args: &[&str]) -> Command {
     c.args(["run", "--rm", "-i", "--hostname", "tugport", "--env-file"]).arg(&repo.env_file);
     for m in repo.mounts.iter().chain(extra_mounts) {
         c.arg("-v").arg(m);
@@ -127,6 +131,11 @@ fn dump_name(engine: Engine) -> &'static str {
         Engine::Mongo => "dump.archive.gz",
         Engine::Redis => "dump.rdb",
     }
+}
+
+/// The server a job's volume lives on: its service's server, else this one.
+fn volume_node(app: &App, j: &Job) -> String {
+    j.service_id.as_ref().and_then(|sid| app.db.get_state(&format!("pin:{sid}")).ok().flatten()).unwrap_or_else(|| "local".into())
 }
 
 /// The running container of a service's live deploy.
@@ -218,7 +227,7 @@ async fn backup(app: &App, j: &Job) -> Result<(Option<String>, Option<i64>)> {
             let s = store::service(app, sid)?.ok_or_else(|| anyhow!("the service was deleted"))?;
             let engine = s.spec.database.as_ref().map(|d| d.engine).ok_or_else(|| anyhow!("{} is not a database", s.name))?;
             let ctr = live_container(app, &s.id).await?;
-            let mut dump = Command::new("docker");
+            let mut dump = crate::nodes::docker_cli(app, &ctr.node)?;
             dump.args(["exec", &ctr.id, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", databases::dump_command(engine)]);
             let filename = format!("{}/{}", s.name, dump_name(engine));
             let restic = restic_cmd(&repo, &[], &["backup", "--json", "--stdin", "--stdin-filename", &filename, "--tag", "tugport", "--tag", &job_tag]);
@@ -227,7 +236,8 @@ async fn backup(app: &App, j: &Job) -> Result<(Option<String>, Option<i64>)> {
         "volume" => {
             let vol = j.volume.as_deref().ok_or_else(|| anyhow!("volume backups need a volume"))?;
             let mount = format!("{vol}:/data/{vol}:ro");
-            crate::proc::output(restic_cmd(&repo, &[mount], &["backup", "--json", &format!("/data/{vol}"), "--tag", "tugport", "--tag", &job_tag])).await?
+            let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
+            crate::proc::output(restic_on(cli, &repo, &[mount], &["backup", "--json", &format!("/data/{vol}"), "--tag", "tugport", "--tag", &job_tag])).await?
         }
         "state" => {
             let dir = app.paths.data.join("backup-staging");
@@ -288,28 +298,29 @@ async fn restore_database(app: &AppState, j: &Job, repo: &Repo, snapshot: &str, 
         bail!("restoring Redis replaces its data file; stop the service and use the volume backup instead");
     }
     let path = format!("/{}/{}", s.name, dump_name(engine));
-    let (container, scratch_name) = if test {
-        let (id, name) = scratch_database(app, &s).await?;
-        (id, Some(name))
+    let (node, container, scratch_name) = if test {
+        let (node, id, name) = scratch_database(app, &s).await?;
+        (node, id, Some(name))
     } else {
-        (live_container(app, &s.id).await?.id, None)
+        let r = live_container(app, &s.id).await?;
+        (r.node, r.id, None)
     };
     let dump = restic_cmd(repo, &[], &["dump", snapshot, &path]);
-    let mut load = Command::new("docker");
+    let mut load = crate::nodes::docker_cli(app, &node)?;
     load.args(["exec", "-i", &container, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", databases::restore_command(engine)]);
     let result = pipe(dump, load).await;
-    let check = if test && result.is_ok() { check_database(app, engine, &container).await } else { Ok(String::new()) };
+    let check = if test && result.is_ok() { check_database(app, engine, &node, &container).await } else { Ok(String::new()) };
     if let Some(name) = scratch_name {
-        let _ = runtime::remove(app, &container, &name).await;
+        let _ = runtime::remove(app, &node, &container, &name).await;
     }
     result?;
     let detail = check?;
     Ok(if test { format!("Test restore succeeded. {detail}") } else { "Restored in place.".into() })
 }
 
-/// A temporary copy of a database service (same image and credentials, empty data).
-/// It gets its own DNS name so nothing can mistake it for the real database.
-async fn scratch_database(app: &AppState, s: &store::Service) -> Result<(String, String)> {
+/// A temporary copy of a database service (same image and credentials, empty data) on
+/// the database's server. It gets its own DNS name so nothing can mistake it for the real one.
+async fn scratch_database(app: &AppState, s: &store::Service) -> Result<(String, String, String)> {
     let mut copy = s.clone();
     copy.name = format!("{}-restoretest", s.name);
     copy.spec.mounts.retain(|m| !matches!(m, crate::model::Mount::Volume { .. }));
@@ -320,19 +331,21 @@ async fn scratch_database(app: &AppState, s: &store::Service) -> Result<(String,
     let network = runtime::ensure_network(app, &s.project).await?;
     let img = runtime::image_info(app, image).await?;
     let name = runtime::container_name(&copy, "restoretest", 1);
-    let id = runtime::create_replica(app, &copy, "restoretest", 1, image, &img, &network, false).await?;
-    if let Err(e) = runtime::start(app, &id).await {
-        let _ = runtime::remove(app, &id, &name).await;
+    let node = crate::nodes::home(app, s)?;
+    crate::nodes::ship_image(app, &node, s, image, &|_| {}).await?;
+    let id = runtime::create_replica(app, &node, &copy, "restoretest", 1, image, &img, &network, false).await?;
+    if let Err(e) = runtime::start(app, &node.id, &id).await {
+        let _ = runtime::remove(app, &node.id, &id, &name).await;
         return Err(e);
     }
-    if let Err(e) = runtime::wait_healthy(app, &copy, &id, &network, Duration::from_secs(120), img.has_healthcheck, &|_| {}).await {
-        let _ = runtime::remove(app, &id, &name).await;
+    if let Err(e) = runtime::wait_healthy(app, &copy, &node.id, &id, &network, Duration::from_secs(120), img.has_healthcheck, &|_| {}).await {
+        let _ = runtime::remove(app, &node.id, &id, &name).await;
         return Err(e.context("the temporary database did not start"));
     }
-    Ok((id, name))
+    Ok((node.id.clone(), id, name))
 }
 
-async fn check_database(app: &App, engine: Engine, container: &str) -> Result<String> {
+async fn check_database(app: &App, engine: Engine, node: &str, container: &str) -> Result<String> {
     let query = match engine {
         Engine::Postgres => "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -tAc \"select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')\"",
         Engine::Mysql => "mysql -uroot -p\"$MYSQL_ROOT_PASSWORD\" -N -e \"select count(*) from information_schema.tables where table_schema not in ('mysql','sys','information_schema','performance_schema')\"",
@@ -340,8 +353,7 @@ async fn check_database(app: &App, engine: Engine, container: &str) -> Result<St
         Engine::Mongo => "mongosh --quiet -u \"$MONGO_INITDB_ROOT_USERNAME\" -p \"$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'db.adminCommand({listDatabases:1}).databases.length'",
         Engine::Redis => "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning dbsize",
     };
-    let _ = app;
-    let mut c = Command::new("docker");
+    let mut c = crate::nodes::docker_cli(app, node)?;
     c.args(["exec", container, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", query]);
     let out = crate::proc::output(c).await?;
     Ok(format!("The restored copy reports {} tables/collections/keys.", out.trim()))
@@ -354,12 +366,13 @@ async fn restore_volume(app: &AppState, j: &Job, repo: &Repo, snapshot: &str) ->
         None => vec![],
     };
     for r in &users {
-        runtime::stop(app, &r.id, 30).await?;
+        runtime::stop(app, &r.node, &r.id, 30).await?;
     }
     let mount = format!("{vol}:/data/{vol}");
-    let res = crate::proc::output(restic_cmd(repo, &[mount], &["restore", snapshot, "--target", "/", "--include", &format!("/data/{vol}")])).await;
+    let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
+    let res = crate::proc::output(restic_on(cli, repo, &[mount], &["restore", snapshot, "--target", "/", "--include", &format!("/data/{vol}")])).await;
     for r in &users {
-        let _ = runtime::start(app, &r.id).await;
+        let _ = runtime::start(app, &r.node, &r.id).await;
     }
     res?;
     crate::proxy::reload(app);

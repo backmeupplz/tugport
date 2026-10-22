@@ -5,8 +5,8 @@ use crate::app::{App, AppState};
 use crate::runtime;
 use crate::util;
 use anyhow::Result;
-use rusqlite::{OptionalExtension, params};
-use serde::Serialize;
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,7 +14,8 @@ use std::time::Duration;
 
 pub const STEP: i64 = 10;
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
 pub struct Snapshot {
     pub at: i64,
     pub cpu: f64,
@@ -30,26 +31,30 @@ pub struct Snapshot {
     pub services: Vec<ServiceUsage>,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
 pub struct Usage {
     pub used: u64,
     pub total: u64,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
 pub struct Rate {
     pub rx: f64,
     pub tx: f64,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
 pub struct DiskUsage {
     pub mount: String,
     pub used: u64,
     pub total: u64,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
 pub struct Gpu {
     pub index: u32,
     pub name: String,
@@ -60,7 +65,8 @@ pub struct Gpu {
     pub power: Option<f64>,
 }
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[serde(default)]
 pub struct ServiceUsage {
     pub id: String,
     /// Percent of one core, summed over replicas.
@@ -74,7 +80,9 @@ pub struct ServiceUsage {
 #[derive(Default)]
 pub struct Metrics {
     pub latest: Mutex<Snapshot>,
-    series: Mutex<HashMap<(String, String), i64>>,
+    /// Latest snapshot of each other server.
+    pub nodes: Mutex<HashMap<String, Snapshot>>,
+    series: Mutex<HashMap<(String, String, String), i64>>,
 }
 
 struct ContainerPrev {
@@ -84,7 +92,9 @@ struct ContainerPrev {
     at: std::time::Instant,
 }
 
-pub async fn sample_loop(app: AppState) {
+/// Sample this server every 10 s. `keep` stores history and checks alerts (on the panel;
+/// agents only report their latest snapshot).
+pub async fn sample_loop(app: AppState, keep: bool) {
     let mut sys = sysinfo::System::new();
     let mut disks = sysinfo::Disks::new_with_refreshed_list();
     let mut nets = sysinfo::Networks::new_with_refreshed_list();
@@ -135,10 +145,14 @@ pub async fn sample_loop(app: AppState) {
         snap.gpus = gpus().await;
         snap.services = containers(&app, &mut prev).await;
 
-        if let Err(e) = store(&app, &snap) {
+        if !keep {
+            *crate::util::lock(&app.metrics.latest) = snap;
+            continue;
+        }
+        if let Err(e) = store_for(&app, "local", &snap) {
             tracing::warn!("storing metrics: {e:#}");
         }
-        crate::alerts::evaluate(&app, &snap).await;
+        crate::alerts::evaluate(&app, None, &snap).await;
         app.emit("metrics", None, None, serde_json::json!({ "at": at, "cpu": snap.cpu, "memory": snap.memory, "net": snap.net }));
         *crate::util::lock(&app.metrics.latest) = snap;
         if at - last_rollup >= 300 {
@@ -275,18 +289,19 @@ fn net_bytes(cg: &std::path::Path) -> Option<(u64, u64)> {
     Some((rx, tx))
 }
 
-fn series_id(app: &App, conn: &rusqlite::Connection, scope: &str, name: &str) -> Result<i64> {
-    let key = (scope.to_string(), name.to_string());
+fn series_id(app: &App, conn: &rusqlite::Connection, node: &str, scope: &str, name: &str) -> Result<i64> {
+    let key = (node.to_string(), scope.to_string(), name.to_string());
     if let Some(id) = crate::util::lock(&app.metrics.series).get(&key) {
         return Ok(*id);
     }
-    conn.execute("INSERT OR IGNORE INTO metric_series (node_id, scope, name) VALUES ('local', ?1, ?2)", params![scope, name])?;
-    let id: i64 = conn.query_row("SELECT id FROM metric_series WHERE node_id = 'local' AND scope = ?1 AND name = ?2", params![scope, name], |r| r.get(0))?;
+    conn.execute("INSERT OR IGNORE INTO metric_series (node_id, scope, name) VALUES (?1, ?2, ?3)", params![node, scope, name])?;
+    let id: i64 = conn.query_row("SELECT id FROM metric_series WHERE node_id = ?1 AND scope = ?2 AND name = ?3", params![node, scope, name], |r| r.get(0))?;
     crate::util::lock(&app.metrics.series).insert(key, id);
     Ok(id)
 }
 
-fn store(app: &App, s: &Snapshot) -> Result<()> {
+/// Store a server's snapshot ("local" = the panel's own server).
+pub fn store_for(app: &App, node: &str, s: &Snapshot) -> Result<()> {
     let mut points: Vec<(String, String, f64)> = vec![
         ("host".into(), "cpu".into(), s.cpu),
         ("host".into(), "memory".into(), s.memory.used as f64),
@@ -324,7 +339,7 @@ fn store(app: &App, s: &Snapshot) -> Result<()> {
     let mut conn = app.db.conn();
     let tx = conn.transaction()?;
     for (scope, name, v) in points {
-        let id = series_id(app, &tx, &scope, &name)?;
+        let id = series_id(app, &tx, node, &scope, &name)?;
         tx.execute("INSERT OR REPLACE INTO metrics_raw (series, ts, v) VALUES (?1, ?2, ?3)", params![id, s.at, v])?;
     }
     tx.commit()?;
@@ -347,9 +362,10 @@ fn rollup(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Points for a chart, downsampled to roughly 300 per series.
+/// Points for a chart, downsampled to roughly 300 per series. Server scopes read `node`;
+/// service scopes add up the service's usage on every server.
 #[allow(clippy::type_complexity)]
-pub fn query(app: &App, scope: &str, names: &[String], range_s: i64) -> Result<(i64, HashMap<String, Vec<(i64, f64)>>)> {
+pub fn query(app: &App, node: &str, scope: &str, names: &[String], range_s: i64) -> Result<(i64, HashMap<String, Vec<(i64, f64)>>)> {
     let now = util::now();
     let from = now - range_s;
     let step = (range_s / 300).max(STEP);
@@ -357,18 +373,25 @@ pub fn query(app: &App, scope: &str, names: &[String], range_s: i64) -> Result<(
     let conn = app.db.conn();
     let mut out = HashMap::new();
     let wanted: Vec<String> = if names.is_empty() {
-        let mut stmt = conn.prepare("SELECT name FROM metric_series WHERE scope = ?1")?;
+        let mut stmt = conn.prepare("SELECT DISTINCT name FROM metric_series WHERE scope = ?1")?;
         stmt.query_map([scope], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
     } else {
         names.to_vec()
     };
+    let every_node = scope.starts_with("service:");
     for name in wanted {
-        let id: Option<i64> = conn
-            .query_row("SELECT id FROM metric_series WHERE node_id = 'local' AND scope = ?1 AND name = ?2", params![scope, name], |r| r.get(0))
-            .optional()?;
-        let Some(id) = id else { continue };
-        let mut stmt = conn.prepare(&format!("SELECT ts / ?3 * ?3, AVG(v) FROM {table} WHERE series = ?1 AND ts >= ?2 GROUP BY ts / ?3 ORDER BY 1"))?;
-        let points: Vec<(i64, f64)> = stmt.query_map(params![id, from, step], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect();
+        let ids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM metric_series WHERE scope = ?1 AND name = ?2 AND (?3 OR node_id = ?4)")?;
+            stmt.query_map(params![scope, name, every_node, node], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
+        };
+        if ids.is_empty() {
+            continue;
+        }
+        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT b, SUM(v) FROM (SELECT series, ts / ?2 * ?2 AS b, AVG(v) AS v FROM {table} WHERE series IN ({list}) AND ts >= ?1 GROUP BY series, b) GROUP BY b ORDER BY b"
+        ))?;
+        let points: Vec<(i64, f64)> = stmt.query_map(params![from, step], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect();
         out.insert(name, points);
     }
     Ok((step, out))

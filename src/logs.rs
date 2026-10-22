@@ -34,35 +34,39 @@ fn day_file(dir: &Path, ts_ms: i64) -> PathBuf {
     dir.join(format!("{day}.log"))
 }
 
-/// Follow every managed container; new containers are picked up within seconds.
+/// Follow every managed container on every server (other servers' output comes over the
+/// mesh, so logs are stored and searched in one place); new containers are picked up within seconds.
 pub async fn collect(app: AppState) {
     let following: Arc<Mutex<HashSet<String>>> = Default::default();
+    crate::nodes::for_each_node(app, move |app, node| collect_on(app, node.docker.clone(), following.clone())).await;
+}
+
+async fn collect_on(app: AppState, docker: bollard::Docker, following: Arc<Mutex<HashSet<String>>>) {
     loop {
         let filters = HashMap::from([("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)])]);
-        if let Ok(list) = app.docker.list_containers(Some(ListContainersOptions { filters: Some(filters), ..Default::default() })).await {
-            for c in list {
-                let (Some(id), Some(labels)) = (c.id, c.labels) else { continue };
-                let Some(service) = labels.get(runtime::L_SERVICE).cloned() else { continue };
-                if !crate::util::lock(&following).insert(id.clone()) {
-                    continue;
-                }
-                let name = c.names.and_then(|n| n.first().cloned()).unwrap_or_default().trim_start_matches('/').to_string();
-                let (app, following) = (app.clone(), following.clone());
-                tokio::spawn(async move {
-                    follow(&app, &id, &name, &service).await;
-                    crate::util::lock(&following).remove(&id);
-                });
+        let Ok(list) = docker.list_containers(Some(ListContainersOptions { filters: Some(filters), ..Default::default() })).await else { return };
+        for c in list {
+            let (Some(id), Some(labels)) = (c.id, c.labels) else { continue };
+            let Some(service) = labels.get(runtime::L_SERVICE).cloned() else { continue };
+            if !crate::util::lock(&following).insert(id.clone()) {
+                continue;
             }
+            let name = c.names.and_then(|n| n.first().cloned()).unwrap_or_default().trim_start_matches('/').to_string();
+            let (app, docker, following) = (app.clone(), docker.clone(), following.clone());
+            tokio::spawn(async move {
+                follow(&app, &docker, &id, &name, &service).await;
+                crate::util::lock(&following).remove(&id);
+            });
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
-async fn follow(app: &AppState, container: &str, name: &str, service_id: &str) {
+async fn follow(app: &AppState, docker: &bollard::Docker, container: &str, name: &str, service_id: &str) {
     let pos_key = format!("logpos:{container}");
     let last_ms: i64 = app.db.get_state(&pos_key).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(0);
     let since = if last_ms > 0 { (last_ms / 1000) as i32 } else { (util::now() - 5) as i32 };
-    let mut stream = app.docker.logs(
+    let mut stream = docker.logs(
         container,
         Some(LogsOptions { follow: true, stdout: true, stderr: true, timestamps: true, since, ..Default::default() }),
     );

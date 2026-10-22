@@ -1,0 +1,98 @@
+//! Servers: list, add (join command), rename/label, remove.
+
+use super::{ApiError, ApiResult, Auth, base_url};
+use crate::app::AppState;
+use crate::nodes;
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use rusqlite::params;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+fn require_servers(a: &Auth) -> ApiResult<()> {
+    if a.0.is_owner || a.0.all_projects_role.is_some() { Ok(()) } else { Err(ApiError::forbidden("servers need the owner or a role on all projects")) }
+}
+
+pub async fn list(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    require_servers(&a)?;
+    let mesh = nodes::mesh_enabled(&app);
+    let conn = app.db.conn();
+    let mut stmt = conn.prepare("SELECT id, name, is_local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at FROM nodes ORDER BY is_local DESC, name")?;
+    let rows: Vec<Value> = stmt
+        .query_map([], |r| {
+            let labels: String = r.get(6)?;
+            let info: String = r.get(8)?;
+            Ok(json!({
+                "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "local": r.get::<_, bool>(2)?,
+                "address": r.get::<_, Option<String>>(3)?, "mesh_ip": r.get::<_, Option<String>>(4)?, "region": r.get::<_, Option<String>>(5)?,
+                "labels": serde_json::from_str::<Value>(&labels).unwrap_or_default(), "status": r.get::<_, String>(7)?,
+                "info": serde_json::from_str::<Value>(&info).unwrap_or_default(), "last_seen_at": r.get::<_, Option<i64>>(9)?,
+                "created_at": r.get::<_, i64>(10)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Json(json!({ "nodes": rows, "mesh": mesh })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct TokenBody {
+    /// Address servers reach the panel on; defaults to the one this request used.
+    panel_url: Option<String>,
+}
+
+/// A one-hour command that adds a server (turning on the mesh the first time).
+pub async fn join_token(State(app): State<AppState>, a: Auth, headers: HeaderMap, body: Option<Json<TokenBody>>) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    let url = body.and_then(|b| b.0.panel_url).unwrap_or_else(|| base_url(&headers));
+    let t = nodes::join_token(&app, url.trim_end_matches('/')).await?;
+    app.audit(Some(&a.0), "node.join_token", None, None, None, None);
+    Ok(Json(serde_json::to_value(t)?))
+}
+
+/// Called by `tugport install --join` on the new server; the one-time token is the credential.
+pub async fn join(State(app): State<AppState>, Json(req): Json<nodes::JoinRequest>) -> ApiResult<Json<Value>> {
+    match nodes::join(&app, req).await {
+        Ok(r) => Ok(Json(serde_json::to_value(r)?)),
+        Err(e) => Err(ApiError::bad_request(format!("{e:#}"))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateBody {
+    name: Option<String>,
+    region: Option<Option<String>>,
+    labels: Option<BTreeMap<String, String>>,
+}
+
+pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Json(b): Json<UpdateBody>) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    if app.node(&id).is_none() {
+        return Err(ApiError::not_found("server not found"));
+    }
+    if let Some(name) = &b.name {
+        if !crate::util::valid_name(name) {
+            return Err(ApiError::bad_request("use lowercase letters, digits and dashes"));
+        }
+        app.db.conn().execute("UPDATE nodes SET name = ?1 WHERE id = ?2", params![name, id])?;
+    }
+    if let Some(region) = &b.region {
+        app.db.conn().execute("UPDATE nodes SET region = ?1 WHERE id = ?2", params![region, id])?;
+    }
+    if let Some(labels) = &b.labels {
+        app.db.conn().execute("UPDATE nodes SET labels = ?1 WHERE id = ?2", params![serde_json::to_string(labels)?, id])?;
+    }
+    nodes::load(&app)?;
+    app.audit(Some(&a.0), "node.update", None, None, Some(&id), None);
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn remove(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    let name = app.node(&id).map(|n| n.name.clone()).ok_or_else(|| ApiError::not_found("server not found"))?;
+    nodes::remove(&app, &id).await?;
+    app.audit(Some(&a.0), "node.remove", None, None, Some(&name), None);
+    Ok(Json(json!({ "ok": true })))
+}

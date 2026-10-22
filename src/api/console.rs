@@ -36,15 +36,16 @@ pub async fn console(State(app): State<AppState>, a: Auth, Path(id): Path<String
         })
         .ok_or_else(|| ApiError::bad_request("no running container to open a shell in"))?;
     app.audit(Some(&a.0), "console.open", Some(&s.project_id), Some(&s.id), Some(&target.name), None);
-    let (app, cid, compose) = (app.clone(), target.id.clone(), s.kind == "compose");
+    let docker = app.docker_on(&target.node)?;
+    let (cid, compose) = (target.id.clone(), s.kind == "compose");
     Ok(ws.on_upgrade(move |socket| async move {
-        if let Err(e) = run(app, cid, compose, socket).await {
+        if let Err(e) = run(docker, cid, compose, socket).await {
             tracing::debug!("console closed: {e:#}");
         }
     }))
 }
 
-async fn run(app: AppState, container: String, compose: bool, socket: WebSocket) -> anyhow::Result<()> {
+async fn run(docker: bollard::Docker, container: String, compose: bool, socket: WebSocket) -> anyhow::Result<()> {
     let shell = "command -v bash >/dev/null 2>&1 && exec bash || exec sh";
     // Compose containers don't start through Tugport's init, so they get a plain shell.
     let cmd: Vec<String> = if compose {
@@ -52,8 +53,7 @@ async fn run(app: AppState, container: String, compose: bool, socket: WebSocket)
     } else {
         vec![crate::secrets::INIT_PATH.into(), "exec".into(), "--".into(), "sh".into(), "-c".into(), shell.into()]
     };
-    let exec = app
-        .docker
+    let exec = docker
         .create_exec(
             &container,
             ExecConfig {
@@ -68,7 +68,7 @@ async fn run(app: AppState, container: String, compose: bool, socket: WebSocket)
         )
         .await?;
     let StartExecResults::Attached { mut output, mut input } =
-        app.docker.start_exec(&exec.id, Some(StartExecOptions { detach: false, tty: true, output_capacity: None })).await?
+        docker.start_exec(&exec.id, Some(StartExecOptions { detach: false, tty: true, output_capacity: None })).await?
     else {
         anyhow::bail!("exec detached");
     };
@@ -82,7 +82,6 @@ async fn run(app: AppState, container: String, compose: bool, socket: WebSocket)
         let _ = tx.close().await;
     };
     let exec_id = exec.id.clone();
-    let docker = app.docker.clone();
     let from_browser = async {
         while let Some(Ok(msg)) = rx.next().await {
             match msg {
@@ -146,12 +145,12 @@ pub async fn exec(State(app): State<AppState>, a: Auth, Path(id): Path<String>, 
     } else {
         vec![crate::secrets::INIT_PATH.into(), "exec".into(), "--".into(), "sh".into(), "-c".into(), b.command.clone()]
     };
-    let exec = app
-        .docker
+    let docker = app.docker_on(&target.node)?;
+    let exec = docker
         .create_exec(&target.id, ExecConfig { attach_stdout: Some(true), attach_stderr: Some(true), cmd: Some(cmd), ..Default::default() })
         .await
         .map_err(anyhow::Error::from)?;
-    let StartExecResults::Attached { mut output, .. } = app.docker.start_exec(&exec.id, None).await.map_err(anyhow::Error::from)? else {
+    let StartExecResults::Attached { mut output, .. } = docker.start_exec(&exec.id, None).await.map_err(anyhow::Error::from)? else {
         return Err(ApiError::bad_request("the command detached"));
     };
     let mut text = String::new();
@@ -167,6 +166,6 @@ pub async fn exec(State(app): State<AppState>, a: Auth, Path(id): Path<String>, 
     })
     .await
     .is_err();
-    let code = app.docker.inspect_exec(&exec.id).await.ok().and_then(|i| i.exit_code);
+    let code = docker.inspect_exec(&exec.id).await.ok().and_then(|i| i.exit_code);
     Ok(axum::Json(serde_json::json!({ "exit_code": code, "timed_out": timed_out, "output": text })))
 }

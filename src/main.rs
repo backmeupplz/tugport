@@ -1,4 +1,5 @@
 mod acme;
+mod agent;
 mod alerts;
 mod api;
 mod app;
@@ -14,11 +15,15 @@ mod databases;
 mod db;
 mod deploy;
 mod git;
+mod handoff;
+mod install;
 mod logs;
 mod mcp;
+mod mesh;
 mod metrics;
 mod migrate;
 mod model;
+mod nodes;
 mod notify;
 mod paths;
 mod proc;
@@ -31,6 +36,7 @@ mod sleep;
 mod store;
 mod tools;
 mod tunnel;
+mod updates;
 mod util;
 mod web;
 
@@ -58,12 +64,16 @@ struct Cli {
 enum Cmd {
     /// Run the panel, proxy and deploy engine.
     Server,
+    /// Run on a server added to a panel (started by its systemd unit).
+    Node,
     /// Print a one-time link for creating the owner account.
     SetupLink,
     /// Restore the master key from its recovery key after a reinstall.
     Recover { key: String },
     /// Print the version.
     Version,
+    /// Set this server up (run by the one-line installer).
+    Install(install::InstallArgs),
     /// Move an Easypanel or Coolify server into Tugport.
     Migrate {
         #[command(subcommand)]
@@ -84,6 +94,7 @@ fn main() -> Result<()> {
             println!("tugport {VERSION} ({COMMIT})");
             Ok(())
         }
+        Cmd::Install(args) => install::install(args),
         Cmd::Recover { key } => {
             let paths = paths::Paths::from_env();
             crypto::restore_master(&paths.etc, &key)?;
@@ -100,6 +111,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Server => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve()),
+        Cmd::Node => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(agent::run()),
         Cmd::Migrate { cmd } => migrate::main(cmd),
         Cmd::Client(c) => {
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -110,7 +122,7 @@ fn main() -> Result<()> {
 }
 
 /// Fresh one-time setup link, or None once an owner exists.
-fn setup_link(db: &db::Db) -> Result<Option<String>> {
+pub fn setup_link(db: &db::Db) -> Result<Option<String>> {
     let users: i64 = db.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
     if users > 0 {
         return Ok(None);
@@ -129,7 +141,7 @@ pub fn public_ip() -> Option<String> {
 
 /// Containers mount a static copy of this binary as their init. `TUGPORT_INIT` overrides
 /// the source (development builds link glibc and cannot run in every image).
-fn install_init_binary(app: &app::App) -> Result<()> {
+pub fn install_init_binary(app: &app::App) -> Result<()> {
     let src = match std::env::var_os("TUGPORT_INIT") {
         Some(p) => std::path::PathBuf::from(p),
         None => std::env::current_exe()?,
@@ -188,8 +200,13 @@ async fn serve() -> Result<()> {
         logs: tokio::sync::broadcast::channel(8192).0,
         selflog,
         metrics: metrics::Metrics::default(),
+        nodes: nodes::Nodes::default(),
     });
     drop(master);
+    nodes::load(&app)?;
+    if let Err(e) = nodes::restore_mesh(&app) {
+        tracing::error!("bringing up the server mesh: {e:#}");
+    }
     install_init_binary(&app)?;
     deploy::recover_interrupted(&app)?;
     match secrets::rematerialize(&app).await {
@@ -200,15 +217,34 @@ async fn serve() -> Result<()> {
     runtime::detect_gpu(&app).await;
 
     let port = |var: &str, default: u16| std::env::var(var).ok().and_then(|p| p.parse().ok()).unwrap_or(default);
+    // Certificates and routes are ready before the first connection (matters after a reload).
+    acme::load_stored(&app);
+    proxy::initial_routes(&app).await;
     tokio::spawn(proxy::watch(app.clone()));
     tokio::spawn(acme::run(app.clone()));
     tokio::spawn(logs::collect(app.clone()));
-    tokio::spawn(metrics::sample_loop(app.clone()));
+    tokio::spawn(metrics::sample_loop(app.clone(), true));
+    tokio::spawn(nodes::health_loop(app.clone()));
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));
     tokio::spawn(backup::scheduler(app.clone()));
     tokio::spawn(tunnel::run(app.clone()));
+    tokio::spawn(updates::auto(app.clone()));
+    // SIGHUP (`systemctl reload tugport`): re-exec the binary on disk without dropping traffic.
+    tokio::spawn(async {
+        let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
+        while hup.recv().await.is_some() {
+            match handoff::binary_path() {
+                Ok(exe) => {
+                    if let Err(e) = handoff::reexec(&exe, std::time::Duration::from_secs(30)).await {
+                        tracing::error!("reload failed: {e:#}");
+                    }
+                }
+                Err(e) => tracing::error!("reload failed: {e}"),
+            }
+        }
+    });
     {
         let app = app.clone();
         let (http, https) = (port("TUGPORT_HTTP_PORT", 80), port("TUGPORT_HTTPS_PORT", 443));
@@ -225,25 +261,35 @@ async fn serve() -> Result<()> {
     // Old panel webhook URLs (Easypanel's :3000). Bound once the setting appears and the port
     // is free, so a migration can turn it on after stopping the old panel.
     {
-        let (app, router) = (app.clone(), router.clone());
+        let app = app.clone();
         tokio::spawn(async move {
             loop {
                 if let Some(legacy) = app.settings().legacy_listen
-                    && let Ok(l) = tokio::net::TcpListener::bind(&legacy).await
+                    && let Ok(l) = handoff::listener("legacy", async { Ok(tokio::net::TcpListener::bind(&legacy).await?) }).await
                 {
-                    tracing::info!("also serving the API on {legacy}");
-                    let _ = axum::serve(l, router.clone().into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+                    tracing::info!("also serving deploy webhooks on {legacy}");
+                    let _ = axum::serve(l, api::hooks_router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>())
+                        .with_graceful_shutdown(handoff::DRAIN.notified())
+                        .await;
+                    return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }
-    let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("listening on {listen}"))?;
+    let listener = handoff::listener("panel", async { Ok(tokio::net::TcpListener::bind(&listen).await?) }).await.with_context(|| format!("listening on {listen}"))?;
     tracing::info!("tugport {VERSION} panel on http://{listen}");
     axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = handoff::DRAIN.notified() => {}
+            }
         })
         .await?;
+    // The panel stops only for a shutdown or a handoff; give a handoff time to exec.
+    if handoff::draining() {
+        std::future::pending::<()>().await;
+    }
     Ok(())
 }

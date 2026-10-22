@@ -302,7 +302,7 @@ fn open() -> Result<AppState> {
         bail!("start Tugport once first (it installs the container init at {})", paths.init_binary().display());
     }
     let selflog = crate::logs::SelfLog::new(paths.logs().join("_tugport"));
-    Ok(Arc::new(App {
+    let app = Arc::new(App {
         paths,
         db,
         keys: crate::crypto::Keyring::new(&master),
@@ -314,7 +314,10 @@ fn open() -> Result<AppState> {
         logs: tokio::sync::broadcast::channel(16).0,
         selflog,
         metrics: crate::metrics::Metrics::default(),
-    }))
+        nodes: crate::nodes::Nodes::default(),
+    });
+    crate::nodes::load(&app)?;
+    Ok(app)
 }
 
 async fn migrate(panel: &'static str, dry_run: bool, yes: bool) -> Result<()> {
@@ -627,7 +630,7 @@ async fn cutover(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
         settings.legacy_listen = Some(listen.clone());
         app.db.set_setting("instance", &settings)?;
         let port = listen.rsplit(':').next().unwrap_or("3000");
-        if answers(&format!("http://127.0.0.1:{port}/api/setup"), None, Duration::from_secs(30)).await {
+        if answers(&format!("http://127.0.0.1:{port}/api/deploy/tugport-migration-probe"), None, Duration::from_secs(30)).await {
             println!("Old deploy webhook URLs now reach Tugport on {listen}");
         } else {
             println!("  ! Tugport does not answer on {listen} yet; restart it to serve the old webhook URLs");
@@ -873,7 +876,8 @@ async fn wait_for_reload(j: &Journal) {
     }
 }
 
-/// Poll a URL until Tugport answers it. With `host`, the answer must be Tugport's proxy page for it.
+/// Poll a URL until Tugport answers it: its proxy's page for `host`, or else its webhook
+/// listener's answer to an unknown token.
 async fn answers(url: &str, host: Option<&str>, timeout: Duration) -> bool {
     let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(2)).redirect(reqwest::redirect::Policy::none()).build() else { return false };
     let started = std::time::Instant::now();
@@ -883,12 +887,9 @@ async fn answers(url: &str, host: Option<&str>, timeout: Duration) -> bool {
             req = req.header("host", h);
         }
         if let Ok(r) = req.send().await {
-            let ok = r.status().is_success();
             let body = r.text().await.unwrap_or_default();
-            match host {
-                Some(h) if body.contains(h) => return true,
-                None if ok && body.contains("needs_setup") => return true,
-                _ => {}
+            if body.contains(host.unwrap_or("unknown deploy hook")) {
+                return true;
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

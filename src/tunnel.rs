@@ -165,7 +165,7 @@ async fn ensure_running(app: &App, t: &Tunnel) -> Result<()> {
         ..Default::default()
     };
     app.docker.create_container(Some(CreateContainerOptions { name: Some(CONTAINER.into()), ..Default::default() }), config).await?;
-    runtime::start(app, CONTAINER).await
+    runtime::start(app, "local", CONTAINER).await
 }
 
 /// Point every tunnel domain at our proxy, and make each hostname's DNS a proxied CNAME to the tunnel.

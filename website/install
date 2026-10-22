@@ -1,0 +1,38 @@
+#!/bin/sh
+# Tugport installer: curl -fsSL https://tugport.com/install | sh
+# Downloads the latest release for this CPU, checks its SHA-256, and runs `tugport install`.
+set -eu
+
+if [ "$(id -u)" != 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    echo "The installer needs root; asking sudo."
+    exec sudo sh -c "curl -fsSL https://tugport.com/install | sh -s -- $*"
+  fi
+  echo "Run the installer as root." >&2
+  exit 1
+fi
+
+case "$(uname -m)" in
+  x86_64 | amd64) arch=x86_64 ;;
+  aarch64 | arm64) arch=aarch64 ;;
+  *) echo "Tugport supports x86_64 and aarch64 Linux; this machine is $(uname -m)." >&2; exit 1 ;;
+esac
+
+base="https://github.com/backmeupplz/tugport/releases/latest/download"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "Downloading Tugport for $arch."
+curl -fsSL "$base/tugport-linux-$arch" -o "$tmp/tugport-linux-$arch"
+curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
+(cd "$tmp" && grep " tugport-linux-$arch\$" SHA256SUMS | sha256sum -c - >/dev/null) || {
+  echo "The download does not match its checksum; nothing was installed." >&2
+  exit 1
+}
+install -m 755 "$tmp/tugport-linux-$arch" /usr/local/bin/tugport
+
+# Questions go to the terminal even though this script arrives through a pipe.
+if [ -t 1 ] && [ -r /dev/tty ]; then
+  exec /usr/local/bin/tugport install "$@" </dev/tty
+else
+  exec /usr/local/bin/tugport install --yes "$@"
+fi

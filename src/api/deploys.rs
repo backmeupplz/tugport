@@ -150,7 +150,7 @@ pub async fn restart(State(app): State<AppState>, a: Auth, Path(id): Path<String
     let live = runtime::live_deploy(&app, &s.id);
     for r in runtime::replicas(&app, &s.id).await? {
         if s.kind == "compose" || live.as_deref() == Some(r.deploy.as_str()) {
-            app.docker.restart_container(&r.id, None::<bollard::query_parameters::RestartContainerOptions>).await.map_err(anyhow::Error::from)?;
+            runtime::restart(&app, &r.node, &r.id).await?;
         }
     }
     app.audit(Some(&a.0), "service.restart", Some(&s.project_id), Some(&s.id), Some(&s.name), None);
@@ -161,8 +161,10 @@ pub async fn restart(State(app): State<AppState>, a: Auth, Path(id): Path<String
 pub async fn stop(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
     for r in runtime::replicas(&app, &s.id).await? {
-        runtime::stop(&app, &r.id, 30).await?;
+        runtime::stop(&app, &r.node, &r.id, 30).await?;
     }
+    // Nothing starts it on its own again (not even a server coming back) until someone does.
+    app.db.set_state(&format!("stopped:{}", s.id), "1")?;
     app.audit(Some(&a.0), "service.stop", Some(&s.project_id), Some(&s.id), Some(&s.name), None);
     app.emit("service.status", Some(&s.project_id), Some(&s.id), json!({ "state": "stopped" }));
     Ok(Json(json!({ "ok": true })))
@@ -176,9 +178,9 @@ pub async fn start(State(app): State<AppState>, a: Auth, Path(id): Path<String>)
         return Err(ApiError::bad_request("nothing to start; deploy the service first"));
     }
     for r in reps {
-        runtime::start(&app, &r.id).await?;
+        runtime::start(&app, &r.node, &r.id).await?;
     }
-    let _ = app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("asleep:{}", s.id)]);
+    let _ = app.db.conn().execute("DELETE FROM state WHERE key IN (?1, ?2)", [format!("asleep:{}", s.id), format!("stopped:{}", s.id)]);
     app.audit(Some(&a.0), "service.start", Some(&s.project_id), Some(&s.id), Some(&s.name), None);
     crate::proxy::reload(&app);
     Ok(Json(json!({ "ok": true })))

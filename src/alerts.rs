@@ -5,9 +5,9 @@ use crate::metrics::Snapshot;
 use crate::{runtime, store, util};
 use rusqlite::{OptionalExtension, params};
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
 
-pub async fn evaluate(app: &App, s: &Snapshot) {
+/// Threshold alerts for a server's snapshot (`node` None = the panel's own server).
+pub async fn evaluate(app: &App, node: Option<&crate::nodes::NodeHandle>, s: &Snapshot) {
     let a = app.settings().alerts;
     let pct = |u: &crate::metrics::Usage| u.used as f64 / u.total.max(1) as f64 * 100.0;
     let mut checks: Vec<(String, bool, String)> = vec![
@@ -25,6 +25,10 @@ pub async fn evaluate(app: &App, s: &Snapshot) {
     }
     let now = util::now();
     for (key, firing, msg) in checks {
+        let (key, msg) = match node {
+            Some(n) => (format!("{}:{key}", n.id), format!("{}: {msg}", n.name)),
+            None => (key, msg),
+        };
         let row: Option<(i64, Option<i64>)> =
             app.db.conn().query_row("SELECT since, last_notified FROM alerts WHERE key = ?1", [&key], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
         match (firing, row) {
@@ -50,15 +54,19 @@ pub async fn evaluate(app: &App, s: &Snapshot) {
 
 /// Crash loops (3+ exits in 10 minutes) and out-of-memory kills of managed containers.
 pub async fn watch_events(app: AppState) {
+    crate::nodes::for_each_node(app, |app, node| watch_on(app, node.docker.clone())).await;
+}
+
+async fn watch_on(app: AppState, docker: bollard::Docker) {
     use futures_util::StreamExt;
     let mut exits: HashMap<String, VecDeque<i64>> = HashMap::new();
     let mut quiet_until: HashMap<String, i64> = HashMap::new();
-    loop {
+    {
         let filters = HashMap::from([
             ("type".to_string(), vec!["container".to_string()]),
             ("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)]),
         ]);
-        let mut events = app.docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
+        let mut events = docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
         while let Some(Ok(e)) = events.next().await {
             let action = e.action.clone().unwrap_or_default();
             let attrs = e.actor.and_then(|a| a.attributes).unwrap_or_default();
@@ -101,6 +109,5 @@ pub async fn watch_events(app: AppState) {
                 _ => {}
             }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

@@ -4,6 +4,7 @@ mod console;
 mod deploys;
 mod git;
 mod hooks;
+mod nodes;
 mod observe;
 pub mod projects;
 
@@ -25,6 +26,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/me", get(access::me))
         .route("/api/me/totp", post(access::totp_begin).put(access::totp_confirm).delete(access::totp_disable))
         .route("/api/about", get(access::about))
+        .route("/api/updates", get(access::update_status))
+        .route("/api/updates/apply", post(access::update_apply))
         .route("/api/users", get(access::list_users).post(access::create_user))
         .route("/api/users/{id}", get(access::get_user).patch(access::update_user).delete(access::delete_user))
         .route("/api/users/{id}/keys", get(access::list_keys).post(access::create_key))
@@ -66,6 +69,10 @@ pub fn router(app: AppState) -> Router {
         .route("/api/metrics", get(observe::metrics_query))
         .route("/api/metrics/now", get(observe::metrics_now))
         .route("/api/docker/usage", get(observe::docker_usage))
+        .route("/api/nodes", get(nodes::list))
+        .route("/api/nodes/join-token", post(nodes::join_token))
+        .route("/api/nodes/join", post(nodes::join))
+        .route("/api/nodes/{id}", patch(nodes::update).delete(nodes::remove))
         .route("/api/notifications", get(observe::list_channels).post(observe::create_channel))
         .route("/api/notifications/{id}", delete(observe::delete_channel))
         .route("/api/notifications/{id}/test", post(observe::test_channel))
@@ -90,6 +97,16 @@ pub fn router(app: AppState) -> Router {
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .fallback(crate::web::static_handler)
+        .with_state(app)
+}
+
+/// Only the deploy webhooks, for listeners exposed to the internet.
+pub fn hooks_router(app: AppState) -> Router {
+    Router::new()
+        .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/hooks/git/{provider}", post(hooks::git_hook))
+        .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .with_state(app)
 }
 
@@ -154,7 +171,7 @@ impl IntoResponse for ApiError {
 /// The client's address. Requests that arrive through our own proxy (loopback)
 /// carry the real address in the last X-Forwarded-For entry.
 pub fn client_ip(parts: &Parts) -> Option<IpAddr> {
-    let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())?;
+    let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical())?;
     if peer.is_loopback()
         && let Some(xff) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
             && let Some(last) = xff.rsplit(',').next().and_then(|s| s.trim().parse().ok()) {

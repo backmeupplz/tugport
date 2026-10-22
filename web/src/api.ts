@@ -167,6 +167,8 @@ export interface ServiceDetail {
   env: string[];
   files: string[];
   last_deploy: Deploy | null;
+  /** Ports the image declares with EXPOSE, as of its last deploy. */
+  exposed_ports?: number[];
   role: Role | null;
 }
 export interface User {

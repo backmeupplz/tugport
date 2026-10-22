@@ -13,7 +13,8 @@ interface Form {
   via_tunnel: boolean;
   www: string;
   redirects: { from: string; to: string; permanent: boolean }[];
-  basic: { user: string; password: string; hash?: string }[];
+  /** `saved` is the user's stored name; sent without a password, that user keeps the current one. */
+  basic: { user: string; password: string; saved?: string }[];
   faUrl: string;
   faHeaders: string;
   strip: boolean;
@@ -39,7 +40,7 @@ function toForm(d?: Domain): Form {
     via_tunnel: d?.via_tunnel ?? false,
     www: o.www_redirect ?? "",
     redirects: o.redirects ?? [],
-    basic: (o.basic_auth ?? []).map((b: { user: string; hash?: string }) => ({ user: b.user, password: "", hash: b.hash })),
+    basic: (o.basic_auth ?? []).map((b: { user: string }) => ({ user: b.user, password: "", saved: b.user })),
     faUrl: o.forward_auth?.url ?? "",
     faHeaders: (o.forward_auth?.response_headers ?? []).join("\n"),
     strip: !!o.strip_prefix,
@@ -58,17 +59,14 @@ function toBody(f: Form) {
     host: f.host.trim().toLowerCase(),
     path: f.path.trim() || "/",
     port: Number(f.port),
-    container: f.container || undefined,
+    container: f.container || null,
     https: f.https,
     via_tunnel: f.via_tunnel,
     options: {
       www_redirect: f.www || null,
       redirects: f.redirects.filter((r) => r.from && r.to),
-      // Existing users keep their stored hash. A new or changed password travels in plaintext over
-      // the panel connection, and the backend is expected to hash it (it takes hashes only today).
-      basic_auth: f.basic
-        .filter((b) => b.user && (b.password || b.hash))
-        .map((b) => (b.password ? { user: b.user, password: b.password } : { user: b.user, hash: b.hash })),
+      // The server hashes new passwords; a user sent without one keeps the stored password.
+      basic_auth: f.basic.filter((b) => b.user).map((b) => (b.password ? { user: b.user, password: b.password } : { user: b.user })),
       forward_auth: f.faUrl.trim() ? { url: f.faUrl.trim(), response_headers: lines(f.faHeaders) } : null,
       strip_prefix: f.strip,
       rewrite: f.rwFrom ? { from: f.rwFrom, to: f.rwTo } : null,
@@ -84,19 +82,23 @@ export function Domains({ c }: { c: Ctx }) {
   const canEdit = atLeast(c.d.role, "operator");
   const [edit, setEdit] = useState<{ id?: string; f: Form } | null>(null);
   const list = c.d.domains;
+  // The image's EXPOSE ports, from its last deploy, suggest the port of a new domain.
+  const port = String(c.d.exposed_ports?.[0] ?? "");
   return (
     <Card
       title="Domains"
       actions={
         canEdit && (
-          <button class="btn btn-primary" onClick={() => setEdit({ f: toForm() })}>
+          <button class="btn btn-primary" onClick={() => setEdit({ f: { ...toForm(), port } })}>
             Add domain
           </button>
         )
       }
     >
       <p class="mb-4 text-dim">
-        Point a domain's DNS records at this server, and Tugport routes its traffic to this service with an automatic Let's Encrypt certificate.
+        {(c.nodes?.nodes.length ?? 0) > 1
+          ? "Point a domain's DNS records at any of your servers, and Tugport routes its traffic to this service wherever it runs, with an automatic Let's Encrypt certificate."
+          : "Point a domain's DNS records at this server, and Tugport routes its traffic to this service with an automatic Let's Encrypt certificate."}
       </p>
       {list.length === 0 ? (
         <Empty>This service has no domains yet.</Empty>
@@ -175,6 +177,11 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
           <Field label="Container port">
             <input class="input font-mono" required type="number" min={1} max={65535} placeholder="3000" {...text("port")} />
           </Field>
+          {(props.c.d.exposed_ports?.length ?? 0) > 0 && (
+            <p class="-mt-2 text-xs text-muted sm:col-span-3">
+              The image exposes {props.c.d.exposed_ports?.length === 1 ? "port" : "ports"} {props.c.d.exposed_ports?.join(", ")}.
+            </p>
+          )}
         </div>
         {isCompose && (
           <Field label="Compose service" hint="Pick the container in the stack that receives this domain's traffic.">
@@ -259,7 +266,8 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
                     class="input"
                     type="password"
                     autoComplete="new-password"
-                    placeholder={b.hash ? "Unchanged" : ""}
+                    required={!!b.user && b.user !== b.saved}
+                    placeholder={b.user && b.user === b.saved ? "Unchanged" : ""}
                     value={b.password}
                     onInput={(e) => set({ basic: f.basic.map((x, j) => (j === i ? { ...x, password: e.currentTarget.value } : x)) })}
                   />

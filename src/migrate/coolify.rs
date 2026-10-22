@@ -452,7 +452,7 @@ pub fn map(rows: &HashMap<String, Vec<Value>>, running: &[Running], key: &[u8; 3
             n.spec.rollout.strategy = Strategy::StopFirst;
             n.spec.rollout.health_timeout_s = 600;
             n.spec.resources = limits(d);
-            n.spec.database = Some(DatabaseSpec { engine, user: user.into(), database: database.into(), replicas: vec![] });
+            n.spec.database = Some(DatabaseSpec { engine, user: user.into(), database: database.into(), primary: None });
             n.old = Old::Labeled { label: format!("coolify.databaseUuid={uuid}") };
             let names = std::iter::once(uuid.to_string()).chain(containers.iter().flat_map(|c| std::iter::once(c.name.clone()).chain(c.aliases.iter().cloned()))).collect();
             set_names(&mut n, names, networks.get(&id(d, "destination_id")));

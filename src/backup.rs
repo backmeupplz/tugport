@@ -148,7 +148,7 @@ async fn live_container(app: &App, service_id: &str) -> Result<runtime::Replica>
 }
 
 /// Run `producer`'s stdout into `consumer`'s stdin; returns the consumer's stdout.
-async fn pipe(mut producer: Command, mut consumer: Command) -> Result<String> {
+pub async fn pipe(mut producer: Command, mut consumer: Command) -> Result<String> {
     producer.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).kill_on_drop(true);
     consumer.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut p = producer.spawn()?;

@@ -425,6 +425,9 @@ pub async fn delete_service(
     if !a.0.can_destroy(&s.project_id) {
         return Err(ApiError::forbidden("deleting needs the admin role and the destroy grant"));
     }
+    if !crate::replicas::of(&app, &s.id)?.is_empty() {
+        return Err(ApiError::conflict("this database has replicas; promote or delete them first"));
+    }
     crate::deploy::cancel_all(&app, &s.id);
     crate::runtime::remove_service(&app, &s, q.volumes).await?;
     app.db.conn().execute("DELETE FROM services WHERE id = ?1", [&s.id])?;

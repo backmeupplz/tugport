@@ -2,6 +2,7 @@ mod access;
 mod backups;
 mod cloud;
 mod console;
+mod databases;
 mod deploys;
 mod git;
 mod hooks;
@@ -53,6 +54,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/services/{id}/deploy", post(deploys::deploy))
         .route("/api/services/{id}/deploys", get(deploys::list))
         .route("/api/services/{id}/rollback", post(deploys::rollback))
+        .route("/api/services/{id}/replicas", get(databases::list).post(databases::add))
+        .route("/api/services/{id}/promote", post(databases::promote))
         .route("/api/services/{id}/restart", post(deploys::restart))
         .route("/api/services/{id}/stop", post(deploys::stop))
         .route("/api/services/{id}/start", post(deploys::start))

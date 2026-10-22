@@ -31,6 +31,7 @@ mod paths;
 mod proc;
 mod proxy;
 mod registry;
+mod replicas;
 mod runtime;
 mod secrets;
 mod shim;

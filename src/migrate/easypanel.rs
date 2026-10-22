@@ -417,7 +417,7 @@ fn database(svc: &Value, n: &mut NewService) {
     n.spec.rollout.strategy = Strategy::StopFirst;
     n.spec.rollout.health_timeout_s = 600;
     n.spec.resources = resources(&svc["resources"]);
-    n.spec.database = Some(DatabaseSpec { engine, user: user.into(), database: db.into(), replicas: vec![] });
+    n.spec.database = Some(DatabaseSpec { engine, user: user.into(), database: db.into(), primary: None });
     for tool in ["dbGate", "pgWeb", "mongoExpress", "phpMyAdmin", "redisCommander"] {
         if svc[tool]["enabled"].as_bool() == Some(true) {
             n.notes.push(format!("the {tool} admin tool is not moved"));

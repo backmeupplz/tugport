@@ -79,6 +79,7 @@ fn require_job(a: &Auth, project: &Option<String>, role: Role) -> ApiResult<()> 
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub async fn list_jobs(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
     let rows: Vec<(String, Option<String>, String, String, Option<String>, String, i64, bool)> = {
         let conn = app.db.conn();

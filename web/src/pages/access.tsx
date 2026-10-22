@@ -30,9 +30,6 @@ function accessBody(a: Access) {
   };
 }
 
-/** The API resets access on any user PATCH that leaves it out, so every PATCH resends it. */
-const keepAccess = (u: User) => ({ all_projects_role: u.all_projects_role ?? null, projects: u.projects ?? {}, grants: u.grants ?? [] });
-
 function AccessEditor(props: { value: Access; onChange: (a: Access) => void; projects: Project[]; who: string }) {
   const a = props.value;
   const set = (p: Partial<Access>) => props.onChange({ ...a, ...p });
@@ -399,7 +396,7 @@ export function UserPage(props: { id?: string; path?: string }) {
           <>
             <Action
               confirm={u.disabled ? undefined : `Disable ${u.name}? Its sessions end and its keys stop working until you enable it again.`}
-              run={() => patch(`/users/${u.id}`, { disabled: !u.disabled, ...keepAccess(u) }).then(r.reload)}
+              run={() => patch(`/users/${u.id}`, { disabled: !u.disabled }).then(r.reload)}
               done={u.disabled ? "Enabled." : "Disabled."}
             >
               {u.disabled ? "Enable" : "Disable"}

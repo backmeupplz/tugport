@@ -348,11 +348,14 @@ pub async fn create_replica(app: &App, s: &Service, deploy_id: &str, replica: u3
         extra_hosts: Some(vec!["host.docker.internal:host-gateway".into()]),
         ..Default::default()
     };
-    let networking = (!spec.host_network).then(|| NetworkingConfig {
-        endpoints_config: Some(HashMap::from([(
-            network.to_string(),
-            EndpointSettings { aliases: Some(vec![s.name.clone()]), ..Default::default() },
-        )])),
+    let networking = (!spec.host_network).then(|| {
+        let mut aliases = vec![s.name.clone()];
+        aliases.extend(spec.aliases.iter().cloned());
+        let mut endpoints = HashMap::from([(network.to_string(), EndpointSettings { aliases: Some(aliases.clone()), ..Default::default() })]);
+        for extra in &spec.networks {
+            endpoints.insert(extra.clone(), EndpointSettings { aliases: Some(aliases.clone()), ..Default::default() });
+        }
+        NetworkingConfig { endpoints_config: Some(endpoints) }
     });
     let config = ContainerCreateBody {
         image: Some(image.to_string()),

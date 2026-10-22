@@ -182,6 +182,18 @@ async fn serve() -> Result<()> {
 
     let listen = app.settings().panel_listen;
     let router = api::router(app.clone());
+    if let Some(legacy) = app.settings().legacy_listen {
+        let router = router.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&legacy).await {
+                Ok(l) => {
+                    tracing::info!("also serving the API on {legacy}");
+                    let _ = axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+                }
+                Err(e) => tracing::warn!("cannot listen on {legacy}: {e}"),
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("listening on {listen}"))?;
     tracing::info!("tugport {VERSION} panel on http://{listen}");
     axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())

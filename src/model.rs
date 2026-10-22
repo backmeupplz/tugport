@@ -40,6 +40,10 @@ pub struct ServiceSpec {
     pub compose: Option<ComposeSpec>,
     /// Env var names passed to builds as build args (in addition to ARGs the Dockerfile declares).
     pub build_args: Vec<String>,
+    /// Extra DNS names on the project network (migrated services keep their old hostnames).
+    pub aliases: Vec<String>,
+    /// Extra Docker networks to join, by name.
+    pub networks: Vec<String>,
 }
 
 impl Default for ServiceSpec {
@@ -74,6 +78,8 @@ impl Default for ServiceSpec {
             database: None,
             compose: None,
             build_args: vec![],
+            aliases: vec![],
+            networks: vec![],
         }
     }
 }

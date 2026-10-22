@@ -89,8 +89,18 @@ pub async fn log_usage(State(app): State<AppState>, a: Auth) -> ApiResult<Json<V
     Ok(Json(json!({ "total_bytes": total, "services": per.into_iter().map(|(id, b)| json!({ "id": id, "bytes": b })).collect::<Vec<_>>() })))
 }
 
-pub async fn metrics_now(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
-    let mut snap = crate::util::lock(&app.metrics.latest).clone();
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct NodeQuery {
+    node: Option<String>,
+}
+
+/// The latest snapshot of a server (this one by default).
+pub async fn metrics_now(State(app): State<AppState>, a: Auth, Query(q): Query<NodeQuery>) -> ApiResult<Json<Value>> {
+    let mut snap = match q.node.as_deref().filter(|n| *n != "local") {
+        Some(n) => crate::util::lock(&app.metrics.nodes).get(n).cloned().ok_or_else(|| ApiError::not_found("no metrics from that server yet"))?,
+        None => crate::util::lock(&app.metrics.latest).clone(),
+    };
     if !a.0.is_owner && a.0.all_projects_role.is_none() {
         // Per-service numbers only for services the caller can see.
         let visible: Vec<String> = crate::store::services(&app, None)?.into_iter().filter(|s| a.0.can(&s.project_id, Role::Viewer)).map(|s| s.id).collect();
@@ -105,6 +115,8 @@ pub struct MetricsQuery {
     scope: Option<String>,
     names: Option<String>,
     range: Option<String>,
+    /// Server for host and GPU scopes (default: the panel's own).
+    node: Option<String>,
 }
 
 pub async fn metrics_query(State(app): State<AppState>, a: Auth, Query(q): Query<MetricsQuery>) -> ApiResult<Json<Value>> {
@@ -120,7 +132,8 @@ pub async fn metrics_query(State(app): State<AppState>, a: Auth, Query(q): Query
     let names: Vec<String> = q.names.map(|n| n.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
     let range = metrics::parse_range(q.range.as_deref().unwrap_or("1h"));
     let app2 = app.clone();
-    let (step, series) = tokio::task::spawn_blocking(move || metrics::query(&app2, &scope, &names, range)).await.map_err(anyhow::Error::from)??;
+    let node = q.node.unwrap_or_else(|| "local".into());
+    let (step, series) = tokio::task::spawn_blocking(move || metrics::query(&app2, &node, &scope, &names, range)).await.map_err(anyhow::Error::from)??;
     Ok(Json(json!({ "step": step, "series": series })))
 }
 

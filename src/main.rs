@@ -1,4 +1,5 @@
 mod acme;
+mod agent;
 mod alerts;
 mod api;
 mod app;
@@ -18,8 +19,10 @@ mod handoff;
 mod install;
 mod logs;
 mod mcp;
+mod mesh;
 mod metrics;
 mod model;
+mod nodes;
 mod notify;
 mod paths;
 mod proc;
@@ -60,6 +63,8 @@ struct Cli {
 enum Cmd {
     /// Run the panel, proxy and deploy engine.
     Server,
+    /// Run on a server added to a panel (started by its systemd unit).
+    Node,
     /// Print a one-time link for creating the owner account.
     SetupLink,
     /// Restore the master key from its recovery key after a reinstall.
@@ -100,6 +105,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Server => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve()),
+        Cmd::Node => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(agent::run()),
         Cmd::Client(c) => {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let code = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(cli::run(c, cli.json))?;
@@ -128,7 +134,7 @@ pub fn public_ip() -> Option<String> {
 
 /// Containers mount a static copy of this binary as their init. `TUGPORT_INIT` overrides
 /// the source (development builds link glibc and cannot run in every image).
-fn install_init_binary(app: &app::App) -> Result<()> {
+pub fn install_init_binary(app: &app::App) -> Result<()> {
     let src = match std::env::var_os("TUGPORT_INIT") {
         Some(p) => std::path::PathBuf::from(p),
         None => std::env::current_exe()?,
@@ -187,8 +193,13 @@ async fn serve() -> Result<()> {
         logs: tokio::sync::broadcast::channel(8192).0,
         selflog,
         metrics: metrics::Metrics::default(),
+        nodes: nodes::Nodes::default(),
     });
     drop(master);
+    nodes::load(&app)?;
+    if let Err(e) = nodes::restore_mesh(&app) {
+        tracing::error!("bringing up the server mesh: {e:#}");
+    }
     install_init_binary(&app)?;
     deploy::recover_interrupted(&app)?;
     match secrets::rematerialize(&app).await {
@@ -205,7 +216,8 @@ async fn serve() -> Result<()> {
     tokio::spawn(proxy::watch(app.clone()));
     tokio::spawn(acme::run(app.clone()));
     tokio::spawn(logs::collect(app.clone()));
-    tokio::spawn(metrics::sample_loop(app.clone()));
+    tokio::spawn(metrics::sample_loop(app.clone(), true));
+    tokio::spawn(nodes::health_loop(app.clone()));
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));

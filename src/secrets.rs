@@ -63,9 +63,11 @@ pub async fn rematerialize(app: &App) -> Result<usize> {
         if s.kind == "compose" {
             continue;
         }
-        let env = crate::store::resolved_env(app, &s)?;
+        let mut env = crate::store::resolved_env(app, &s)?;
+        crate::runtime::add_port(app, &s, &mut env)?;
         let files = crate::store::files(app, &s.id)?;
-        for r in crate::runtime::replicas(app, &s.id).await? {
+        // Other servers keep their own; the panel sends them again after a reboot there.
+        for r in crate::runtime::replicas(app, &s.id).await?.into_iter().filter(|r| r.node == "local") {
             materialize(app, &r.name, &env)?;
             materialize_files(app, &r.name, &files)?;
             n += 1;

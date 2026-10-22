@@ -27,9 +27,35 @@ pub async fn run(app: AppState) {
 }
 
 pub async fn clean(app: &App) -> Result<String> {
+    let (mut containers, mut images) = (0, 0);
+    for (node, docker) in runtime::dockers(app) {
+        match clean_on(app, &node, &docker).await {
+            Ok((c, i)) => {
+                containers += c;
+                images += i;
+            }
+            Err(e) if node == "local" => return Err(e),
+            Err(e) => tracing::warn!("docker cleanup on {node}: {e:#}"),
+        }
+    }
+    crate::nodes::reset_registry(app).await;
+    // Builds only run here.
+    let cap = format!("{}gb", app.settings().docker_cleanup.build_cache_gb);
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args(["builder", "prune", "-f", "--max-used-space", &cap]);
+    if crate::proc::output(cmd).await.is_err() {
+        let mut old = tokio::process::Command::new("docker");
+        old.args(["builder", "prune", "-f", "--keep-storage", &cap]);
+        let _ = crate::proc::output(old).await;
+    }
+    Ok(format!("removed {containers} leftover containers and {images} unused images"))
+}
+
+/// Leftover containers and unused images on one server.
+async fn clean_on(app: &App, node: &str, docker: &bollard::Docker) -> Result<(usize, usize)> {
     let mut removed_containers = 0;
     let mut removed_images = 0;
-    let all = app.docker.list_containers(Some(ListContainersOptions { all: true, ..Default::default() })).await?;
+    let all = docker.list_containers(Some(ListContainersOptions { all: true, ..Default::default() })).await?;
     let in_use: HashSet<String> = all.iter().filter_map(|c| c.image_id.clone()).collect();
 
     // Containers Tugport left behind (failed or cancelled deploys), not part of what's live.
@@ -43,7 +69,7 @@ pub async fn clean(app: &App) -> Result<String> {
         let old = util::now() - c.created.unwrap_or(0) > 3600;
         if stale && old && runtime::live_deploy(app, service).as_deref() != Some(deploy.as_str()) {
             let name = c.names.as_ref().and_then(|n| n.first()).map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
-            runtime::remove(app, c.id.as_deref().unwrap_or_default(), &name).await?;
+            runtime::remove(app, node, c.id.as_deref().unwrap_or_default(), &name).await?;
             removed_containers += 1;
         }
     }
@@ -65,7 +91,7 @@ pub async fn clean(app: &App) -> Result<String> {
             }
         }
     }
-    let images = app.docker.list_images(Some(ListImagesOptions { all: false, ..Default::default() })).await?;
+    let images = docker.list_images(Some(ListImagesOptions { all: false, ..Default::default() })).await?;
     let mut by_tag: HashMap<String, (String, i64)> = HashMap::new();
     for i in &images {
         for t in i.repo_tags.iter() {
@@ -83,23 +109,15 @@ pub async fn clean(app: &App) -> Result<String> {
             continue;
         }
         for t in &tags {
-            if app.docker.remove_image(t, Some(RemoveImageOptions { force: false, noprune: false }), None).await.is_ok() {
+            if docker.remove_image(t, Some(RemoveImageOptions { force: false, noprune: false }), None).await.is_ok() {
                 removed_images += 1;
             }
         }
     }
 
-    // Dangling layers and build cache above the cap.
+    // Dangling layers.
     let mut prune = HashMap::new();
     prune.insert("dangling".to_string(), vec!["true".to_string()]);
-    let _ = app.docker.prune_images(Some(bollard::query_parameters::PruneImagesOptions { filters: Some(prune) })).await;
-    let cap = format!("{}gb", app.settings().docker_cleanup.build_cache_gb);
-    let mut cmd = tokio::process::Command::new("docker");
-    cmd.args(["builder", "prune", "-f", "--max-used-space", &cap]);
-    if crate::proc::output(cmd).await.is_err() {
-        let mut old = tokio::process::Command::new("docker");
-        old.args(["builder", "prune", "-f", "--keep-storage", &cap]);
-        let _ = crate::proc::output(old).await;
-    }
-    Ok(format!("removed {removed_containers} leftover containers and {removed_images} unused images"))
+    let _ = docker.prune_images(Some(bollard::query_parameters::PruneImagesOptions { filters: Some(prune) })).await;
+    Ok((removed_containers, removed_images))
 }

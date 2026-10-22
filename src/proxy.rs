@@ -4,6 +4,7 @@
 use crate::app::{App, AppState};
 use crate::model::{DomainOptions, WwwRedirect};
 use crate::{runtime, store};
+use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
@@ -23,11 +24,52 @@ use std::time::Duration;
 pub type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = BoxBody<Bytes, BoxErr>;
 
+/// The routing table as data: built by the panel, pushed to every server, and compiled
+/// there into `Routes` relative to that server.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Table {
+    pub routes: Vec<RouteSpec>,
+    /// Node id -> that node's proxy on the mesh.
+    pub nodes: HashMap<String, SocketAddr>,
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RouteSpec {
+    pub host: String,
+    pub path: String,
+    pub service_id: Option<String>,
+    pub project_id: Option<String>,
+    pub https: bool,
+    pub via_tunnel: bool,
+    pub options: DomainOptions,
+    pub targets: Vec<Target>,
+    pub asleep: bool,
+}
+
+/// A replica: the node it runs on and its address as seen from that node.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Target {
+    pub node: String,
+    pub addr: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Upstream {
+    /// A replica on this server.
+    Local(SocketAddr),
+    /// Another server's proxy, which serves its own replicas.
+    Node(SocketAddr),
+}
+
+/// Requests one proxy forwards to another carry this header.
+const HOP: &str = "x-tugport-hop";
+
 pub struct Route {
     pub service_id: Option<String>,
     pub project_id: Option<String>,
     pub path: String,
-    pub upstreams: Vec<SocketAddr>,
+    pub upstreams: Vec<Upstream>,
     pub https: bool,
     pub via_tunnel: bool,
     pub options: DomainOptions,
@@ -40,6 +82,45 @@ pub struct Route {
 #[derive(Default)]
 pub struct Routes {
     pub hosts: HashMap<String, Vec<Arc<Route>>>,
+    pub trusted: Vec<ipnet::IpNet>,
+}
+
+/// Turn a table into routes as seen from node `me`.
+pub fn compile(table: &Table, me: &str) -> Routes {
+    let mut hosts: HashMap<String, Vec<Arc<Route>>> = HashMap::new();
+    for spec in &table.routes {
+        let mut upstreams: Vec<Upstream> = vec![];
+        for t in &spec.targets {
+            let u = if t.node == me { Some(Upstream::Local(t.addr)) } else { table.nodes.get(&t.node).map(|a| Upstream::Node(*a)) };
+            if let Some(u) = u
+                && !upstreams.contains(&u)
+            {
+                upstreams.push(u);
+            }
+        }
+        let redirects = spec.options.redirects.iter().filter_map(|r| regex::Regex::new(&r.from).ok().map(|re| (re, r.to.clone(), r.permanent))).collect();
+        let rewrite = spec.options.rewrite.as_ref().and_then(|r| regex::Regex::new(&r.from).ok().map(|re| (re, r.to.clone())));
+        hosts.entry(spec.host.clone()).or_default().push(Arc::new(Route {
+            service_id: spec.service_id.clone(),
+            project_id: spec.project_id.clone(),
+            path: spec.path.clone(),
+            upstreams,
+            https: spec.https,
+            via_tunnel: spec.via_tunnel,
+            options: spec.options.clone(),
+            redirects,
+            rewrite,
+            asleep: spec.asleep,
+        }));
+    }
+    for routes in hosts.values_mut() {
+        routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
+    }
+    let mut trusted = table.trusted_proxies.clone();
+    if let Ok(mesh) = "10.99.0.0/16".parse() {
+        trusted.push(mesh);
+    }
+    Routes { hosts, trusted }
 }
 
 impl Routes {
@@ -60,10 +141,15 @@ pub struct Traffic {
 
 pub struct Proxy {
     routes: RwLock<Arc<Routes>>,
+    table: RwLock<Arc<Table>>,
+    /// This server's node id ("local" on the panel's server).
+    pub me: RwLock<String>,
     certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
     fallback: Arc<CertifiedKey>,
     pub challenges: Mutex<HashMap<String, String>>,
     rr: AtomicUsize,
+    /// Other servers' proxies that just refused a connection, until when to skip them.
+    down: Mutex<HashMap<SocketAddr, std::time::Instant>>,
     pub traffic: Mutex<HashMap<String, Traffic>>,
     reload: tokio::sync::Notify,
     http1: Client<HttpConnector, Body>,
@@ -80,10 +166,13 @@ impl Proxy {
         let fallback = certified_key(&self_signed.cert.pem(), &self_signed.signing_key.serialize_pem())?;
         Ok(Proxy {
             routes: RwLock::new(Arc::new(Routes::default())),
+            table: RwLock::new(Arc::new(Table::default())),
+            me: RwLock::new("local".into()),
             certs: RwLock::new(HashMap::new()),
             fallback: Arc::new(fallback),
             challenges: Mutex::new(HashMap::new()),
             rr: AtomicUsize::new(0),
+            down: Mutex::new(HashMap::new()),
             traffic: Mutex::new(HashMap::new()),
             reload: tokio::sync::Notify::new(),
             http1: Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).build(conn.clone()),
@@ -94,6 +183,17 @@ impl Proxy {
 
     pub fn routes(&self) -> Arc<Routes> {
         crate::util::read(&self.routes).clone()
+    }
+
+    pub fn table(&self) -> Arc<Table> {
+        crate::util::read(&self.table).clone()
+    }
+
+    /// Install a routing table (the panel builds it; servers receive it over the mesh).
+    pub fn set_table(&self, table: Table) {
+        let me = crate::util::read(&self.me).clone();
+        *crate::util::write(&self.routes) = Arc::new(compile(&table, &me));
+        *crate::util::write(&self.table) = Arc::new(table);
     }
 
     pub fn set_cert(&self, host: &str, key: CertifiedKey) {
@@ -141,8 +241,8 @@ pub fn reload(app: &App) {
     app.proxy.reload.notify_one();
 }
 
-async fn build_routes(app: &App) -> Result<Routes> {
-    let mut hosts: HashMap<String, Vec<Arc<Route>>> = HashMap::new();
+async fn build_table(app: &App) -> Result<Table> {
+    let mut routes = vec![];
     let services: HashMap<String, store::Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
     let mut replicas: HashMap<String, Vec<runtime::Replica>> = HashMap::new();
     for d in store::domains(app, None)? {
@@ -151,7 +251,7 @@ async fn build_routes(app: &App) -> Result<Routes> {
             replicas.insert(s.id.clone(), runtime::replicas(app, &s.id).await.unwrap_or_default());
         }
         let live = runtime::live_deploy(app, &s.id);
-        let upstreams = replicas[&s.id]
+        let targets = replicas[&s.id]
             .iter()
             .filter(|r| r.state == "running")
             .filter(|r| match (&d.container, s.kind.as_str()) {
@@ -159,89 +259,76 @@ async fn build_routes(app: &App) -> Result<Routes> {
                 (None, "compose") => true,
                 _ => live.as_deref().is_none_or(|l| r.deploy == l),
             })
-            .filter_map(|r| r.ip.as_ref()?.parse::<IpAddr>().ok())
-            .map(|ip| SocketAddr::new(ip, d.port))
+            .filter_map(|r| Some(Target { node: r.node.clone(), addr: SocketAddr::new(r.ip.as_ref()?.parse().ok()?, d.port) }))
             .collect();
-        let redirects = d
-            .options
-            .redirects
-            .iter()
-            .filter_map(|r| regex::Regex::new(&r.from).ok().map(|re| (re, r.to.clone(), r.permanent)))
-            .collect();
-        let rewrite = d.options.rewrite.as_ref().and_then(|r| regex::Regex::new(&r.from).ok().map(|re| (re, r.to.clone())));
-        let route = Route {
+        routes.push(RouteSpec {
+            host: d.host.clone(),
+            path: d.path.clone(),
             service_id: Some(s.id.clone()),
             project_id: Some(s.project_id.clone()),
-            path: d.path.clone(),
-            upstreams,
             https: d.https,
             via_tunnel: d.via_tunnel,
             options: d.options.clone(),
-            redirects,
-            rewrite,
+            targets,
             asleep: crate::sleep::is_asleep(app, &s.id),
-        };
-        hosts.entry(d.host.clone()).or_default().push(Arc::new(route));
+        });
     }
     let settings = app.settings();
     if let Some(panel) = &settings.panel_domain {
         let port = settings.panel_listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(8484);
         let ip = settings.panel_listen.rsplit_once(':').and_then(|(ip, _)| ip.trim_matches(['[', ']']).parse::<IpAddr>().ok()).filter(|ip| !ip.is_unspecified());
-        let upstream = SocketAddr::new(ip.unwrap_or(IpAddr::from([127, 0, 0, 1])), port);
+        let addr = SocketAddr::new(ip.unwrap_or(IpAddr::from([127, 0, 0, 1])), port);
         // A private panel still takes webhooks on its public domain, and nothing else.
-        let paths: &[&str] = if settings.panel_public { &["/"] } else { &["/api/hooks", "/api/deploy"] };
+        let paths: &[&str] = if settings.panel_public { &["/"] } else { &["/api/hooks", "/api/deploy", "/api/nodes/join"] };
         for path in paths {
-            hosts.entry(panel.clone()).or_default().push(Arc::new(Route {
+            routes.push(RouteSpec {
+                host: panel.clone(),
+                path: path.to_string(),
                 service_id: None,
                 project_id: None,
-                path: path.to_string(),
-                upstreams: vec![upstream],
                 https: true,
                 via_tunnel: false,
                 options: DomainOptions { timeout_s: Some(3600), ..Default::default() },
-                redirects: vec![],
-                rewrite: None,
+                targets: vec![Target { node: "local".into(), addr }],
                 asleep: false,
-            }));
+            });
         }
     }
-    for routes in hosts.values_mut() {
-        routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
-    }
-    Ok(Routes { hosts })
+    Ok(Table { routes, nodes: crate::nodes::proxy_addresses(app), trusted_proxies: settings.trusted_proxies })
 }
 
-/// Build the routing table once; call before serving so the first request already routes.
-pub async fn initial_routes(app: &App) {
-    match build_routes(app).await {
-        Ok(r) => *crate::util::write(&app.proxy.routes) = Arc::new(r),
+async fn rebuild(app: &App) {
+    match build_table(app).await {
+        Ok(t) => {
+            let changed = *app.proxy.table() != t;
+            app.proxy.set_table(t);
+            if changed {
+                crate::nodes::push_routes(app);
+            }
+        }
         Err(e) => tracing::error!("building routes: {e:#}"),
     }
 }
 
-/// Keep the routing table fresh: on demand, on container events, and every 30 seconds.
+/// Build the routing table once; call before serving so the first request already routes.
+pub async fn initial_routes(app: &App) {
+    rebuild(app).await;
+}
+
+/// Keep the routing table fresh: on demand, on container events on any server, and every 30 seconds.
 pub async fn watch(app: AppState) {
-    {
-        let app = app.clone();
-        tokio::spawn(async move {
-            use futures_util::StreamExt;
-            let filters = HashMap::from([("type".to_string(), vec!["container".to_string()])]);
-            loop {
-                let mut events = app.docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters.clone()), ..Default::default() }));
-                while let Some(Ok(e)) = events.next().await {
-                    if matches!(e.action.as_deref(), Some("start" | "die" | "stop" | "pause" | "unpause")) || e.action.as_deref().is_some_and(|a| a.starts_with("health_status")) {
-                        reload(&app);
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::spawn(crate::nodes::for_each_node(app.clone(), |app, node| async move {
+        use futures_util::StreamExt;
+        let filters = HashMap::from([("type".to_string(), vec!["container".to_string()])]);
+        let mut events = node.docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
+        while let Some(Ok(e)) = events.next().await {
+            if matches!(e.action.as_deref(), Some("start" | "die" | "stop" | "pause" | "unpause")) || e.action.as_deref().is_some_and(|a| a.starts_with("health_status")) {
+                reload(&app);
             }
-        });
-    }
-    loop {
-        match build_routes(&app).await {
-            Ok(r) => *crate::util::write(&app.proxy.routes) = Arc::new(r),
-            Err(e) => tracing::error!("building routes: {e:#}"),
         }
+    }));
+    loop {
+        rebuild(&app).await;
         tokio::select! {
             _ = app.proxy.reload.notified() => tokio::time::sleep(Duration::from_millis(150)).await,
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
@@ -312,6 +399,8 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let _guard = crate::handoff::ConnGuard::new();
+    // Dual-stack listeners see IPv4 clients as ::ffff:a.b.c.d; trust checks need a.b.c.d.
+    let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
     let svc = hyper::service::service_fn(move |req| {
         let app = app.clone();
         async move { Ok::<_, std::convert::Infallible>(handle(app, req, peer, tls).await) }
@@ -380,7 +469,8 @@ fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: &[ipnet::IpNet]) -> (Ip
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .filter_map(|s| s.trim().parse().ok())
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
         .collect();
     let client = chain.iter().rev().find(|ip| !is_trusted(ip)).copied().or(chain.first().copied()).unwrap_or(peer);
     (client, true)
@@ -392,8 +482,11 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
 
     if !tls
         && let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-            return match crate::util::lock(&app.proxy.challenges).get(token) {
-                Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth.clone()),
+            let known = crate::util::lock(&app.proxy.challenges).get(token).cloned();
+            return match known {
+                Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth),
+                // The panel runs ACME; DNS may point at any server.
+                None if *crate::util::read(&app.proxy.me) != "local" => panel_challenge(&host, &path).await,
                 None => full(StatusCode::NOT_FOUND, "text/plain", "unknown challenge"),
             };
         }
@@ -402,8 +495,10 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     let Some(route) = routes.find(&host, &path) else {
         return page(StatusCode::NOT_FOUND, "Nothing here yet", &format!("No service is set up for {host}."));
     };
-    let settings_trusted = app.settings().trusted_proxies;
-    let (client, via_trusted) = client_ip(req.headers(), peer.ip(), &settings_trusted);
+    let (client, via_trusted) = client_ip(req.headers(), peer.ip(), &routes.trusted);
+    // A neighbour proxy already chose this server and checked auth: serve from local
+    // replicas only. Only Tugport itself can open connections from the mesh.
+    let hop = req.headers().contains_key(HOP) && in_mesh(peer.ip());
     let forwarded_https = via_trusted && req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     let scheme = if tls || forwarded_https { "https" } else { "http" };
     let path_and_query = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
@@ -430,13 +525,13 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
             return redirect(if *permanent { StatusCode::PERMANENT_REDIRECT } else { StatusCode::FOUND }, &target);
         }
     }
-    if !route.options.basic_auth.is_empty() && !basic_auth_ok(&app, &route, req.headers()) {
+    if !hop && !route.options.basic_auth.is_empty() && !basic_auth_ok(&app, &route, req.headers()) {
         let mut r = page(StatusCode::UNAUTHORIZED, "Sign in", "This site needs a user name and password.");
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Restricted\", charset=\"UTF-8\""));
         return r;
     }
     let mut extra_headers = vec![];
-    if let Some(fa) = &route.options.forward_auth {
+    if let Some(fa) = route.options.forward_auth.as_ref().filter(|_| !hop) {
         match forward_auth(&app, fa, &req, scheme, &host, client).await {
             Ok(h) => extra_headers = h,
             Err(resp) => return resp,
@@ -449,26 +544,39 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
         e.requests += 1;
         e.last_at = crate::util::now();
     }
-    let upstreams = if route.upstreams.is_empty() && route.asleep {
+    let mut upstreams: Vec<Upstream> = route.upstreams.iter().filter(|u| !hop || matches!(u, Upstream::Local(_))).copied().collect();
+    if upstreams.is_empty() && route.asleep && !hop {
         match crate::sleep::wake(&app, route.service_id.as_deref().unwrap_or_default()).await {
-            Ok(u) => u.into_iter().map(|ip| SocketAddr::new(ip, route.upstreams.first().map(|u| u.port()).unwrap_or(80))).collect(),
+            Ok(woken) => upstreams = woken,
             Err(e) => return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Waking up failed", &e.to_string()),
         }
-    } else {
-        route.upstreams.clone()
-    };
+    }
     if upstreams.is_empty() {
         return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Service unavailable", "The service is not running right now.");
     }
+    // Skip servers that just failed, unless nothing else is left.
+    {
+        let now = std::time::Instant::now();
+        let mut down = crate::util::lock(&app.proxy.down);
+        down.retain(|_, until| *until > now);
+        let up: Vec<Upstream> = upstreams.iter().filter(|u| !matches!(u, Upstream::Node(a) if down.contains_key(a))).copied().collect();
+        if !up.is_empty() {
+            upstreams = up;
+        }
+    }
     let upstream = upstreams[app.proxy.rr.fetch_add(1, Ordering::Relaxed) % upstreams.len()];
+    let (upstream, via_node) = match upstream {
+        Upstream::Local(a) => (a, false),
+        Upstream::Node(a) => (a, true),
+    };
 
     // Path handling: strip the route prefix, then apply a rewrite.
     let mut new_pq = path_and_query.clone();
-    if route.options.strip_prefix && route.path != "/" {
+    if route.options.strip_prefix && route.path != "/" && !via_node {
         let prefix = route.path.trim_end_matches('/');
         new_pq = new_pq.strip_prefix(prefix).map(|r| if r.starts_with('/') { r.to_string() } else { format!("/{r}") }).unwrap_or(new_pq);
     }
-    if let Some((re, to)) = &route.rewrite {
+    if let Some((re, to)) = route.rewrite.as_ref().filter(|_| !via_node) {
         new_pq = re.replace(&new_pq, to.as_str()).to_string();
     }
 
@@ -502,6 +610,9 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     for (k, v) in extra_headers {
         parts.headers.insert(k, v);
     }
+    if via_node {
+        parts.headers.insert(HeaderName::from_static(HOP), HeaderValue::from_static("1"));
+    }
     let limit = route.options.max_body_mb.map(|mb| (mb * 1024 * 1024) as usize);
     let body: Body = match limit {
         Some(l) => Limited::new(body, l).boxed(),
@@ -518,6 +629,10 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::debug!("upstream {upstream} for {host}: {e}");
+            if via_node && e.is_connect() {
+                crate::util::lock(&app.proxy.down).insert(upstream, std::time::Instant::now() + Duration::from_secs(15));
+                reload(&app);
+            }
             return error_page(Some(&route), StatusCode::BAD_GATEWAY, "Bad gateway", "The service did not answer. It may be starting or crashing.");
         }
         Err(_) => return error_page(Some(&route), StatusCode::GATEWAY_TIMEOUT, "Gateway timeout", "The service took too long to answer."),
@@ -543,6 +658,22 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
         }
     strip_hop_headers(&mut rparts.headers, false);
     Response::from_parts(rparts, rbody.map_err(|e| Box::new(e) as BoxErr).boxed())
+}
+
+fn in_mesh(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[..2] == [10, 99])
+}
+
+async fn panel_challenge(host: &str, path: &str) -> Response<Body> {
+    let url = format!("http://{}{path}", crate::mesh::PANEL_IP);
+    let answer = async {
+        let r = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().ok()?.get(url).header("host", host).send().await.ok()?;
+        if r.status().is_success() { r.text().await.ok() } else { None }
+    };
+    match answer.await {
+        Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth),
+        None => full(StatusCode::NOT_FOUND, "text/plain", "unknown challenge"),
+    }
 }
 
 fn strip_hop_headers(h: &mut HeaderMap, keep_upgrade: bool) {
@@ -642,5 +773,35 @@ mod tests {
         assert_eq!(client_ip(&h, "10.0.0.3".parse().unwrap(), &trusted), ("203.0.113.9".parse().unwrap(), true));
         // Untrusted peers cannot spoof their address.
         assert_eq!(client_ip(&h, "198.51.100.7".parse().unwrap(), &trusted), ("198.51.100.7".parse().unwrap(), false));
+        // Mapped addresses in the chain count as IPv4.
+        h.insert("x-forwarded-for", "::ffff:203.0.113.9".parse().unwrap());
+        assert_eq!(client_ip(&h, "10.0.0.3".parse().unwrap(), &trusted).0, "203.0.113.9".parse::<IpAddr>().unwrap());
+        assert!(in_mesh("10.99.0.2".parse().unwrap()));
+        assert!(!in_mesh("10.98.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn tables_compile_per_server() {
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let spec = RouteSpec {
+            host: "a.test".into(),
+            path: "/".into(),
+            service_id: Some("s".into()),
+            project_id: None,
+            https: false,
+            via_tunnel: false,
+            options: DomainOptions::default(),
+            targets: vec![Target { node: "local".into(), addr: addr("172.20.0.2:80") }, Target { node: "n1".into(), addr: addr("172.21.0.2:80") }],
+            asleep: false,
+        };
+        let nodes = HashMap::from([("local".to_string(), addr("10.99.0.1:80")), ("n1".to_string(), addr("10.99.0.2:80"))]);
+        let table = Table { routes: vec![spec], nodes, trusted_proxies: vec![] };
+        let on_panel = compile(&table, "local");
+        let r = &on_panel.hosts["a.test"][0];
+        assert_eq!(r.upstreams, vec![Upstream::Local(addr("172.20.0.2:80")), Upstream::Node(addr("10.99.0.2:80"))]);
+        let on_worker = compile(&table, "n1");
+        let r = &on_worker.hosts["a.test"][0];
+        assert_eq!(r.upstreams, vec![Upstream::Node(addr("10.99.0.1:80")), Upstream::Local(addr("172.21.0.2:80"))]);
+        assert!(on_worker.trusted.iter().any(|n| n.contains(&"10.99.0.1".parse::<IpAddr>().unwrap())));
     }
 }

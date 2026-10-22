@@ -4,6 +4,7 @@ mod console;
 mod deploys;
 mod git;
 mod hooks;
+mod nodes;
 mod observe;
 pub mod projects;
 
@@ -68,6 +69,10 @@ pub fn router(app: AppState) -> Router {
         .route("/api/metrics", get(observe::metrics_query))
         .route("/api/metrics/now", get(observe::metrics_now))
         .route("/api/docker/usage", get(observe::docker_usage))
+        .route("/api/nodes", get(nodes::list))
+        .route("/api/nodes/join-token", post(nodes::join_token))
+        .route("/api/nodes/join", post(nodes::join))
+        .route("/api/nodes/{id}", patch(nodes::update).delete(nodes::remove))
         .route("/api/notifications", get(observe::list_channels).post(observe::create_channel))
         .route("/api/notifications/{id}", delete(observe::delete_channel))
         .route("/api/notifications/{id}/test", post(observe::test_channel))
@@ -164,7 +169,7 @@ impl IntoResponse for ApiError {
 /// The client's address. Requests that arrive through our own proxy (loopback)
 /// carry the real address in the last X-Forwarded-For entry.
 pub fn client_ip(parts: &Parts) -> Option<IpAddr> {
-    let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())?;
+    let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical())?;
     if peer.is_loopback()
         && let Some(xff) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
             && let Some(last) = xff.rsplit(',').next().and_then(|s| s.trim().parse().ok()) {

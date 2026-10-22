@@ -13,6 +13,12 @@ pub struct InstallArgs {
     /// Skip offering to migrate an existing Easypanel or Coolify.
     #[arg(long)]
     pub no_migrate: bool,
+    /// Add this server to an existing panel (the panel shows the full command).
+    #[arg(long, requires = "token", value_name = "PANEL_URL")]
+    pub join: Option<String>,
+    /// One-time token for --join.
+    #[arg(long, requires = "join")]
+    pub token: Option<String>,
 }
 
 fn ask(yes: bool, question: &str) -> bool {
@@ -105,6 +111,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
         std::fs::copy(&exe, target).context("copying the binary to /usr/local/bin")?;
         crate::paths::restrict(target, 0o755)?;
     }
+    if let (Some(panel), Some(token)) = (&args.join, &args.token) {
+        return join(panel, token);
+    }
     let has_key = paths.etc.join("master.key").exists() || paths.etc.join("master.key.cred").exists();
     if !has_key {
         let (key, store) = crate::crypto::create_master(&paths.etc)?;
@@ -156,6 +165,36 @@ pub fn install(args: InstallArgs) -> Result<()> {
     }
     if ok(Command::new("sh").args(["-c", "ufw status | grep -q 'Status: active'"])) {
         println!("ufw is active: allow the panel and web traffic with `ufw allow 80,443,8484/tcp`.");
+    }
+    Ok(())
+}
+
+/// Become a server of an existing panel: mesh, overlay networks, then the agent service.
+fn join(panel: &str, token: &str) -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(crate::agent::join(panel, token))?;
+    let unit = "[Unit]\n\
+Description=Tugport node\n\
+Documentation=https://tugport.com\n\
+After=network-online.target docker.service\n\
+Wants=network-online.target\n\
+Requires=docker.service\n\
+\n\
+[Service]\n\
+ExecStart=/usr/local/bin/tugport node\n\
+Restart=always\n\
+RestartSec=2\n\
+Environment=RUST_LOG=tugport=info\n\
+LimitNOFILE=1048576\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n";
+    std::fs::write("/etc/systemd/system/tugport-node.service", unit)?;
+    run(Command::new("systemctl").arg("daemon-reload"))?;
+    run(Command::new("systemctl").args(["enable", "--now", "tugport-node.service"]))?;
+    println!("\nThis server joined {panel} as {} on the private network. It shows up under Servers within a minute.", config.mesh_ip);
+    if ok(Command::new("sh").args(["-c", "ufw status | grep -q 'Status: active'"])) {
+        println!("ufw is active: allow the mesh and web traffic with `ufw allow 51820/udp && ufw allow 80,443/tcp`.");
     }
     Ok(())
 }

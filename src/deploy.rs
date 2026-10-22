@@ -26,6 +26,11 @@ impl Deployer {
     pub fn idle(&self) -> bool {
         crate::util::lock(&self.queues).is_empty()
     }
+
+    /// A deploy of this service is running or waiting.
+    pub fn busy(&self, service_id: &str) -> bool {
+        crate::util::lock(&self.queues).contains_key(service_id)
+    }
 }
 
 #[derive(Default)]
@@ -342,27 +347,40 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
     let n = s.spec.replicas.max(1);
     let strategy = if !s.spec.ports.is_empty() || s.kind == "database" || s.spec.host_network { Strategy::StopFirst } else { s.spec.rollout.strategy };
     let timeout = Duration::from_secs(s.spec.rollout.health_timeout_s.max(10) as u64);
+    let nodes = crate::nodes::place(app, s, n).await?;
+    let mut distinct: Vec<&crate::nodes::NodeHandle> = vec![];
+    for node in &nodes {
+        if !distinct.iter().any(|d| d.id == node.id) {
+            distinct.push(node);
+        }
+    }
+    if crate::nodes::mesh_enabled(app) {
+        log.line(&format!("Running on {}", distinct.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    for node in &distinct {
+        crate::nodes::ship_image(app, node, s, image, &|l| log.line(l)).await?;
+    }
 
     if strategy == Strategy::StopFirst {
         if !old.is_empty() {
             log.line(&format!("Stopping the old version ({} container{})", old.len(), if old.len() == 1 { "" } else { "s" }));
         }
         for r in &old {
-            runtime::stop(app, &r.id, 30).await?;
+            runtime::stop(app, &r.node, &r.id, 30).await?;
         }
     }
 
-    let mut created = vec![];
+    let mut created: Vec<(String, String)> = vec![];
     let result: Result<()> = async {
-        for i in 1..=n {
-            let id = runtime::create_replica(app, s, deploy_id, i, image, &img, &network, i == 1).await?;
-            runtime::start(app, &id).await?;
-            created.push(id);
+        for (i, node) in nodes.iter().enumerate() {
+            let id = runtime::create_replica(app, node, s, deploy_id, i as u32 + 1, image, &img, &network, i == 0).await?;
+            created.push((node.id.clone(), id.clone()));
+            runtime::start(app, &node.id, &id).await?;
         }
         log.line(&format!("Started {n} container{}; checking health", if n == 1 { "" } else { "s" }));
-        for id in &created {
-            if let Err(e) = runtime::wait_healthy(app, s, id, &network, timeout, img.has_healthcheck, &|l| log.line(l)).await {
-                for line in runtime::tail_logs(app, id, 30).await {
+        for (node, id) in &created {
+            if let Err(e) = runtime::wait_healthy(app, s, node, id, &network, timeout, img.has_healthcheck, &|l| log.line(l)).await {
+                for line in runtime::tail_logs(app, node, id, 30).await {
                     log.line(&format!("  | {line}"));
                 }
                 return Err(e.context("the new version is not healthy"));
@@ -373,14 +391,15 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
     .await;
 
     if let Err(e) = result {
-        for id in &created {
-            let name = runtime::replicas(app, &s.id).await.ok().and_then(|rs| rs.into_iter().find(|r| &r.id == id).map(|r| r.name)).unwrap_or_default();
-            let _ = runtime::remove(app, id, &name).await;
+        let ours = runtime::replicas(app, &s.id).await.unwrap_or_default();
+        for (node, id) in &created {
+            let name = ours.iter().find(|r| &r.id == id).map(|r| r.name.clone()).unwrap_or_default();
+            let _ = runtime::remove(app, node, id, &name).await;
         }
         if strategy == Strategy::StopFirst && !old.is_empty() {
             log.line("Starting the previous version again");
             for r in &old {
-                let _ = runtime::start(app, &r.id).await;
+                let _ = runtime::start(app, &r.node, &r.id).await;
             }
         } else if !old.is_empty() {
             log.line("The previous version keeps serving traffic.");
@@ -389,6 +408,8 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
     }
 
     runtime::set_live_deploy(app, &s.id, deploy_id)?;
+    app.db.set_state(&format!("nodes:{}", s.id), &distinct.iter().map(|d| d.id.as_str()).collect::<Vec<_>>().join(","))?;
+    app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("stopped:{}", s.id)])?;
     crate::proxy::reload(app);
     let serving_old = old.iter().filter(|r| r.state == "running").count();
     if strategy == Strategy::StartFirst && serving_old > 0 && !store::domains(app, Some(&s.id))?.is_empty() {

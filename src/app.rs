@@ -22,6 +22,7 @@ pub struct App {
     pub logs: broadcast::Sender<crate::logs::LogLine>,
     pub selflog: Arc<crate::logs::SelfLog>,
     pub metrics: crate::metrics::Metrics,
+    pub nodes: crate::nodes::Nodes,
 }
 
 /// Something that happened, streamed to the UI and API clients that may see it.

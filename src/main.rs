@@ -14,6 +14,7 @@ mod db;
 mod deploy;
 mod git;
 mod logs;
+mod mcp;
 mod metrics;
 mod model;
 mod notify;
@@ -102,7 +103,7 @@ fn setup_link(db: &db::Db) -> Result<Option<String>> {
     Ok(Some(format!("http://{host}:8484/setup#{token}")))
 }
 
-fn public_ip() -> Option<String> {
+pub fn public_ip() -> Option<String> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("1.1.1.1:80").ok()?;
     Some(sock.local_addr().ok()?.ip().to_string())
@@ -189,6 +190,7 @@ async fn serve() -> Result<()> {
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));
     tokio::spawn(backup::scheduler(app.clone()));
+    tokio::spawn(tunnel::run(app.clone()));
     {
         let app = app.clone();
         let (http, https) = (port("TUGPORT_HTTP_PORT", 80), port("TUGPORT_HTTPS_PORT", 443));
@@ -201,6 +203,7 @@ async fn serve() -> Result<()> {
 
     let listen = app.settings().panel_listen;
     let router = api::router(app.clone());
+    mcp::install(router.clone());
     if let Some(legacy) = app.settings().legacy_listen {
         let router = router.clone();
         tokio::spawn(async move {

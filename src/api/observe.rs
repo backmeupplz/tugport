@@ -234,3 +234,30 @@ pub async fn delete_registry(State(app): State<AppState>, a: Auth, Path(id): Pat
     app.audit(Some(&a.0), "registry.delete", None, None, Some(&id), None);
     Ok(Json(json!({ "ok": true })))
 }
+
+pub async fn tunnel_status(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    Ok(Json(crate::tunnel::status(&app).await?))
+}
+
+#[derive(Deserialize)]
+pub struct TunnelBody {
+    api_token: String,
+}
+
+pub async fn tunnel_connect(State(app): State<AppState>, a: Auth, Json(b): Json<TunnelBody>) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    if crate::tunnel::load(&app)?.is_some() {
+        return Err(ApiError::conflict("a tunnel is already connected; disconnect it first"));
+    }
+    crate::tunnel::connect(&app, b.api_token.trim()).await.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    app.audit(Some(&a.0), "tunnel.connect", None, None, None, None);
+    Ok(Json(crate::tunnel::status(&app).await?))
+}
+
+pub async fn tunnel_disconnect(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    a.require_owner()?;
+    crate::tunnel::disconnect(&app).await?;
+    app.audit(Some(&a.0), "tunnel.disconnect", None, None, None, None);
+    Ok(Json(json!({ "ok": true })))
+}

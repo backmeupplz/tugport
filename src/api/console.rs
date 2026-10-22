@@ -22,6 +22,9 @@ pub struct ConsoleQuery {
 
 pub async fn console(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<ConsoleQuery>, ws: WebSocketUpgrade) -> ApiResult<Response> {
     let s = service_or_404(&app, &a, &id, Role::Operator)?;
+    if !a.0.can_read_secrets(&s.project_id) {
+        return Err(ApiError::forbidden("a shell can read the service's environment, so it needs the secrets:read grant"));
+    }
     let live = runtime::live_deploy(&app, &s.id);
     let reps = runtime::replicas(&app, &s.id).await?;
     let target = reps
@@ -111,4 +114,59 @@ async fn run(app: AppState, container: String, compose: bool, socket: WebSocket)
         _ = from_browser => {}
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct ExecBody {
+    command: String,
+    timeout_s: Option<u64>,
+    container: Option<String>,
+}
+
+/// Run one command in a running container and return its output (for agents and the CLI).
+pub async fn exec(State(app): State<AppState>, a: Auth, Path(id): Path<String>, axum::Json(b): axum::Json<ExecBody>) -> ApiResult<axum::Json<serde_json::Value>> {
+    let s = service_or_404(&app, &a, &id, Role::Operator)?;
+    if !a.0.can_read_secrets(&s.project_id) {
+        return Err(ApiError::forbidden("running commands can read the service's environment, so it needs the secrets:read grant"));
+    }
+    let live = runtime::live_deploy(&app, &s.id);
+    let reps = runtime::replicas(&app, &s.id).await?;
+    let target = reps
+        .iter()
+        .filter(|r| r.state == "running")
+        .find(|r| match &b.container {
+            Some(c) => r.id.starts_with(c.as_str()) || r.name == *c,
+            None => s.kind == "compose" || live.as_deref().is_none_or(|l| r.deploy == l),
+        })
+        .ok_or_else(|| ApiError::bad_request("no running container to run the command in"))?;
+    let masker = crate::secrets::Masker::for_service(&app, &s);
+    app.audit(Some(&a.0), "service.exec", Some(&s.project_id), Some(&s.id), Some(&target.name), Some(&masker.mask(&b.command).chars().take(300).collect::<String>()));
+    let cmd: Vec<String> = if s.kind == "compose" {
+        vec!["sh".into(), "-c".into(), b.command.clone()]
+    } else {
+        vec![crate::secrets::INIT_PATH.into(), "exec".into(), "--".into(), "sh".into(), "-c".into(), b.command.clone()]
+    };
+    let exec = app
+        .docker
+        .create_exec(&target.id, ExecConfig { attach_stdout: Some(true), attach_stderr: Some(true), cmd: Some(cmd), ..Default::default() })
+        .await
+        .map_err(anyhow::Error::from)?;
+    let StartExecResults::Attached { mut output, .. } = app.docker.start_exec(&exec.id, None).await.map_err(anyhow::Error::from)? else {
+        return Err(ApiError::bad_request("the command detached"));
+    };
+    let mut text = String::new();
+    let timeout = std::time::Duration::from_secs(b.timeout_s.unwrap_or(60).min(3600));
+    let timed_out = tokio::time::timeout(timeout, async {
+        while let Some(Ok(chunk)) = output.next().await {
+            text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
+            if text.len() > 1_000_000 {
+                text.push_str("\n[output truncated]");
+                break;
+            }
+        }
+    })
+    .await
+    .is_err();
+    let code = app.docker.inspect_exec(&exec.id).await.ok().and_then(|i| i.exit_code);
+    Ok(axum::Json(serde_json::json!({ "exit_code": code, "timed_out": timed_out, "output": text })))
 }

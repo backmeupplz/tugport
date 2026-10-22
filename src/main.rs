@@ -1,3 +1,4 @@
+mod acme;
 mod api;
 mod app;
 mod auth;
@@ -154,6 +155,7 @@ async fn serve() -> Result<()> {
         events,
         deployer: deploy::Deployer::default(),
         build_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+        proxy: proxy::Proxy::new(),
     });
     drop(master);
     install_init_binary(&app)?;
@@ -164,6 +166,19 @@ async fn serve() -> Result<()> {
         Err(e) => tracing::error!("restoring container secrets: {e:#}"),
     }
     runtime::detect_gpu(&app).await;
+
+    let port = |var: &str, default: u16| std::env::var(var).ok().and_then(|p| p.parse().ok()).unwrap_or(default);
+    tokio::spawn(proxy::watch(app.clone()));
+    tokio::spawn(acme::run(app.clone()));
+    {
+        let app = app.clone();
+        let (http, https) = (port("TUGPORT_HTTP_PORT", 80), port("TUGPORT_HTTPS_PORT", 443));
+        tokio::spawn(async move {
+            if let Err(e) = proxy::serve(app, http, https).await {
+                tracing::error!("proxy stopped: {e:#}");
+            }
+        });
+    }
 
     let listen = app.settings().panel_listen;
     let router = api::router(app.clone());

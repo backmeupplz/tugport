@@ -40,6 +40,8 @@ pub struct Replica {
     pub image: String,
     pub created: i64,
     pub node: String,
+    /// Compose service name for containers of Compose stacks.
+    pub compose_service: Option<String>,
 }
 
 fn label_filter(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
@@ -74,6 +76,7 @@ pub async fn replicas(app: &App, service_id: &str) -> Result<Vec<Replica>> {
             image: c.image.unwrap_or_default(),
             created: c.created.unwrap_or_default(),
             node: labels.get(L_NODE).cloned().unwrap_or_else(|| "local".into()),
+            compose_service: labels.get("com.docker.compose.service").cloned(),
         });
     }
     out.sort_by(|a, b| b.created.cmp(&a.created).then(a.replica.cmp(&b.replica)));

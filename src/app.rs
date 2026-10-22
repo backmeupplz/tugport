@@ -18,6 +18,7 @@ pub struct App {
     pub events: broadcast::Sender<Event>,
     pub deployer: crate::deploy::Deployer,
     pub build_slots: Arc<tokio::sync::Semaphore>,
+    pub proxy: crate::proxy::Proxy,
 }
 
 /// Something that happened, streamed to the UI and API clients that may see it.

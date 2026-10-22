@@ -7,6 +7,7 @@ mod autoupdate;
 mod backup;
 mod builder;
 mod cleanup;
+mod cli;
 mod compose;
 mod crypto;
 mod databases;
@@ -47,6 +48,9 @@ pub const COMMIT: &str = match option_env!("TUGPORT_COMMIT") {
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Print raw JSON (for scripts and agents).
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -59,6 +63,8 @@ enum Cmd {
     Recover { key: String },
     /// Print the version.
     Version,
+    #[command(flatten)]
+    Client(cli::Client),
 }
 
 fn main() -> Result<()> {
@@ -88,6 +94,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Server => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve()),
+        Cmd::Client(c) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let code = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(cli::run(c, cli.json))?;
+            std::process::exit(code);
+        }
     }
 }
 

@@ -34,8 +34,7 @@ export async function api<T = any>(method: string, path: string, body?: unknown)
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    // Axum's body rejections (400/415/422) arrive as plain text rather than {"error": ...}.
-    data = { error: text.trim() };
+    // Every API answer is JSON; anything else (a proxy's error page) gets its status line below.
   }
   if (!res.ok) {
     const message = typeof data?.error === "string" && data.error ? data.error : `${res.status} ${res.statusText}`;

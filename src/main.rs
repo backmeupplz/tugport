@@ -17,6 +17,7 @@ mod git;
 mod logs;
 mod mcp;
 mod metrics;
+mod migrate;
 mod model;
 mod notify;
 mod paths;
@@ -63,6 +64,11 @@ enum Cmd {
     Recover { key: String },
     /// Print the version.
     Version,
+    /// Move an Easypanel or Coolify server into Tugport.
+    Migrate {
+        #[command(subcommand)]
+        cmd: migrate::Command,
+    },
     #[command(flatten)]
     Client(cli::Client),
 }
@@ -94,6 +100,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Server => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve()),
+        Cmd::Migrate { cmd } => migrate::main(cmd),
         Cmd::Client(c) => {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let code = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(cli::run(c, cli.json))?;

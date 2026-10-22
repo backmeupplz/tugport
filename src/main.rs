@@ -240,12 +240,12 @@ async fn serve() -> Result<()> {
     let router = api::router(app.clone());
     mcp::install(router.clone());
     if let Some(legacy) = app.settings().legacy_listen {
-        let router = router.clone();
+        let router = api::hooks_router(app.clone());
         tokio::spawn(async move {
             let bound = handoff::listener("legacy", async { Ok(tokio::net::TcpListener::bind(&legacy).await?) }).await;
             match bound {
                 Ok(l) => {
-                    tracing::info!("also serving the API on {legacy}");
+                    tracing::info!("also serving deploy webhooks on {legacy}");
                     let _ = axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                         .with_graceful_shutdown(handoff::DRAIN.notified())
                         .await;

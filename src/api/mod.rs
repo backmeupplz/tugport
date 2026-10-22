@@ -94,6 +94,15 @@ pub fn router(app: AppState) -> Router {
         .with_state(app)
 }
 
+/// Only the deploy webhooks, for listeners exposed to the internet.
+pub fn hooks_router(app: AppState) -> Router {
+    Router::new()
+        .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/hooks/git/{provider}", post(hooks::git_hook))
+        .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .with_state(app)
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     pub status: StatusCode,

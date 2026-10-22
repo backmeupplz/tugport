@@ -98,7 +98,11 @@ pub struct Settings {
     pub panel_domain: Option<String>,
     /// Address the raw panel port listens on. Empty disables it once a panel domain works.
     pub panel_listen: String,
-    /// Extra address serving the API (e.g. `0.0.0.0:3000` so Easypanel's webhook URLs keep working).
+    /// When false, the panel domain only serves webhook paths; use `panel_listen` on a private
+    /// address (a tailnet IP, say) for the panel itself.
+    pub panel_public: bool,
+    /// Extra address serving deploy webhooks only (e.g. `0.0.0.0:3000` so Easypanel's
+    /// webhook URLs keep working after a migration).
     pub legacy_listen: Option<String>,
     pub acme_email: Option<String>,
     pub deploy_policy: DeployPolicy,
@@ -116,6 +120,7 @@ impl Default for Settings {
         Settings {
             panel_domain: None,
             panel_listen: "0.0.0.0:8484".into(),
+            panel_public: true,
             legacy_listen: None,
             acme_email: None,
             deploy_policy: DeployPolicy::Cancel,

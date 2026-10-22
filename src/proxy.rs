@@ -186,18 +186,24 @@ async fn build_routes(app: &App) -> Result<Routes> {
     let settings = app.settings();
     if let Some(panel) = &settings.panel_domain {
         let port = settings.panel_listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(8484);
-        hosts.entry(panel.clone()).or_default().push(Arc::new(Route {
-            service_id: None,
-            project_id: None,
-            path: "/".into(),
-            upstreams: vec![SocketAddr::from(([127, 0, 0, 1], port))],
-            https: true,
-            via_tunnel: false,
-            options: DomainOptions { timeout_s: Some(3600), ..Default::default() },
-            redirects: vec![],
-            rewrite: None,
-            asleep: false,
-        }));
+        let ip = settings.panel_listen.rsplit_once(':').and_then(|(ip, _)| ip.trim_matches(['[', ']']).parse::<IpAddr>().ok()).filter(|ip| !ip.is_unspecified());
+        let upstream = SocketAddr::new(ip.unwrap_or(IpAddr::from([127, 0, 0, 1])), port);
+        // A private panel still takes webhooks on its public domain, and nothing else.
+        let paths: &[&str] = if settings.panel_public { &["/"] } else { &["/api/hooks", "/api/deploy"] };
+        for path in paths {
+            hosts.entry(panel.clone()).or_default().push(Arc::new(Route {
+                service_id: None,
+                project_id: None,
+                path: path.to_string(),
+                upstreams: vec![upstream],
+                https: true,
+                via_tunnel: false,
+                options: DomainOptions { timeout_s: Some(3600), ..Default::default() },
+                redirects: vec![],
+                rewrite: None,
+                asleep: false,
+            }));
+        }
     }
     for routes in hosts.values_mut() {
         routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));

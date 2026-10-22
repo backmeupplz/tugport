@@ -6,6 +6,8 @@ Even on a single server, the panel drives Docker through the same node interface
 
 ## Milestone 1: one server, complete
 
+**Status:** built and tested on development servers. Live ACME certificates, the GitHub App flow, the Cloudflare Tunnel and the installer still need a run on a real server.
+
 ### Install and migrate
 - **One command:** `curl -fsSL https://tugport.com/install | sh`.
   - Installs Docker if it is missing.
@@ -146,7 +148,10 @@ Even on a single server, the panel drives Docker through the same node interface
 - **Updates:** the update channel and an option to check now.
 
 ## Milestone 2: more servers
-- **Joining:** a server joins with one command shown in the panel: `curl -fsSL https://tugport.com/install | sh -s -- join <token>`.
+
+**Status:** built and tested with two development servers: joining, the mesh, placement, routing between servers, central logs and metrics, rescheduling when a server goes away, and restoring it when it returns.
+
+- **Joining:** a server joins with one command shown in the panel: `curl -fsSL https://tugport.com/install | sh -s -- --join <panel> --token <token>`.
 - **Mesh:** servers form an encrypted WireGuard mesh that Tugport sets up itself, and services reach each other by name across servers.
 - **Replicas and placement:**
   - Replicas spread across servers, and every server's proxy balances over the healthy ones.
@@ -156,6 +161,8 @@ Even on a single server, the panel drives Docker through the same node interface
 - **Resilience:** apps keep running if the panel's server goes down. Changes pause until it is back.
 
 ## Milestone 3: cloud and data
+
+**Status:** built. Scale to zero, replica autoscaling and database replicas (all five engines, with promote) are tested with two development servers. Cloud servers and server pools are tested against the real Hetzner and AWS APIs with invalid credentials only; creating real machines still needs a live run.
 - **Cloud servers:** connect an AWS or Hetzner account to create servers in any region. They join the mesh automatically.
 - **Autoscaling:** add and remove replicas by CPU or request rate, then add and remove whole servers.
 - **Scale to zero:** idle services stop and start again on the first request.

@@ -1,6 +1,8 @@
 # Tugport API
 
-All endpoints live under the panel address (`http://<server>:8484` or the panel domain) and speak JSON. Errors look like `{"error": "message"}` with a matching HTTP status.
+All endpoints live under the panel address (`http://<server>:8484` or the panel domain) and speak JSON. Every error, including a malformed body, looks like `{"error": "message"}` with a matching HTTP status.
+
+Work that takes a while (backups, restores, removing a server, adding a database replica) finishes even if the caller disconnects.
 
 ## Authentication
 
@@ -24,8 +26,6 @@ The owner can do everything.
 
 Services can be addressed by id or as `project.service` (for example `shop.api`). Projects can be addressed by id or by name.
 
-Endpoints marked **(planned)** are not implemented yet; their shapes are the contract.
-
 ## Setup and session
 
 | Method | Path | Notes |
@@ -39,6 +39,8 @@ Endpoints marked **(planned)** are not implemented yet; their shapes are the con
 | PUT | `/api/me/totp` | `{code}` confirms 2FA |
 | DELETE | `/api/me/totp` | `{code}` turns 2FA off |
 | GET | `/api/about` | `{version, commit, source, docker}` |
+| GET | `/api/updates` | Owner only. `{current, latest, available}` |
+| POST | `/api/updates/apply` | Owner only. Installs the newest release without dropping traffic: `{updating_to}` |
 
 ## Users, agents and keys
 
@@ -46,7 +48,7 @@ Endpoints marked **(planned)** are not implemented yet; their shapes are the con
 |---|---|---|
 | GET | `/api/users` | `{users: [{id, kind, name, email, is_owner, all_projects_role, projects: {project_id: role}, grants, disabled, totp, created_at}]}`. Non-owners only see id, kind and name for other users. |
 | POST | `/api/users` | Owner only. `{kind: "human"\|"agent", name, email?, password?, description?, all_projects_role?, projects?: {project: role}, grants?: []}` |
-| GET / PATCH / DELETE | `/api/users/{id}` | PATCH accepts `{name?, email?, password?, description?, disabled?, all_projects_role?, projects?, grants?}` |
+| GET / PATCH / DELETE | `/api/users/{id}` | PATCH accepts `{name?, email?, password?, description?, disabled?, all_projects_role?, projects?, grants?}`. Only the fields sent change; `all_projects_role: null` removes that role. People may change their own name, email, password and description. |
 | POST | `/api/agents` | Owner only. Creates an agent and its key in one step. |
 | GET | `/api/users/{id}/keys` | `{keys: [{id, name, prefix, expires_at, allowed_ips, last_used_at, last_used_ip, created_at, revoked_at}]}` |
 | POST | `/api/users/{id}/keys` | `{name?, expires_days?, allowed_ips?}` returns `{id, token, snippets}` |
@@ -62,7 +64,7 @@ Endpoints marked **(planned)** are not implemented yet; their shapes are the con
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/projects` | `{projects: [{id, name, description, services, role, created_at}]}` |
+| GET | `/api/projects` | `{projects: [{id, name, description, services, states: {running: 2, ...}, role, created_at}]}` |
 | POST | `/api/projects` | `{name, description?}`. Names are lowercase DNS-safe. |
 | GET | `/api/projects/{id}` | `{project, services: [{id, name, kind, source, status}], vars: [names], role}` |
 | PATCH | `/api/projects/{id}` | `{description}` |
@@ -84,6 +86,8 @@ Endpoints marked **(planned)** are not implemented yet; their shapes are the con
 
 It returns `{id, name, kind, spec, deploy_hook, database?: {url, project_var}}`. A new database also adds a `<NAME>_URL` project variable.
 
+`GET /api/services` lists every service the caller can see: `{services: [{id, name, project, project_id, kind, state, running, desired}]}`.
+
 ### The service spec
 
 Every field has a default. See `src/model.rs`.
@@ -92,7 +96,7 @@ Every field has a default. See `src/model.rs`.
 |---|---|
 | `source` | `{type: "git", provider?, repo, branch, path, watch_paths, auto_deploy}`, `{type: "image", image}`, `{type: "dockerfile", content}` or `{type: "compose", yaml}` |
 | `build` | `{type: "auto"}`, `{type: "dockerfile", path, target?}`, `{type: "railpack"}`, `{type: "nixpacks"}` or `{type: "buildpacks", builder}` |
-| Runtime basics | `command`, `entrypoint`, `working_dir`, `user`, `replicas` |
+| Runtime basics | `command`, `entrypoint`, `working_dir`, `user`, `replicas` (ignored while `autoscale` is set) |
 | `ports` | `[{container, host, protocol: tcp\|udp}]` |
 | `mounts` | `[{type: volume, name, target, readonly}, {type: bind, source, target, readonly}, {type: file, target}]` |
 | `resources` | `{cpus, memory_mb, memory_reservation_mb}` |
@@ -101,27 +105,31 @@ Every field has a default. See `src/model.rs`.
 | `deploy_policy` | `cancel` or `queue` |
 | Container options | `gpu`, `cap_add`, `cap_drop`, `groups`, `sysctls`, `privileged`, `docker_socket`, `host_network`, `no_new_privileges` |
 | `auto_update` | `{enabled, interval_minutes, policy: digest\|same_major}` |
-| `placement` | `{node, region, labels}` |
-| `autoscale` | `{min, max, cpu_percent, rps}` |
-| `sleep` | `{idle_minutes}` |
+| `placement` | `{node, region, labels}`: `node` is a server id or name; labels must all match. Services with a database, volumes or bind mounts, host ports, host networking or the Docker socket stay on the server they first ran on. Other services spread their replicas over the eligible servers. |
+| `autoscale` | `{min, max, cpu_percent, rps}`: replicas follow total CPU (percent of one core per replica) or requests per second per replica. More start at once; extras leave after five quiet minutes. |
+| `sleep` | `{idle_minutes}`: the service stops after that long without requests and starts again on the next one (web apps only). |
 | Other | `database`, `compose: {file}`, `build_args` |
 
 ### Service endpoints
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/services/{id}` | `{service, status, domains, env: [names], files: [targets], last_deploy, role}` |
+| GET | `/api/services/{id}` | `{service, status, domains, env: [names], files: [targets], last_deploy, exposed_ports, role}`. `exposed_ports` are the ports the running image declares. |
 | PATCH | `/api/services/{id}` | `{spec: <JSON merge patch>}` returns `{spec, redeploy_needed}` |
 | DELETE | `/api/services/{id}?volumes=true` | Needs `destroy`. |
 | GET | `/api/services/{id}/env` | `{env: [names] or {NAME: value}, project_vars: [names], values_visible}` |
 | PUT | `/api/services/{id}/env` | `{NAME: "value" \| null}`. Writing never needs `secrets:read`. |
 | GET / PUT | `/api/services/{id}/files` | PUT takes `{target: "/etc/app.conf", content \| null}` |
 | GET / POST | `/api/services/{id}/domains` | POST takes `{host, path?, port, container?, https?, via_tunnel?, options?}` |
-| PATCH / DELETE | `/api/domains/{id}` | |
+| PATCH / DELETE | `/api/domains/{id}` | PATCH takes the same fields; `container: null` clears a Compose container target. |
+| GET | `/api/services/{id}/hook` | The deploy webhook URL `{url}`. Needs `operator` and `secrets:read`. |
 | POST | `/api/services/{id}/hook` | Issues a new deploy webhook URL `{url}`; the old one stops working. |
+| GET | `/api/services/{id}/replicas` | Databases: `{replicas: [{id, name, state, nodes, replication}]}`. `replication` is `copying`, `following` or `failed: <reason>`. |
+| POST | `/api/services/{id}/replicas` | Databases, `operator`: `{placement?}` adds a read replica, see [Database replicas](#database-replicas). Returns `{replica: {id, name}, deploy_id}`. |
+| POST | `/api/services/{id}/promote` | On a replica, `admin`: makes it a primary. Returns `{variable, message}`. |
 | POST | `/api/services/{id}/deploy-key` | `{public_key}`: an SSH key to add to the repository. |
 
-`status` looks like `{state, running, desired, live_deploy, replicas: [{id, name, deploy, replica, state, health, ip, image, created, node}]}`. `state` is one of:
+`status` looks like `{state, running, desired, live_deploy, replicas: [{id, name, deploy, replica, state, health, ip, image, created, node}]}`. `node` is the id of the server the container runs on (`local` is the panel's own). `state` is one of:
 - `running`
 - `degraded`
 - `unhealthy`
@@ -133,7 +141,7 @@ Every field has a default. See `src/model.rs`.
 Domain `options` contains:
 - `www_redirect` (`to_www` or `to_apex`)
 - `redirects: [{from (regex), to, permanent}]`
-- `basic_auth: [{user, hash}]`
+- `basic_auth: [{user, password?}]`: passwords are stored as Argon2 hashes and never returned. An entry sent without a password keeps that user's current one.
 - `forward_auth: {url, response_headers}`
 - `strip_prefix`
 - `rewrite: {from, to}`
@@ -161,17 +169,20 @@ Domain `options` contains:
 
 A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at}`:
 - `status` is `queued`, `building`, `deploying`, `live`, `failed`, `cancelled` or `superseded`.
-- `trigger` is `manual`, `api`, `agent`, `push`, `webhook`, `rollback`, `autoupdate` or `migration`.
+- `trigger` is `manual`, `api`, `agent`, `push`, `webhook`, `rollback`, `autoupdate`, `migration`, `reschedule` (its server went away), `drain` (its server is being removed), `replica` or `replication`.
 
 `GET /api/events` streams events (the event name is the `kind`; data is `{kind, project_id, service_id, data, at}`). The kinds are:
 - `deploy`
 - `deploy.log`
-- `service.status`
+- `service.status`: `{event, container, state, running, desired}` after every container start, exit, out-of-memory kill and health change; also `wake`, `sleep`, `scaled` and `replica` events
 - `service.updated`
 - `audit`
 - `certificate`
 - `settings`
 - `metrics`
+- `alert`
+- `backup`
+- `nodes`: a server joined, came online or went offline
 - `warning`
 
 ## Hooks (no auth; the URL is the secret)
@@ -179,7 +190,8 @@ A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit
 | Method | Path | Notes |
 |---|---|---|
 | POST / GET | `/api/hooks/deploy/{token}?ref=` | Deploys the service. |
-| POST / GET | `/api/deploy/{token}` | The same, at Easypanel's path, so migrated webhooks keep working. |
+| POST / GET | `/api/deploy/{token}` and `/api/compose/deploy/{token}` | The same, at Easypanel's paths, so migrated webhooks keep working. GitHub push events sent there only deploy pushes to the service's branch. |
+| POST | `/api/nodes/join` | Called by `tugport install --join` on a new server; the one-time token is the credential. |
 | POST | `/api/hooks/git/{provider}` | Push events. The signature is checked; watch paths and `[skip deploy]` are honored. |
 
 ## Git providers
@@ -193,7 +205,7 @@ A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit
 | POST | `/api/git/github/manifest` | See below. |
 | GET | `/api/git/github/callback` | GitHub redirects here; it stores the app and redirects to the install page. |
 
-To connect a GitHub App, `POST /api/git/github/manifest` takes `{organization?}` and returns `{action, manifest}`. The browser must then POST a form to `action` with a field `manifest` set to `JSON.stringify(manifest)`.
+To connect a GitHub App, `POST /api/git/github/manifest` takes `{organization?}` and returns `{action, manifest}`. The browser must then POST a form to `action` with a field `manifest` set to `JSON.stringify(manifest)`. After installing the app, GitHub sends people back to `/settings/git`.
 
 ## Settings
 
@@ -205,6 +217,8 @@ To connect a GitHub App, `POST /api/git/github/manifest` takes `{organization?}`
 The settings fields are:
 - `panel_domain`
 - `panel_listen`
+- `panel_public`: when false, the panel domain only serves webhook paths and server joins; reach the panel itself on `panel_listen` (a tailnet address, say)
+- `legacy_listen`: an extra address that only serves deploy webhooks (`0.0.0.0:3000` keeps Easypanel's webhook URLs working)
 - `acme_email`
 - `deploy_policy`
 - `docker_cleanup: {enabled, interval_hours, build_cache_gb}`
@@ -214,37 +228,40 @@ The settings fields are:
 - `alerts: {cpu_percent, memory_percent, disk_percent, gpu_temp_c, for_minutes}`
 - `updates: {auto, channel}`
 
-## Logs (planned)
+## Logs
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/services/{id}/logs?since&until&q&limit&replica` | `{lines: [{ts, replica, stream, line}]}`. Times are epoch ms; `q` is a case-insensitive substring. |
+| GET | `/api/services/{id}/logs?since&until&q&limit&replica` | `{lines: [{ts, replica, stream, line}]}`. Times are epoch ms; `q` is a case-insensitive substring. Logs from every server are collected in one place, with secret values masked. |
 | GET | `/api/services/{id}/logs/stream` | SSE `line` events with `{ts, replica, stream, line}` |
 | GET | `/api/logs/tugport?limit&level` | `{lines: [{ts, level, target, message}]}` (Tugport's own log) |
 | GET | `/api/logs/usage` | `{total_bytes, services: [{id, bytes}]}` |
 
-## Metrics (planned)
+## Metrics
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/metrics/now` | Current snapshot, see below. |
-| GET | `/api/metrics?scope=host\|service:<id>\|gpu:<n>&names=cpu,memory&range=1h\|6h\|24h\|7d\|30d` | `{step, series: {name: [[ts, value]]}}` |
+| GET | `/api/metrics/now?node=<id>` | A server's current snapshot (the panel's own by default), see below. |
+| GET | `/api/metrics?scope=host\|service:<id>\|gpu:<n>&names=cpu,memory&range=1h\|6h\|24h\|7d\|30d&node=<id>` | `{step, series: {name: [[ts, value]]}}`. `node` picks the server for host and GPU scopes; service scopes add up every server. |
 | GET | `/api/docker/usage` | `{images, build_cache, volumes, containers}` (bytes) |
 
-`GET /api/metrics/now` returns `{cpu, cores: [..], load: [1,5,15], memory: {used, total}, swap: {used, total}, disks: [{mount, used, total}], net: {rx, tx}, gpus: [{name, util, mem_used, mem_total, temp, power}], services: [{id, cpu, memory}]}`.
+`GET /api/metrics/now` returns `{cpu, cores: [..], load: [1,5,15], memory: {used, total}, swap: {used, total}, disks: [{mount, used, total}], net: {rx, tx}, gpus: [{name, util, mem_used, mem_total, temp, power}], services: [{id, cpu, memory, net_rx, net_tx, restarts}]}`.
+
+Units: `cpu` is percent (for services, percent of one core summed over replicas), memory is bytes, network and disk I/O are bytes per second, `disk:<mount>` is percent used, and `restarts` counts crashes per 10-second sample (stops Tugport makes are not crashes).
 
 Series names:
 - **`host`:** `cpu`, `memory`, `swap`, `load1`, `disk:<mount>`, `disk_read`, `disk_write`, `net_rx`, `net_tx`, `temp`
 - **`service:<id>`:** `cpu`, `memory`, `net_rx`, `net_tx`, `restarts`
 - **`gpu:<n>`:** `util`, `memory`, `temp`, `power`
 
-## Console (planned)
+## Console and exec
 
 | Method | Path | Notes |
 |---|---|---|
-| WS | `/api/services/{id}/console?container=<id>` | Text frames carry terminal I/O; send `{"resize": [cols, rows]}` as a text frame starting with `{`. Needs `operator`. |
+| WS | `/api/services/{id}/console?container=<id>` | Text frames carry terminal I/O; send `{"resize": [cols, rows]}` as a text frame starting with `{`. Needs `operator` and `secrets:read` (a shell can read the environment). A refusal arrives on the socket: one `{"error": "..."}` message, then close code 4403. |
+| POST | `/api/services/{id}/exec` | `{command, timeout_s?, container?}` runs one command with the service's environment: `{exit_code, timed_out, output}`. Same permissions as the console. |
 
-## Notifications (planned)
+## Notifications
 
 | Method | Path | Notes |
 |---|---|---|
@@ -258,7 +275,7 @@ The `config` for each kind:
 - **email:** `{host, port?, tls?, username?, password?, from, to}`
 - **webhook:** `{url}`
 
-## Registries (planned)
+## Registries
 
 | Method | Path | Notes |
 |---|---|---|
@@ -266,44 +283,75 @@ The `config` for each kind:
 | POST | `/api/registries` | `{host, username, password}` |
 | DELETE | `/api/registries/{id}` | |
 
-## Backups (planned)
+## Backups
 
 | Method | Path | Notes |
 |---|---|---|
 | GET / POST | `/api/backups/targets` | POST takes `{name, kind: s3\|local, config}`. S3 config: `{endpoint, bucket, prefix?, access_key, secret_key, region?}`. Local config: `{path}`. |
 | DELETE | `/api/backups/targets/{id}` | |
-| GET / POST | `/api/backups/jobs` | POST takes `{service_id?, target_id, kind: database\|volume\|state, volume?, schedule (cron), keep_last}` |
+| GET / POST | `/api/backups/jobs` | GET returns jobs with `enabled` and `last_run`. POST takes `{service_id?, target_id, kind: database\|volume\|state, volume?, schedule (cron), keep_last}`. |
 | PATCH / DELETE | `/api/backups/jobs/{id}` | |
 | POST | `/api/backups/jobs/{id}/run` | |
 | GET | `/api/backups/jobs/{id}/runs` | `{runs: [{id, kind, status, snapshot, size_bytes, error, started_at, finished_at}]}` |
-| POST | `/api/backups/runs/{id}/restore` | `{test?: true}` restores into a throwaway copy and reports. |
+| POST | `/api/backups/runs/{id}/restore` | `{test?: true}` restores into a throwaway copy and reports. Returns `{ok, message}`. |
 
-## Cloudflare Tunnel (planned)
+## Cloudflare Tunnel
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/tunnel` | `{enabled, account, tunnel_id, status}` |
+| GET | `/api/tunnel` | `{enabled, account, tunnel_id, running, domains}` |
 | PUT | `/api/tunnel` | `{api_token}`: creates the tunnel and runs cloudflared. |
 | DELETE | `/api/tunnel` | |
 
 Domains with `via_tunnel: true` are routed through the tunnel.
 
-## Servers (planned, milestone 2)
+## Servers
+
+Servers join over an encrypted WireGuard mesh (10.99.0.0/16, UDP 51820). Containers can never open connections into the mesh. Each server runs `tugport node`; the panel drives its Docker, sends it secrets (kept in its memory-only `/run`), routes and certificates, and collects its logs and metrics.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/nodes` | `{nodes: [{id, name, region, labels, status, mesh_ip, info, last_seen_at}]}` |
-| POST | `/api/nodes/join-token` | `{command}`: the one-line install command for a new server. |
-| PATCH / DELETE | `/api/nodes/{id}` | |
+| GET | `/api/nodes` | `{mesh, nodes: [{id, name, local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at}]}`. Needs the owner or a role on all projects. |
+| POST | `/api/nodes/join-token` | Owner. `{panel_url?}` returns `{token, command, expires_at}`: a one-hour command to run as root on the new server. The first call turns on the mesh. |
+| PATCH | `/api/nodes/{id}` | Owner. `{name?, region?, labels?}` |
+| DELETE | `/api/nodes/{id}?keep_machine=true` | Owner. Moves the server's services elsewhere, removes it from the mesh and, if Tugport created it in a cloud account, deletes the machine unless `keep_machine`. Returns `{ok, machine_deleted}`. |
 
-## Cloud (planned, milestone 3)
+`status` is `online`, `unreachable` (a health check failed; already out of routing and placement), `offline` (30 seconds without answers), or `joining`. `info` has `{version, docker, cpus, memory_total, arch, nvidia, dri, swarm_node, boot_id, uptime_s}`.
+
+A server that stays away for 2 minutes has its movable services redeployed on the others. Services that keep data there wait for it. When it comes back, replaced containers are removed and, after a reboot, secrets are sent again.
+
+## Cloud
+
+Owner only: these spend money.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET / POST | `/api/cloud/accounts` | POST takes `{provider: aws\|hetzner, name, credentials}` |
-| POST | `/api/cloud/servers` | `{account_id, region, size, name?}` creates a server that joins automatically. |
-| GET / PUT | `/api/cloud/autoscale` | `{account_id, region, size, min, max, scale_up_cpu, scale_down_cpu}` |
+| GET / POST | `/api/cloud/accounts` | POST takes `{kind: "hetzner", name, token}` or `{kind: "aws", name, access_key, secret_key}`. Credentials are checked with the provider first and kept sealed. |
+| DELETE | `/api/cloud/accounts/{id}` | Refused while the account has servers or pools. |
+| GET | `/api/cloud/accounts/{id}/options` | `{regions: [{id, name}], sizes: [{id, cpus, memory_gb, disk_gb?, arch, prices?}]}` |
+| GET / POST | `/api/cloud/servers` | POST takes `{account_id, region, size, panel_url?}` and creates an Ubuntu 24.04 machine that installs Tugport and joins on first boot. A machine that has not joined after 20 minutes is deleted. |
+| DELETE | `/api/cloud/servers/{id}` | Deletes a machine that has not joined (joined ones are removed under Servers). |
+| GET / POST | `/api/cloud/pools` | POST takes `{name, account_id, region, size, labels?, min_servers?, max_servers?, scale_up_cpu?, scale_down_cpu?}` |
+| PATCH / DELETE | `/api/cloud/pools/{id}` | Deleting a pool keeps its servers. |
 
-## MCP (planned)
+A pool keeps at least `min_servers`, adds one server at a time while the average CPU of all servers stays above `scale_up_cpu` (10 minutes apart), and removes its newest server after 30 minutes below `scale_down_cpu`. It never removes a server that keeps data.
 
-`POST /mcp` speaks streamable HTTP JSON-RPC (`initialize`, `tools/list`, `tools/call`). It uses the same bearer key and the same permissions as the REST API.
+AWS machines use the default VPC and a `tugport` security group that opens UDP 51820 and TCP 80 and 443.
+
+## Database replicas
+
+A replica is a database service of its own, `<db>-replica-N`, placed like any service (another server or region). It follows its primary over the project network and refuses writes.
+
+| Engine | How |
+|---|---|
+| Postgres | Streaming replication, seeded with `pg_basebackup` on first start. |
+| MySQL | Binlog replication, seeded from a dump of the primary. |
+| MariaDB | The same; the primary restarts once to turn on binary logging. |
+| MongoDB | The primary restarts once as a one-member replica set; replicas join without votes, so the primary keeps working when they are away. |
+| Redis | `replicaof` |
+
+The project gets `<DB>_READ_URL` (for MongoDB, a replica-set URL that reads from secondaries) and `<DB>_REPLICA_N_URL` variables. Promoting a replica makes it a primary that stays one after restarts and points `<DB>_URL` at it; services read the new value on their next deploy or restart. Promote only when the primary is lost: if the old one still runs, both take writes. A primary with replicas cannot be deleted.
+
+## MCP
+
+`POST /mcp` speaks streamable HTTP JSON-RPC (`initialize`, `tools/list`, `tools/call`). It uses the same bearer key and the same permissions as the REST API. Its tools cover projects, services, deploys, logs, exec, env, domains, metrics, servers, backups, database replicas and the audit log.

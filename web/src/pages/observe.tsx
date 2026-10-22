@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { get, isPlanned, useApi, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
 import { Card, Empty, ErrorBox, Field, Loaded, Loading, Note, Planned, Select, errText } from "../ui";
-import { ago, bytes, clock, qs, toMs } from "../util";
+import { ago, bytes, clock, qs, sentence, toMs } from "../util";
 
 interface LogLine {
   ts: number;
@@ -183,7 +183,7 @@ function RangeSelect(props: { value: string; onChange: (v: string) => void }) {
 export function Console(props: { service: Service; replicas: Replica[]; canUse: boolean; label: (r: Replica) => string }) {
   const running = props.replicas.filter((r) => r.state === "running");
   const [container, setContainer] = useState(running[0]?.id ?? "");
-  const [state, setState] = useState<"idle" | "planned" | "connecting" | "open" | "closed">("idle");
+  const [state, setState] = useState<"idle" | "connecting" | "open" | "closed">("idle");
   const [error, setError] = useState("");
   const box = useRef<HTMLDivElement>(null);
   const session = useRef<{ close: () => void } | null>(null);
@@ -195,12 +195,6 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
     setError("");
     setState("connecting");
     const path = `/api/services/${props.service.id}/console${qs({ container })}`;
-    // A plain GET tells a missing endpoint (404) apart from one that only speaks WebSocket.
-    const probe = await fetch(path, { credentials: "same-origin" }).catch(() => null);
-    if (probe?.status === 404) {
-      setState("planned");
-      return;
-    }
     const el = box.current;
     if (!el) return;
     try {
@@ -219,6 +213,7 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
       const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}`);
       ws.binaryType = "arraybuffer";
       let opened = false;
+      let refused = "";
       const resize = () => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ resize: [term.cols, term.rows] }));
       ws.onopen = () => {
         opened = true;
@@ -226,11 +221,20 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
         resize();
         term.focus();
       };
-      ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
-      ws.onclose = () => {
+      ws.onmessage = (e) => {
+        if (typeof e.data !== "string") return term.write(new Uint8Array(e.data));
+        // The shell's output is binary; a text message is a refusal ({"error": ...}) before close code 4403.
+        try {
+          refused = JSON.parse(e.data).error ?? "";
+        } catch {
+          term.write(e.data);
+        }
+      };
+      ws.onclose = (e) => {
         setState("closed");
-        if (opened) term.write("\r\n\x1b[2mThe session ended.\x1b[0m\r\n");
-        // The server refuses before the upgrade, so the browser never sees the reason.
+        if (refused || e.code === 4403) setError(refused ? sentence(refused) : "The server refused to open a shell.");
+        else if (opened) term.write("\r\n\x1b[2mThe session ended.\x1b[0m\r\n");
+        // Refusals before the upgrade (like an expired session) reach the browser without a reason.
         else setError("The console could not connect. Check that the container is still running, then try again.");
       };
       const input = term.onData((d) => ws.readyState === WebSocket.OPEN && ws.send(d));
@@ -253,7 +257,6 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
   };
 
   if (!props.canUse) return <Note>A shell can read the service's environment, so opening one needs the operator role on this project and the secrets:read grant.</Note>;
-  if (state === "planned") return <Planned />;
   return (
     <div class="space-y-4">
       <div class="flex flex-wrap items-end gap-3">

@@ -164,7 +164,7 @@ export function ServiceMetrics(props: { service: Service }) {
               ]}
               fmt={fmt.rate}
             />
-            {(d.series.restarts?.length ?? 0) > 0 && <Chart title="Restarts" lines={[{ label: "Restarts", points: d.series.restarts ?? [] }]} fmt={fmt.count} />}
+            {d.series.restarts?.some((p) => p[1] > 0) && <Chart title="Crashes (per 10 seconds)" lines={[{ label: "Crashes", points: d.series.restarts }]} fmt={fmt.count} />}
           </div>
         )}
       </Loaded>

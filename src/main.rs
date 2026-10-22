@@ -1,10 +1,25 @@
 mod api;
 mod app;
 mod auth;
+mod builder;
+mod compose;
 mod crypto;
+mod databases;
 mod db;
+mod deploy;
+mod git;
 mod model;
+mod notify;
 mod paths;
+mod proc;
+mod proxy;
+mod runtime;
+mod secrets;
+mod shim;
+mod sleep;
+mod store;
+mod tools;
+mod tunnel;
 mod util;
 mod web;
 
@@ -38,6 +53,10 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // Containers start through this binary mounted as /run/tugport/init.
+    if shim::invoked_as_init() {
+        shim::run(std::env::args().skip(1).collect());
+    }
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Version => {
@@ -81,6 +100,24 @@ fn public_ip() -> Option<String> {
     Some(sock.local_addr().ok()?.ip().to_string())
 }
 
+/// Containers mount a static copy of this binary as their init. `TUGPORT_INIT` overrides
+/// the source (development builds link glibc and cannot run in every image).
+fn install_init_binary(app: &app::App) -> Result<()> {
+    let src = match std::env::var_os("TUGPORT_INIT") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::env::current_exe()?,
+    };
+    let dest = app.paths.init_binary();
+    let same = std::fs::read(&dest).ok().is_some_and(|d| std::fs::read(&src).ok().is_some_and(|s| s == d));
+    if !same {
+        let tmp = dest.with_extension("new");
+        std::fs::copy(&src, &tmp).with_context(|| format!("copying {} to {}", src.display(), tmp.display()))?;
+        paths::restrict(&tmp, 0o755)?;
+        std::fs::rename(&tmp, &dest)?;
+    }
+    Ok(())
+}
+
 async fn serve() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "tugport=info".into()))
@@ -107,9 +144,26 @@ async fn serve() -> Result<()> {
         tracing::info!("open {link} to create the owner account");
     }
 
-    let (events, _) = tokio::sync::broadcast::channel(1024);
-    let app: app::AppState = Arc::new(app::App { paths, db, keys: crypto::Keyring::new(&master), docker, events });
+    let (events, _) = tokio::sync::broadcast::channel(4096);
+    let slots = db.get_setting::<app::Settings>("instance")?.unwrap_or_default().builds.max_parallel.max(1) as usize;
+    let app: app::AppState = Arc::new(app::App {
+        paths,
+        db,
+        keys: crypto::Keyring::new(&master),
+        docker,
+        events,
+        deployer: deploy::Deployer::default(),
+        build_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
+    });
     drop(master);
+    install_init_binary(&app)?;
+    deploy::recover_interrupted(&app)?;
+    match secrets::rematerialize(&app).await {
+        Ok(n) if n > 0 => tracing::info!("restored secrets for {n} containers"),
+        Ok(_) => {}
+        Err(e) => tracing::error!("restoring container secrets: {e:#}"),
+    }
+    runtime::detect_gpu(&app).await;
 
     let listen = app.settings().panel_listen;
     let router = api::router(app.clone());

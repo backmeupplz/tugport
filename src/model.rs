@@ -30,6 +30,8 @@ pub struct ServiceSpec {
     pub privileged: bool,
     pub docker_socket: bool,
     pub host_network: bool,
+    /// Blocks setuid escalation inside the container. On by default for new services.
+    pub no_new_privileges: bool,
     pub auto_update: AutoUpdate,
     pub placement: Placement,
     pub autoscale: Option<Autoscale>,
@@ -64,6 +66,7 @@ impl Default for ServiceSpec {
             privileged: false,
             docker_socket: false,
             host_network: false,
+            no_new_privileges: true,
             auto_update: AutoUpdate::default(),
             placement: Placement::default(),
             autoscale: None,

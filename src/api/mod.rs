@@ -1,4 +1,8 @@
 mod access;
+mod deploys;
+mod git;
+mod hooks;
+pub mod projects;
 
 use crate::app::AppState;
 use crate::auth::{self, KeyCheck, Principal};
@@ -7,7 +11,7 @@ use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use std::net::{IpAddr, SocketAddr};
 
 pub fn router(app: AppState) -> Router {
@@ -26,6 +30,38 @@ pub fn router(app: AppState) -> Router {
         .route("/api/keys/{id}/rotate", post(access::rotate_key))
         .route("/api/settings", get(access::get_settings).patch(access::update_settings))
         .route("/api/audit", get(access::audit))
+        .route("/api/projects", get(projects::list_projects).post(projects::create_project))
+        .route("/api/projects/{id}", get(projects::get_project).patch(projects::update_project).delete(projects::delete_project))
+        .route("/api/projects/{id}/vars", get(projects::get_vars).put(projects::put_vars))
+        .route("/api/projects/{id}/members", get(projects::list_members))
+        .route("/api/projects/{id}/members/{user}", put(projects::set_member))
+        .route("/api/projects/{id}/services", post(projects::create_service))
+        .route("/api/services/{id}", get(projects::get_service).patch(projects::update_service).delete(projects::delete_service))
+        .route("/api/services/{id}/env", get(projects::get_env).put(projects::put_env))
+        .route("/api/services/{id}/files", get(projects::list_files).put(projects::put_file))
+        .route("/api/services/{id}/domains", get(projects::list_domains).post(projects::create_domain))
+        .route("/api/services/{id}/hook", post(projects::rotate_hook))
+        .route("/api/services/{id}/deploy-key", post(git::deploy_key))
+        .route("/api/services/{id}/deploy", post(deploys::deploy))
+        .route("/api/services/{id}/deploys", get(deploys::list))
+        .route("/api/services/{id}/rollback", post(deploys::rollback))
+        .route("/api/services/{id}/restart", post(deploys::restart))
+        .route("/api/services/{id}/stop", post(deploys::stop))
+        .route("/api/services/{id}/start", post(deploys::start))
+        .route("/api/domains/{id}", patch(projects::update_domain).delete(projects::delete_domain))
+        .route("/api/deploys/{id}", get(deploys::get_one))
+        .route("/api/deploys/{id}/log", get(deploys::log_stream))
+        .route("/api/deploys/{id}/cancel", post(deploys::cancel))
+        .route("/api/events", get(deploys::events))
+        .route("/api/git/providers", get(git::list).post(git::create))
+        .route("/api/git/providers/{id}", delete(git::delete))
+        .route("/api/git/providers/{id}/repos", get(git::repos))
+        .route("/api/git/github/manifest", post(git::github_manifest))
+        .route("/api/git/github/callback", get(git::github_callback))
+        .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/hooks/git/{provider}", post(hooks::git_hook))
+        // Easypanel's deploy webhook path, so migrated repositories keep deploying.
+        .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .fallback(crate::web::static_handler)
         .with_state(app)
 }

@@ -57,11 +57,13 @@ pub async fn replicas(app: &App, service_id: &str) -> Result<Vec<Replica>> {
     let mut out = vec![];
     for c in list {
         let labels = c.labels.clone().unwrap_or_default();
-        let ip = c
-            .network_settings
-            .as_ref()
-            .and_then(|n| n.networks.as_ref())
-            .and_then(|n| n.values().find_map(|e| e.ip_address.clone().filter(|ip| !ip.is_empty())));
+        // The proxy runs on the host: prefer an address on a Tugport bridge over extra
+        // networks (an old panel's overlay during a migration is not routable from here).
+        let ip = c.network_settings.as_ref().and_then(|n| n.networks.as_ref()).and_then(|n| {
+            let mut nets: Vec<_> = n.iter().collect();
+            nets.sort_by_key(|(name, _)| !name.starts_with("tp-"));
+            nets.into_iter().find_map(|(_, e)| e.ip_address.clone().filter(|ip| !ip.is_empty()))
+        });
         let health = c.status.as_deref().and_then(|s| {
             ["(healthy)", "(unhealthy)", "(health: starting)"].iter().find(|h| s.contains(*h)).map(|h| h.trim_matches(['(', ')']).replace("health: ", ""))
         });

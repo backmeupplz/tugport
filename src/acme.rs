@@ -11,8 +11,9 @@ use std::time::Duration;
 const RENEW_BEFORE: i64 = 30 * 86400;
 
 pub async fn run(app: AppState) {
-    load_stored(&app);
     loop {
+        // Every round, so certificates imported while running (`tugport migrate`) are served too.
+        load_stored(&app);
         if let Err(e) = tick(&app).await {
             tracing::warn!("certificate check: {e:#}");
         }
@@ -29,7 +30,7 @@ fn load_stored(app: &App) {
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
-    for (host, cert, key) in rows {
+    for (host, cert, key) in rows.into_iter().filter(|(h, _, _)| !app.proxy.has_cert(h)) {
         match app.keys.open_str(&format!("cert:{host}"), &key).and_then(|k| crate::proxy::certified_key(&cert, &k)) {
             Ok(ck) => app.proxy.set_cert(&host, ck),
             Err(e) => tracing::warn!("stored certificate for {host} is unusable: {e:#}"),

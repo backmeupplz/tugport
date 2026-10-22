@@ -215,15 +215,19 @@ async fn serve() -> Result<()> {
     let listen = app.settings().panel_listen;
     let router = api::router(app.clone());
     mcp::install(router.clone());
-    if let Some(legacy) = app.settings().legacy_listen {
-        let router = router.clone();
+    // Old panel webhook URLs (Easypanel's :3000). Bound once the setting appears and the port
+    // is free, so a migration can turn it on after stopping the old panel.
+    {
+        let (app, router) = (app.clone(), router.clone());
         tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(&legacy).await {
-                Ok(l) => {
+            loop {
+                if let Some(legacy) = app.settings().legacy_listen
+                    && let Ok(l) = tokio::net::TcpListener::bind(&legacy).await
+                {
                     tracing::info!("also serving the API on {legacy}");
-                    let _ = axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+                    let _ = axum::serve(l, router.clone().into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
                 }
-                Err(e) => tracing::warn!("cannot listen on {legacy}: {e}"),
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }

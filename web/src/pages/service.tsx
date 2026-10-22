@@ -1,11 +1,11 @@
 import type { ComponentChildren } from "preact";
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { route } from "preact-router";
-import { FINAL, atLeast, del, get, hasGrant, post, put, useApi, useMe, type Deploy, type Replica, type ServiceDetail } from "../api";
+import { FINAL, atLeast, del, get, hasGrant, nodeName, post, put, useApi, useEvent, useMe, useNodes, type Deploy, type Node, type Replica, type ServiceDetail } from "../api";
 import { EnvEditor } from "../env-editor";
 import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, toast, useSubmit } from "../ui";
 import { fmt } from "../charts";
-import { ago, bytes, clock, duration } from "../util";
+import { ago, bytes, clock, duration, qs, sumUsage } from "../util";
 import { Domains } from "./domains";
 import { DeployKey } from "./new-service";
 import { Console, Logs, ServiceMetrics, type Now } from "./observe";
@@ -30,7 +30,12 @@ export interface Ctx {
   d: ServiceDetail;
   reload: () => Promise<void>;
   openLog: (deployId: string) => void;
+  /** The servers, when the signed-in user may list them. */
+  nodes: { mesh: boolean; nodes: Node[] } | null;
 }
+
+/** Which server runs a replica matters once there is more than one. */
+const multiServer = (c: Ctx) => (c.nodes?.nodes.length ?? 0) > 1 || c.d.status.replicas.some((r) => r.node !== "local");
 
 /** Starts a deploy and opens its live log. */
 export async function deploy(c: Ctx) {
@@ -55,8 +60,10 @@ export function RedeployNote(props: { c: Ctx; children: ComponentChildren }) {
 export function ServicePage(props: { project?: string; service?: string; tab?: string; path?: string }) {
   const me = useMe();
   const sid = useRef("");
-  const r = useApi<ServiceDetail>(`/services/${props.project}.${props.service}`, (e) => e.service_id === sid.current && LIVE.has(e.kind));
+  // Replicas on a server that drops out vanish from the status without a container event.
+  const r = useApi<ServiceDetail>(`/services/${props.project}.${props.service}`, (e) => (e.service_id === sid.current && LIVE.has(e.kind)) || e.kind === "nodes");
   sid.current = r.data?.service.id ?? "";
+  const nodes = useNodes();
   const [logId, setLogId] = useState<string | null>(null);
   const d = r.data;
   if (!d) {
@@ -69,7 +76,8 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
   const s = d.service;
   const tab = TABS.some(([id]) => id === props.tab) ? (props.tab as string) : "overview";
   const base = `/projects/${s.project}/${s.name}`;
-  const c: Ctx = { d, reload: r.reload, openLog: setLogId };
+  const c: Ctx = { d, reload: r.reload, openLog: setLogId, nodes };
+  const label = (x: Replica) => (x.compose_service ?? x.name) + (multiServer(c) ? ` on ${nodeName(nodes, x.node)}` : "");
   const site = d.domains[0];
   return (
     <Page
@@ -107,13 +115,13 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
       <Tabs label="Service sections" current={tab} items={TABS.map(([id, label]) => [id, label, id === "overview" ? base : `${base}/${id}`])} />
       {tab === "overview" && <Overview c={c} />}
       {tab === "deploys" && <Deploys c={c} />}
-      {tab === "logs" && <Logs service={s} replicas={d.status.replicas} />}
+      {tab === "logs" && <Logs service={s} replicas={d.status.replicas} label={label} />}
       {tab === "metrics" && <ServiceMetrics service={s} />}
       {tab === "domains" && <Domains c={c} />}
       {tab === "env" && <Env c={c} />}
       {tab === "files" && <Files c={c} />}
       {tab === "settings" && <ServiceSettings c={c} />}
-      {tab === "console" && <Console service={s} replicas={d.status.replicas} canUse={atLeast(d.role, "operator") && hasGrant(me, "secrets:read")} />}
+      {tab === "console" && <Console service={s} replicas={d.status.replicas} label={label} canUse={atLeast(d.role, "operator") && hasGrant(me, "secrets:read")} />}
       {tab === "danger" && <Danger c={c} />}
       <DeployLog id={logId} onClose={() => setLogId(null)} />
     </Page>
@@ -174,9 +182,9 @@ function Overview({ c }: { c: Ctx }) {
           {st.replicas.length === 0 ? (
             <p class="text-muted">There are no containers yet, so deploy the service to start it.</p>
           ) : (
-            <Replicas list={st.replicas} live={st.live_deploy} />
+            <Replicas c={c} />
           )}
-          {st.running > 0 && <Usage id={id} />}
+          {st.running > 0 && <Usage id={id} nodes={st.replicas.filter((x) => x.state === "running").map((x) => x.node)} />}
           <p class="mt-4 text-xs text-muted">
             Other services in this project reach it by the host name <code>{s.name}</code>
             {s.kind === "database" && (
@@ -219,35 +227,58 @@ function Overview({ c }: { c: Ctx }) {
   );
 }
 
-/** Current CPU and memory from the server's latest metrics sample. */
-function Usage(props: { id: string }) {
-  const r = useApi<Now>("/metrics/now", (e) => e.kind === "metrics");
-  const u = r.data?.services?.find((x) => x.id === props.id);
+/**
+ * Current CPU and memory, added up over the servers its replicas run on. The panel's own sample
+ * always joins in, because it counts the crashes on every server.
+ */
+function Usage(props: { id: string; nodes: string[] }) {
+  const servers = [...new Set(props.nodes)];
+  const key = [...new Set(["local", ...servers])].sort().join(",");
+  const [u, setU] = useState<ReturnType<typeof sumUsage>>(null);
+  const load = useCallback(async () => {
+    const samples = await Promise.all(key.split(",").map((n) => get<Now>(`/metrics/now${qs({ node: n === "local" ? null : n })}`).catch(() => null)));
+    setU(sumUsage(samples, props.id));
+  }, [key, props.id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  // Only the owner gets "metrics" events; everyone else sees the numbers from when the page opened.
+  useEvent((e) => (e.kind === "metrics" || e.kind === "resync") && load());
   if (!u) return null;
   // Docker reports 0 B where the memory controller is unavailable; leave it out rather than mislead.
   const memory = u.memory > 0 ? ` and ${bytes(u.memory)} of memory` : "";
+  const across = servers.length > 1 ? ` across ${servers.length} servers` : "";
   const restarts = u.restarts ? `, after ${u.restarts} ${u.restarts === 1 ? "restart" : "restarts"}` : "";
   return (
     <p class="mt-3 text-dim">
       Using {fmt.pct(u.cpu)} of a core{memory}
+      {across}
       {restarts}.
     </p>
   );
 }
 
-function Replicas(props: { list: Replica[]; live: string | null }) {
+function Replicas({ c }: { c: Ctx }) {
+  const st = c.d.status;
+  const multi = multiServer(c);
   return (
     <ul class="divide-y divide-line rounded-md border border-line">
-      {props.list.map((r) => (
+      {st.replicas.map((r) => (
         <li key={r.id} class="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2">
           <span class="min-w-0 flex-1 truncate font-mono text-[13px]" title={r.name}>
             {r.compose_service ?? r.name}
           </span>
+          {multi &&
+            (c.nodes ? (
+              <a class="chip hover:text-text" href={`/servers/${r.node}`} title="The server this replica runs on">
+                on {nodeName(c.nodes, r.node)}
+              </a>
+            ) : (
+              <span class="chip">on {nodeName(null, r.node)}</span>
+            ))}
           <Pill state={r.health && r.state === "running" ? r.health : r.state} />
-          {props.live && r.deploy !== props.live && <span class="chip">previous deploy</span>}
-          <span class="w-full truncate text-xs text-muted sm:w-auto">
-            {[r.ip, r.image, r.created ? `started ${ago(r.created)}` : "", r.node !== "local" ? r.node : ""].filter(Boolean).join(" · ")}
-          </span>
+          {st.live_deploy && r.deploy !== st.live_deploy && <span class="chip">previous deploy</span>}
+          <span class="w-full truncate text-xs text-muted">{[r.ip, r.image, r.created ? `started ${ago(r.created)}` : ""].filter(Boolean).join(" · ")}</span>
         </li>
       ))}
     </ul>

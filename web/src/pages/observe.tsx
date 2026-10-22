@@ -20,7 +20,7 @@ const LOG_RANGES: [string, string, number][] = [
 ];
 const MAX_LINES = 5000;
 
-export function Logs(props: { service: Service; replicas: Replica[] }) {
+export function Logs(props: { service: Service; replicas: Replica[]; label: (r: Replica) => string }) {
   const id = props.service.id;
   const [q, setQ] = useState("");
   const [query, setQuery] = useState("");
@@ -99,7 +99,7 @@ export function Logs(props: { service: Service; replicas: Replica[] }) {
         </Field>
         {props.replicas.length > 1 && (
           <Field label="Replica">
-            <Select value={replica} onChange={setReplica} options={[["", "All replicas"], ...props.replicas.map((r): [string, string] => [r.name, r.compose_service ?? r.name])]} />
+            <Select value={replica} onChange={setReplica} options={[["", "All replicas"], ...props.replicas.map((r): [string, string] => [r.name, props.label(r)])]} />
           </Field>
         )}
         <label class="flex items-center gap-2 pb-2">
@@ -180,7 +180,7 @@ function RangeSelect(props: { value: string; onChange: (v: string) => void }) {
   );
 }
 
-export function Console(props: { service: Service; replicas: Replica[]; canUse: boolean }) {
+export function Console(props: { service: Service; replicas: Replica[]; canUse: boolean; label: (r: Replica) => string }) {
   const running = props.replicas.filter((r) => r.state === "running");
   const [container, setContainer] = useState(running[0]?.id ?? "");
   const [state, setState] = useState<"idle" | "planned" | "connecting" | "open" | "closed">("idle");
@@ -261,7 +261,7 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
           <Select
             value={container}
             onChange={setContainer}
-            options={running.length ? running.map((r): [string, string] => [r.id, r.compose_service ?? r.name]) : [["", "No running containers"]]}
+            options={running.length ? running.map((r): [string, string] => [r.id, props.label(r)]) : [["", "No running containers"]]}
           />
         </Field>
         <button class="btn btn-primary" disabled={!container || state === "connecting"} onClick={connect}>

@@ -128,7 +128,8 @@ function NewProject(props: { open: boolean; onClose: () => void }) {
 export function ProjectPage(props: { project?: string; path?: string }) {
   const me = useMe();
   const pid = useRef("");
-  const r = useApi<ProjectDetail>(`/projects/${props.project ?? ""}`, (e) => e.project_id === pid.current && LIVE.has(e.kind));
+  // Replicas on a server that drops out vanish from the status without a container event.
+  const r = useApi<ProjectDetail>(`/projects/${props.project ?? ""}`, (e) => (e.project_id === pid.current && LIVE.has(e.kind)) || e.kind === "nodes");
   pid.current = r.data?.project.id ?? "";
   const [wizard, setWizard] = useState(false);
   const d = r.data;

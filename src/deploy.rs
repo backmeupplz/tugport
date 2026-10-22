@@ -21,6 +21,13 @@ pub struct Deployer {
     queues: Mutex<HashMap<String, Queue>>,
 }
 
+impl Deployer {
+    /// No deploy is running or waiting.
+    pub fn idle(&self) -> bool {
+        crate::util::lock(&self.queues).is_empty()
+    }
+}
+
 #[derive(Default)]
 struct Queue {
     running: Option<(String, CancellationToken)>,

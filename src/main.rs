@@ -14,6 +14,7 @@ mod databases;
 mod db;
 mod deploy;
 mod git;
+mod handoff;
 mod logs;
 mod mcp;
 mod metrics;
@@ -30,6 +31,7 @@ mod sleep;
 mod store;
 mod tools;
 mod tunnel;
+mod updates;
 mod util;
 mod web;
 
@@ -193,6 +195,9 @@ async fn serve() -> Result<()> {
     runtime::detect_gpu(&app).await;
 
     let port = |var: &str, default: u16| std::env::var(var).ok().and_then(|p| p.parse().ok()).unwrap_or(default);
+    // Certificates and routes are ready before the first connection (matters after a reload).
+    acme::load_stored(&app);
+    proxy::initial_routes(&app).await;
     tokio::spawn(proxy::watch(app.clone()));
     tokio::spawn(acme::run(app.clone()));
     tokio::spawn(logs::collect(app.clone()));
@@ -202,6 +207,21 @@ async fn serve() -> Result<()> {
     tokio::spawn(autoupdate::run(app.clone()));
     tokio::spawn(backup::scheduler(app.clone()));
     tokio::spawn(tunnel::run(app.clone()));
+    tokio::spawn(updates::auto(app.clone()));
+    // SIGHUP (`systemctl reload tugport`): re-exec the binary on disk without dropping traffic.
+    tokio::spawn(async {
+        let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
+        while hup.recv().await.is_some() {
+            match handoff::binary_path() {
+                Ok(exe) => {
+                    if let Err(e) = handoff::reexec(&exe, std::time::Duration::from_secs(30)).await {
+                        tracing::error!("reload failed: {e:#}");
+                    }
+                }
+                Err(e) => tracing::error!("reload failed: {e}"),
+            }
+        }
+    });
     {
         let app = app.clone();
         let (http, https) = (port("TUGPORT_HTTP_PORT", 80), port("TUGPORT_HTTPS_PORT", 443));
@@ -218,21 +238,31 @@ async fn serve() -> Result<()> {
     if let Some(legacy) = app.settings().legacy_listen {
         let router = router.clone();
         tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(&legacy).await {
+            let bound = handoff::listener("legacy", async { Ok(tokio::net::TcpListener::bind(&legacy).await?) }).await;
+            match bound {
                 Ok(l) => {
                     tracing::info!("also serving the API on {legacy}");
-                    let _ = axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
+                    let _ = axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                        .with_graceful_shutdown(handoff::DRAIN.notified())
+                        .await;
                 }
-                Err(e) => tracing::warn!("cannot listen on {legacy}: {e}"),
+                Err(e) => tracing::warn!("cannot listen on {legacy}: {e:#}"),
             }
         });
     }
-    let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("listening on {listen}"))?;
+    let listener = handoff::listener("panel", async { Ok(tokio::net::TcpListener::bind(&listen).await?) }).await.with_context(|| format!("listening on {listen}"))?;
     tracing::info!("tugport {VERSION} panel on http://{listen}");
     axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = handoff::DRAIN.notified() => {}
+            }
         })
         .await?;
+    // The panel stops only for a shutdown or a handoff; give a handoff time to exec.
+    if handoff::draining() {
+        std::future::pending::<()>().await;
+    }
     Ok(())
 }

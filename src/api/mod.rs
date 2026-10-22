@@ -25,6 +25,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/me", get(access::me))
         .route("/api/me/totp", post(access::totp_begin).put(access::totp_confirm).delete(access::totp_disable))
         .route("/api/about", get(access::about))
+        .route("/api/updates", get(access::update_status))
+        .route("/api/updates/apply", post(access::update_apply))
         .route("/api/users", get(access::list_users).post(access::create_user))
         .route("/api/users/{id}", get(access::get_user).patch(access::update_user).delete(access::delete_user))
         .route("/api/users/{id}/keys", get(access::list_keys).post(access::create_key))

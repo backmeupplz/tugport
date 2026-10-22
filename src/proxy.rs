@@ -205,6 +205,14 @@ async fn build_routes(app: &App) -> Result<Routes> {
     Ok(Routes { hosts })
 }
 
+/// Build the routing table once; call before serving so the first request already routes.
+pub async fn initial_routes(app: &App) {
+    match build_routes(app).await {
+        Ok(r) => *crate::util::write(&app.proxy.routes) = Arc::new(r),
+        Err(e) => tracing::error!("building routes: {e:#}"),
+    }
+}
+
 /// Keep the routing table fresh: on demand, on container events, and every 30 seconds.
 pub async fn watch(app: AppState) {
     {
@@ -241,23 +249,35 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
     };
-    let (http, https) = tokio::try_join!(bind(http_port), bind(https_port))?;
+    let (http_key, https_key) = (format!("proxy:{http_port}"), format!("proxy:{https_port}"));
+    let (http, https) = tokio::try_join!(crate::handoff::listener(&http_key, bind(http_port)), crate::handoff::listener(&https_key, bind(https_port)))?;
     tracing::info!("proxy listening on :{http_port} and :{https_port}");
     let a = app.clone();
     tokio::spawn(async move {
-        loop {
-            let Ok((stream, peer)) = http.accept().await else { continue };
+        while !crate::handoff::draining() {
+            let accepted = tokio::select! {
+                r = http.accept() => r,
+                _ = crate::handoff::DRAIN.notified() => break,
+            };
+            let Ok((stream, peer)) = accepted else { continue };
             let app = a.clone();
             tokio::spawn(async move { serve_conn(app, TokioIo::new(stream), peer, false).await });
         }
     });
-    loop {
-        let Ok((stream, peer)) = https.accept().await else { continue };
+    while !crate::handoff::draining() {
+        let accepted = tokio::select! {
+            r = https.accept() => r,
+            _ = crate::handoff::DRAIN.notified() => break,
+        };
+        let Ok((stream, peer)) = accepted else { continue };
         let (app, tls) = (app.clone(), tls.clone());
         tokio::spawn(async move {
-            if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await { serve_conn(app, TokioIo::new(s), peer, true).await }
+            if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
+                serve_conn(app, TokioIo::new(s), peer, true).await
+            }
         });
     }
+    Ok(())
 }
 
 /// Bind, waiting while another proxy (Traefik during a migration) still holds the port.
@@ -285,11 +305,22 @@ async fn serve_conn<I>(app: AppState, io: TokioIo<I>, peer: SocketAddr, tls: boo
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let _guard = crate::handoff::ConnGuard::new();
     let svc = hyper::service::service_fn(move |req| {
         let app = app.clone();
         async move { Ok::<_, std::convert::Infallible>(handle(app, req, peer, tls).await) }
     });
-    let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(io, svc).await;
+    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        _ = conn.as_mut() => {}
+        _ = crate::handoff::DRAIN.notified() => {
+            // Finish the requests in flight, then close (keep-alive ends here).
+            conn.as_mut().graceful_shutdown();
+            let _ = conn.await;
+        }
+    }
 }
 
 fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response<Body> {

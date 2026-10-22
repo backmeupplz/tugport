@@ -20,7 +20,7 @@ pub async fn run(app: AppState) {
     }
 }
 
-fn load_stored(app: &App) {
+pub fn load_stored(app: &App) {
     let rows: Vec<(String, String, Vec<u8>)> = {
         let conn = app.db.conn();
         let mut stmt = match conn.prepare("SELECT host, cert_pem, key_pem FROM certificates WHERE cert_pem IS NOT NULL") {

@@ -289,9 +289,7 @@ pub enum PoolStep {
 pub fn pool_step(p: &Pool, machines: u32, creating: bool, cpu: Option<f64>, low_for_s: i64, since_growth_s: i64) -> PoolStep {
     if creating {
         PoolStep::Wait
-    } else if machines < p.min_servers {
-        PoolStep::Grow
-    } else if machines < p.max_servers && cpu.is_some_and(|c| c > p.scale_up_cpu) && since_growth_s >= GROW_COOLDOWN_S {
+    } else if machines < p.min_servers || (machines < p.max_servers && cpu.is_some_and(|c| c > p.scale_up_cpu) && since_growth_s >= GROW_COOLDOWN_S) {
         PoolStep::Grow
     } else if machines > p.min_servers && (machines > p.max_servers || low_for_s >= SHRINK_AFTER_S) {
         PoolStep::Shrink

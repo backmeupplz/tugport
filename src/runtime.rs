@@ -257,7 +257,13 @@ pub fn container_name(s: &Service, deploy_id: &str, replica: u32) -> String {
 pub async fn create_replica(app: &App, s: &Service, deploy_id: &str, replica: u32, image: &str, img: &ImageInfo, network: &str, publish_ports: bool) -> Result<String> {
     let spec = &s.spec;
     let name = container_name(s, deploy_id, replica);
-    let env = store::resolved_env(app, s)?;
+    let mut env = store::resolved_env(app, s)?;
+    // Like other platforms, tell the app which port the proxy expects it on.
+    if !env.contains_key("PORT") {
+        if let Some(d) = store::domains(app, Some(&s.id))?.first() {
+            env.insert("PORT".into(), zeroize::Zeroizing::new(d.port.to_string()));
+        }
+    }
     let env_file = secrets::materialize(app, &name, &env)?;
     let mut mounts = vec![
         bind(&app.paths.init_binary().to_string_lossy(), secrets::INIT_PATH, true),

@@ -211,12 +211,18 @@ const KINDS = ["deploy", "deploy.log", "service.status", "service.updated", "aud
 const listeners = new Set<(e: Event) => void>();
 let source: EventSource | null = null;
 let wanted = false;
+/** The stream was open before, so a later open (a reconnect, a tab shown again) may have missed events. */
+let wasOpen = false;
 
 export function startEvents() {
   wanted = true;
   if (source) return;
   const s = new EventSource("/api/events");
   source = s;
+  s.onopen = () => {
+    if (wasOpen) listeners.forEach((f) => f({ kind: "resync", data: {}, at: Date.now() }));
+    wasOpen = true;
+  };
   const fire = (m: MessageEvent) => {
     let e: Event;
     try {
@@ -237,6 +243,7 @@ export function startEvents() {
 
 export function stopEvents() {
   wanted = false;
+  wasOpen = false;
   source?.close();
   source = null;
 }
@@ -250,8 +257,6 @@ document.addEventListener("visibilitychange", () => {
     source = null;
   } else if (!source) {
     startEvents();
-    const resync: Event = { kind: "resync", data: {}, at: Date.now() };
-    listeners.forEach((f) => f(resync));
   }
 });
 
@@ -268,10 +273,11 @@ export function useEvent(fn: (e: Event) => void) {
 }
 
 /**
- * GET `path` (null = skip). With `live`, matching events refetch the data, and a slow poll
- * covers status changes the event stream does not announce (like a crashing container).
+ * GET `path` (null = skip). With `live`, matching events refetch the data. With `poll` (ms), it
+ * also refetches after that long without a refetch, for data the stream does not bring to
+ * everyone: "metrics" and "nodes" events reach only the owner.
  */
-export function useApi<T = any>(path: string | null, live?: (e: Event) => boolean) {
+export function useApi<T = any>(path: string | null, live?: (e: Event) => boolean, poll?: number) {
   const [state, setState] = useState<{ path?: string | null; data?: T; error?: ApiError }>({});
   const latest = useRef(path);
   latest.current = path;
@@ -297,15 +303,14 @@ export function useApi<T = any>(path: string | null, live?: (e: Event) => boolea
     clearTimeout(timer.current);
     timer.current = setTimeout(reload, 300);
   });
-  const isLive = !!live;
+  useEffect(() => () => clearTimeout(timer.current), []);
+  // Every refetch re-arms the timer, so events that keep the data fresh leave nothing to poll.
+  // A hidden tab lets it lapse and catches up through the "resync" event.
   useEffect(() => {
-    if (!isLive) return;
-    const t = setInterval(() => document.visibilityState === "visible" && reload(), 15000);
-    return () => {
-      clearInterval(t);
-      clearTimeout(timer.current);
-    };
-  }, [reload, isLive]);
+    if (!poll || !path) return;
+    const t = setTimeout(() => document.visibilityState === "visible" && reload(), poll);
+    return () => clearTimeout(t);
+  }, [state, poll, reload]);
 
   const mine = state.path === path;
   return {

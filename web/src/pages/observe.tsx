@@ -143,9 +143,12 @@ export function Logs(props: { service: Service; replicas: Replica[] }) {
 
 type Series = { step: number; series: Record<string, Points> };
 
+/** Metrics refresh with each 10-second sample; people other than the owner do not get that event and poll. */
+const useMetrics = <T,>(path: string | null) => useApi<T>(path, (e) => e.kind === "metrics", 15000);
+
 export function ServiceMetrics(props: { service: Service }) {
   const [range, setRange] = useState("1h");
-  const r = useApi<Series>(`/metrics?scope=service:${props.service.id}&names=cpu,memory,net_rx,net_tx,restarts&range=${range}`, (e) => e.kind === "metrics");
+  const r = useMetrics<Series>(`/metrics?scope=service:${props.service.id}&names=cpu,memory,net_rx,net_tx,restarts&range=${range}`);
   return (
     <div class="space-y-4">
       <RangeSelect value={range} onChange={setRange} />

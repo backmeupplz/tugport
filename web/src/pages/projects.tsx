@@ -46,7 +46,10 @@ export function sourceLabel(src: Source, kind?: string): string {
 
 export function Projects(_: { path?: string }) {
   const me = useMe();
-  const r = useApi<{ projects: Project[] }>("/projects", (e) => e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? ""));
+  const r = useApi<{ projects: Project[] }>(
+    "/projects",
+    (e) => e.kind === "service.status" || (e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? "")),
+  );
   const [open, setOpen] = useState(false);
   const canCreate = me.principal.is_owner || atLeast(me.principal.all_projects_role, "operator");
   return (

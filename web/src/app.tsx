@@ -1,12 +1,12 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import Router, { getCurrentUrl } from "preact-router";
-import { ApiError, MeContext, del, get, onUnauthorized, post, put, startEvents, stopEvents, type Me } from "./api";
+import { ApiError, MeContext, canSeeServers, del, get, onUnauthorized, post, put, startEvents, stopEvents, type Me } from "./api";
 import { CodeBlock, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useSubmit } from "./ui";
 import { Access, Audit, NewAgent, NewPerson, UserPage } from "./pages/access";
 import { Login, Setup } from "./pages/auth";
-import { Server } from "./pages/observe";
 import { ProjectPage, Projects } from "./pages/projects";
+import { ServerPage, Servers } from "./pages/servers";
 import { ServicePage } from "./pages/service";
 import { Settings } from "./pages/settings";
 
@@ -106,7 +106,7 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
   const path = url.split("?")[0];
   const nav: [string, string, boolean][] = [
     ["Projects", "/", path === "/" || path.startsWith("/projects")],
-    ["Server", "/server", path.startsWith("/server")],
+    ...(canSeeServers(me) ? [["Servers", "/servers", path.startsWith("/server")] as [string, string, boolean]] : []),
     ["Access", "/access", path.startsWith("/access")],
     ["Settings", "/settings", path.startsWith("/settings")],
   ];
@@ -189,7 +189,9 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
             <Projects path="/" />
             <ProjectPage path="/projects/:project" />
             <ServicePage path="/projects/:project/:service/:tab?" />
-            <Server path="/server" />
+            <Servers path="/servers" />
+            <ServerPage path="/servers/:id" />
+            <ServerPage path="/server" />
             <Access path="/access" />
             <Audit path="/access/audit" />
             <NewAgent path="/access/new-agent" />

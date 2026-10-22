@@ -94,8 +94,8 @@ export function Select(props: {
   );
 }
 
-/** A DNS-safe name (projects, services): lowercase letters, digits and dashes. */
-export function NameInput(props: { value: string; onChange: (v: string) => void; autoFocus?: boolean }) {
+/** A DNS-safe name (projects, services, servers): lowercase letters, digits and dashes. An unchanged `initial` name passes as it is. */
+export function NameInput(props: { value: string; onChange: (v: string) => void; autoFocus?: boolean; initial?: string }) {
   return (
     <input
       class="input font-mono"
@@ -104,7 +104,7 @@ export function NameInput(props: { value: string; onChange: (v: string) => void;
       autoComplete="off"
       spellcheck={false}
       maxLength={40}
-      pattern="[a-z]([a-z0-9\-]*[a-z0-9])?"
+      pattern={props.value === props.initial ? undefined : "[a-z]([a-z0-9\\-]*[a-z0-9])?"}
       title="Lowercase letters, digits and dashes, starting with a letter"
       value={props.value}
       onInput={(e) => props.onChange(e.currentTarget.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))}
@@ -294,6 +294,10 @@ const TONE: Record<string, string> = {
   failed: "bad",
   dead: "bad",
   asleep: "info",
+  online: "ok",
+  joining: "warn",
+  unreachable: "warn",
+  offline: "bad",
 };
 const TONE_CLASS: Record<string, string> = {
   ok: "border-ok/30 bg-ok/10 text-ok",
@@ -304,12 +308,12 @@ const TONE_CLASS: Record<string, string> = {
 };
 
 /** A state label with a colored dot; the text carries the meaning, the color only reinforces it. */
-export function Pill(props: { state: string; class?: string }) {
+export function Pill(props: { state: string; label?: string; class?: string }) {
   const tone = TONE[props.state] ?? "muted";
   return (
     <span class={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border px-2 py-px text-xs font-medium ${TONE_CLASS[tone]} ${props.class ?? ""}`}>
       <span class="size-1.5 rounded-full bg-current" aria-hidden="true" />
-      {props.state}
+      {props.label ?? props.state}
     </span>
   );
 }

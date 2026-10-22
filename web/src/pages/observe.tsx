@@ -1,10 +1,9 @@
-// Logs, charts and the console: everything built on the endpoints docs/API.md marks as planned.
-// Each one shows a calm "later build" state while the server still answers 404.
+// Logs, charts and the console of services, and the charts of servers.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { get, isPlanned, useApi, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
-import { Card, Empty, ErrorBox, Field, Loaded, Loading, Note, Page, Planned, Select, errText } from "../ui";
-import { bytes, clock, qs, toMs } from "../util";
+import { Card, Empty, ErrorBox, Field, Loaded, Loading, Note, Planned, Select, errText } from "../ui";
+import { ago, bytes, clock, qs, toMs } from "../util";
 
 interface LogLine {
   ts: number;
@@ -292,77 +291,74 @@ export interface Now {
   services: { id: string; cpu: number; memory: number; net_rx: number; net_tx: number; restarts: number }[];
 }
 
-export function Server(_: { path?: string }) {
-  const now = useApi<Now>("/metrics/now", (e) => e.kind === "metrics");
+/** Live tiles and history charts of one server ("local" is the panel's own). */
+export function ServerCharts(props: { node: string }) {
+  const node = props.node === "local" ? null : props.node;
+  const now = useMetrics<Now>(`/metrics/now${qs({ node })}`);
   const [range, setRange] = useState("1h");
   const disks = now.data?.disks ?? [];
   const names = ["cpu", "memory", "swap", "load1", "disk_read", "disk_write", "net_rx", "net_tx", "temp", ...disks.map((d) => `disk:${d.mount}`)].join(",");
-  const host = useApi<Series>(now.data ? `/metrics${qs({ scope: "host", names, range })}` : null, (e) => e.kind === "metrics");
+  const host = useMetrics<Series>(now.data ? `/metrics${qs({ scope: "host", names, range, node })}` : null);
+  // Other servers answer 404 until their first sample reaches the panel.
+  if (now.error?.status === 404) return <Empty>There are no measurements from this server yet. They arrive every 10 seconds while it is online.</Empty>;
   return (
-    <Page title="Server" sub="This machine, its containers and Tugport itself.">
-      <div class="space-y-6">
-        <Loaded r={now} planned>
-          {(n) =>
-            !n.at ? (
-              <Empty>Tugport is taking its first measurements, which only takes a few seconds.</Empty>
-            ) : (
-            <>
-              <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
-                <Tile label="CPU" value={fmt.pct(n.cpu)} sub={`${n.cores.length} cores · load ${n.load.map((l) => l.toFixed(2)).join(" ")}`} pct={n.cpu} />
-                <Tile label="Memory" value={bytes(n.memory.used)} sub={`of ${bytes(n.memory.total)}`} pct={(100 * n.memory.used) / (n.memory.total || 1)} />
-                {n.disks.slice(0, 1).map((d) => (
-                  <Tile key={d.mount} label={`Disk ${d.mount}`} value={bytes(d.used)} sub={`of ${bytes(d.total)}`} pct={(100 * d.used) / (d.total || 1)} />
-                ))}
-                <Tile label="Network" value={fmt.rate(n.net.rx)} sub={`in · ${fmt.rate(n.net.tx)} out`} />
-              </div>
-              <RangeSelect value={range} onChange={setRange} />
-              <Loaded r={host} planned>
-                {(h) => (
-                  <div class="grid gap-4 lg:grid-cols-2">
-                    <Chart title="CPU" lines={[{ label: "CPU", points: h.series.cpu ?? [] }]} fmt={fmt.pct} max={100} />
-                    <Chart title="Load (1 minute)" lines={[{ label: "Load", points: h.series.load1 ?? [] }]} fmt={fmt.count} />
-                    <Chart
-                      title="Memory"
-                      lines={[
-                        { label: "Memory", points: h.series.memory ?? [] },
-                        { label: "Swap", points: h.series.swap ?? [] },
-                      ]}
-                      fmt={fmt.bytes}
-                    />
-                    <Chart title="Disk space used" lines={disks.map((d) => ({ label: d.mount, points: h.series[`disk:${d.mount}`] ?? [] }))} fmt={fmt.pct} max={100} />
-                    <Chart
-                      title="Disk I/O"
-                      lines={[
-                        { label: "Read", points: h.series.disk_read ?? [] },
-                        { label: "Write", points: h.series.disk_write ?? [] },
-                      ]}
-                      fmt={fmt.rate}
-                    />
-                    <Chart
-                      title="Network"
-                      lines={[
-                        { label: "Received", points: h.series.net_rx ?? [] },
-                        { label: "Sent", points: h.series.net_tx ?? [] },
-                      ]}
-                      fmt={fmt.rate}
-                    />
-                    {(h.series.temp?.length ?? 0) > 0 && <Chart title="Temperature" lines={[{ label: "Temperature", points: h.series.temp ?? [] }]} fmt={fmt.celsius} />}
-                  </div>
-                )}
-              </Loaded>
-              {n.gpus.map((g) => (
-                <Gpu key={g.index} index={g.index} gpu={g} range={range} />
+    <Loaded r={now}>
+      {(n) =>
+        !n.at ? (
+          <Empty>Tugport is taking its first measurements, which only takes a few seconds.</Empty>
+        ) : (
+          <div class="space-y-6">
+            {Date.now() / 1000 - n.at > 60 && <Note tone="warn">These are the last measurements this server sent, {ago(n.at)}.</Note>}
+            <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <Tile label="CPU" value={fmt.pct(n.cpu)} sub={`${n.cores.length} cores · load ${n.load.map((l) => l.toFixed(2)).join(" ")}`} pct={n.cpu} />
+              <Tile label="Memory" value={bytes(n.memory.used)} sub={`of ${bytes(n.memory.total)}`} pct={(100 * n.memory.used) / (n.memory.total || 1)} />
+              {n.disks.slice(0, 1).map((d) => (
+                <Tile key={d.mount} label={`Disk ${d.mount}`} value={bytes(d.used)} sub={`of ${bytes(d.total)}`} pct={(100 * d.used) / (d.total || 1)} />
               ))}
-            </>
-            )
-          }
-        </Loaded>
-        <div class="grid gap-6 lg:grid-cols-2">
-          <DockerUsage />
-          <TugportLog />
-        </div>
-      </div>
-    </Page>
+              <Tile label="Network" value={fmt.rate(n.net.rx)} sub={`in · ${fmt.rate(n.net.tx)} out`} />
+            </div>
+            <RangeSelect value={range} onChange={setRange} />
+            <Loaded r={host}>
+              {(h) => (
+                <div class="grid gap-4 lg:grid-cols-2">
+                  <Chart title="CPU" lines={[{ label: "CPU", points: h.series.cpu ?? [] }]} fmt={fmt.pct} max={100} />
+                  <Chart title="Load (1 minute)" lines={[{ label: "Load", points: h.series.load1 ?? [] }]} fmt={fmt.count} />
+                  <Chart
+                    title="Memory"
+                    lines={[
+                      { label: "Memory", points: h.series.memory ?? [] },
+                      { label: "Swap", points: h.series.swap ?? [] },
+                    ]}
+                    fmt={fmt.bytes}
+                  />
+                  <Chart title="Disk space used" lines={disks.map((d) => ({ label: d.mount, points: h.series[`disk:${d.mount}`] ?? [] }))} fmt={fmt.pct} max={100} />
+                  <Chart
+                    title="Disk I/O"
+                    lines={[
+                      { label: "Read", points: h.series.disk_read ?? [] },
+                      { label: "Write", points: h.series.disk_write ?? [] },
+                    ]}
+                    fmt={fmt.rate}
+                  />
+                  <Chart
+                    title="Network"
+                    lines={[
+                      { label: "Received", points: h.series.net_rx ?? [] },
+                      { label: "Sent", points: h.series.net_tx ?? [] },
+                    ]}
+                    fmt={fmt.rate}
+                  />
+                  {(h.series.temp?.length ?? 0) > 0 && <Chart title="Temperature" lines={[{ label: "Temperature", points: h.series.temp ?? [] }]} fmt={fmt.celsius} />}
+                </div>
+              )}
+            </Loaded>
+            {n.gpus.map((g) => (
+              <Gpu key={g.index} gpu={g} range={range} node={node} />
+            ))}
+          </div>
+        )
+      }
+    </Loaded>
   );
 }
 
@@ -382,11 +378,11 @@ function Tile(props: { label: string; value: string; sub?: string; pct?: number 
   );
 }
 
-function Gpu(props: { index: number; gpu: Now["gpus"][number]; range: string }) {
-  const r = useApi<Series>(`/metrics${qs({ scope: `gpu:${props.index}`, names: "util,memory,temp,power", range: props.range })}`);
+function Gpu(props: { gpu: Now["gpus"][number]; range: string; node: string | null }) {
+  const r = useMetrics<Series>(`/metrics${qs({ scope: `gpu:${props.gpu.index}`, names: "util,memory,temp,power", range: props.range, node: props.node })}`);
   return (
-    <Card title={`GPU ${props.index}: ${props.gpu.name}`}>
-      <Loaded r={r} planned>
+    <Card title={`GPU ${props.gpu.index}: ${props.gpu.name}`}>
+      <Loaded r={r}>
         {(d) => (
           <div class="grid gap-4 lg:grid-cols-2">
             <Chart title="Utilization" lines={[{ label: "Utilization", points: d.series.util ?? [] }]} fmt={fmt.pct} max={100} />
@@ -400,11 +396,11 @@ function Gpu(props: { index: number; gpu: Now["gpus"][number]; range: string }) 
   );
 }
 
-function DockerUsage() {
+export function DockerUsage() {
   const r = useApi<{ images: number; build_cache: number; volumes: number; containers: number }>("/docker/usage");
   return (
     <Card title="Docker disk usage">
-      <Loaded r={r} planned>
+      <Loaded r={r}>
         {(u) => {
           const rows: [string, number][] = [
             ["Images", u.images],
@@ -435,7 +431,7 @@ function DockerUsage() {
   );
 }
 
-function TugportLog() {
+export function TugportLog() {
   const [level, setLevel] = useState("info");
   const r = useApi<{ lines: { ts: number | string; level: string; target: string; message: string }[] }>(`/logs/tugport${qs({ limit: 300, level })}`);
   return (

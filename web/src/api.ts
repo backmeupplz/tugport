@@ -195,6 +195,39 @@ export interface Key {
   revoked_at: number | null;
 }
 export type Snippets = Record<"env" | "cli" | "claude_code" | "codex" | "curl", string>;
+export interface Node {
+  id: string;
+  name: string;
+  local: boolean;
+  mesh_ip: string | null;
+  region: string | null;
+  labels: Record<string, string>;
+  status: "online" | "unreachable" | "offline" | "joining";
+  last_seen_at: number | null;
+  created_at: number;
+  info: {
+    version?: string;
+    docker?: string | null;
+    cpus?: number;
+    memory_total?: number;
+    arch?: string;
+    nvidia?: boolean;
+    dri?: boolean;
+  };
+}
+
+/** Listing servers needs the owner or a role on all projects. */
+export const canSeeServers = (me: Me) => me.principal.is_owner || !!me.principal.all_projects_role;
+
+/** Every server, for people allowed to list them; null for everyone else. */
+export function useNodes() {
+  const r = useApi<{ mesh: boolean; nodes: Node[] }>(canSeeServers(useMe()) ? "/nodes" : null, (e) => e.kind === "nodes");
+  return r.data ?? null;
+}
+
+/** A server's name for display. Without the server list only the panel's own server is known. */
+export const nodeName = (nodes: { nodes: Node[] } | null, id: string) =>
+  nodes?.nodes.find((n) => n.id === id)?.name ?? (id === "local" ? "the panel's server" : "another server");
 
 export const FINAL = new Set(["live", "failed", "cancelled", "superseded"]);
 
@@ -207,7 +240,7 @@ export interface Event {
   data: any;
   at: number;
 }
-const KINDS = ["deploy", "deploy.log", "service.status", "service.updated", "audit", "certificate", "settings", "metrics", "warning"];
+const KINDS = ["deploy", "deploy.log", "service.status", "service.updated", "audit", "certificate", "settings", "metrics", "warning", "nodes"];
 const listeners = new Set<(e: Event) => void>();
 let source: EventSource | null = null;
 let wanted = false;

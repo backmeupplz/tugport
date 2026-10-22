@@ -11,14 +11,15 @@ Tugport is a self-hosted deploy platform in the spirit of Coolify and Easypanel,
 
 ## What it will do
 
-- **Projects and services:** group apps and databases into projects, and give each service its own domains, automatic HTTPS, environment, volumes and limits.
-- **Deploys on push:** build every push from GitHub or Forgejo with your Dockerfile or Nixpacks, switch traffic only after the health check passes, and roll back in one click.
-- **Logs:** follow any service live and search history that survives restarts and redeploys.
-- **Server charts:** CPU, memory, disk, network and GPU for the whole machine and for each service.
-- **Agents as users:** create an agent user with a scoped API key in one step, limit what it may see and do per project, and audit everything it did.
-- **Database backups:** scheduled backups to S3-compatible storage with in-place restore.
+- **One-command install** that offers to migrate an existing Easypanel or Coolify server without downtime.
+- **Projects and services:** apps from Git or images, Docker Compose stacks and databases, each with domains, automatic HTTPS, environment, volumes and limits.
+- **Fast deploys on push** from GitHub or Forgejo, built with your Dockerfile, Railpack, Nixpacks or buildpacks, rolled out only after the health check passes and rolled back in one click.
+- **Logs and charts:** live and searchable logs, plus CPU, memory, disk, network and GPU charts for every server and service.
+- **Agents as users:** an agent user with a scoped API key in one step, per-project or all-project access, and an audit log of everything it did.
+- **Secrets that stay secret:** encrypted at rest, delivered only to the containers that use them, and masked everywhere else.
+- **More servers and regions** from the same panel, connected by an encrypted mesh.
 
-There is deliberately no app store.
+There is deliberately no app store. The full plan is in [ROADMAP.md](ROADMAP.md).
 
 ## Repository
 

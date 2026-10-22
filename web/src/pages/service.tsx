@@ -3,7 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "preac
 import { route } from "preact-router";
 import { FINAL, atLeast, del, get, hasGrant, nodeName, post, put, useApi, useEvent, useMe, useNodes, type Deploy, type Node, type Replica, type ServiceDetail } from "../api";
 import { EnvEditor } from "../env-editor";
-import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, toast, useSubmit } from "../ui";
+import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, errText, toast, useSubmit } from "../ui";
 import { fmt } from "../charts";
 import { ago, bytes, clock, duration, qs, sumUsage } from "../util";
 import { Domains } from "./domains";
@@ -348,24 +348,33 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
 }
 
 function Webhook({ c }: { c: Ctx }) {
-  const [url, setUrl] = useState("");
+  const me = useMe();
   const canOperate = atLeast(c.d.role, "operator");
+  // The URL deploys the service, so reading it back needs secrets:read; rotating shows a new one to any operator.
+  const canRead = canOperate && hasGrant(me, "secrets:read");
+  const hook = useApi<{ url: string }>(canRead ? `/services/${c.d.service.id}/hook` : null);
+  const url = hook.data?.url;
   return (
     <Card title="Deploy webhook">
-      <p class="text-dim">CI can deploy this service with a POST or GET to its webhook URL. The URL is shown only when it is created, so rotate it whenever you need it again.</p>
+      <p class="text-dim">CI can deploy this service with a POST or GET to its webhook URL. Anyone who has the URL can deploy, so keep it secret.</p>
       {url && (
         <div class="mt-3 space-y-2">
           <CodeBlock label="Webhook URL" text={url} />
           <CodeBlock label="From CI" text={`curl -fsS -X POST "${url}"`} />
         </div>
       )}
+      {hook.error && (hook.error.status === 404 ? <Note class="mt-3">{errText(hook.error)}</Note> : <div class="mt-3"><ErrorBox error={hook.error} /></div>)}
+      {canOperate && !canRead && !url && (
+        <p class="mt-3 text-xs text-muted">Seeing the current URL needs the secrets:read grant. Rotating it shows you a new URL once.</p>
+      )}
       {canOperate && (
         <div class="mt-3">
           <Action
             confirm="Rotate the webhook URL? The current URL stops working right away."
-            run={async () => setUrl((await post<{ url: string }>(`/services/${c.d.service.id}/hook`)).url)}
+            run={async () => hook.set(await post<{ url: string }>(`/services/${c.d.service.id}/hook`))}
+            done="The webhook has a new URL."
           >
-            {url ? "Rotate again" : "Rotate URL"}
+            Rotate URL
           </Action>
         </div>
       )}

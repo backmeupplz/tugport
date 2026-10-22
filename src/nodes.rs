@@ -371,6 +371,20 @@ fn remote(app: &App) -> Vec<Arc<NodeHandle>> {
     app.all_nodes().into_iter().filter(|n| !n.local).collect()
 }
 
+/// Send the routing table to every server and wait until they have it.
+pub async fn push_routes_now(app: &App) {
+    let body = serde_json::to_value(&*app.proxy.table()).unwrap_or_default();
+    let pushes = remote(app).into_iter().map(|n| {
+        let body = body.clone();
+        async move {
+            if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/routes", Some(body)).await {
+                tracing::debug!("pushing routes to {}: {e:#}", n.name);
+            }
+        }
+    });
+    futures_util::future::join_all(pushes).await;
+}
+
 pub fn push_routes(app: &App) {
     let table = app.proxy.table();
     for n in remote(app) {
@@ -530,6 +544,13 @@ pub async fn health_loop(app: AppState) {
                     let old_boot = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["boot_id"].as_str().map(String::from));
                     // A reboot empties the server's /run, and with it every container's secrets.
                     let rebooted = old_boot.is_some_and(|b| Some(b.as_str()) != h["boot_id"].as_str());
+                    if let Ok(t) = serde_json::from_value(h["traffic"].clone()) {
+                        util::lock(&app.proxy.remote_traffic).insert(n.id.clone(), t);
+                    }
+                    let mut h = h;
+                    if let Some(o) = h.as_object_mut() {
+                        o.remove("traffic");
+                    }
                     let _ = app.db.conn().execute("UPDATE nodes SET status = 'online', last_seen_at = ?1, info = ?2 WHERE id = ?3", params![now, h.to_string(), n.id]);
                     if was != "online" || rebooted {
                         tracing::info!("server {} is online", n.name);
@@ -706,9 +727,9 @@ pub fn is_pinned(s: &Service) -> bool {
         || s.spec.mounts.iter().any(|m| !matches!(m, Mount::File { .. }))
 }
 
-/// Servers for `n` replicas: pinned services stay where their data is, the others go to
-/// the least busy eligible servers.
-pub async fn place(app: &App, s: &Service, n: u32) -> Result<Vec<Arc<NodeHandle>>> {
+/// Servers for `n` more replicas (next to ones running on `existing` servers): pinned
+/// services stay where their data is, the others spread out, then go to the least busy.
+pub async fn place(app: &App, s: &Service, n: u32, existing: &[String]) -> Result<Vec<Arc<NodeHandle>>> {
     let candidates = eligible(app, &s.spec.placement);
     if candidates.is_empty() {
         bail!("no online server matches this service's placement");
@@ -729,7 +750,8 @@ pub async fn place(app: &App, s: &Service, n: u32) -> Result<Vec<Arc<NodeHandle>
     let mut slots = vec![];
     for c in candidates {
         let busy = c.docker.list_containers(Some(ListContainersOptions { filters: Some(filters.clone()), ..Default::default() })).await.map(|l| l.len()).unwrap_or(usize::MAX / 2);
-        slots.push((c, 0usize, busy));
+        let mine = existing.iter().filter(|id| **id == c.id).count();
+        slots.push((c, mine, busy));
     }
     let mut out = vec![];
     for _ in 0..n {

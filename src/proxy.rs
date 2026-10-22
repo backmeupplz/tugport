@@ -45,6 +45,9 @@ pub struct RouteSpec {
     pub options: DomainOptions,
     pub targets: Vec<Target>,
     pub asleep: bool,
+    /// The container port requests go to (to wake a sleeping service).
+    #[serde(default)]
+    pub port: u16,
 }
 
 /// A replica: the node it runs on and its address as seen from that node.
@@ -66,6 +69,7 @@ pub enum Upstream {
 const HOP: &str = "x-tugport-hop";
 
 pub struct Route {
+    pub port: u16,
     pub service_id: Option<String>,
     pub project_id: Option<String>,
     pub path: String,
@@ -100,7 +104,16 @@ pub fn compile(table: &Table, me: &str) -> Routes {
         }
         let redirects = spec.options.redirects.iter().filter_map(|r| regex::Regex::new(&r.from).ok().map(|re| (re, r.to.clone(), r.permanent))).collect();
         let rewrite = spec.options.rewrite.as_ref().and_then(|r| regex::Regex::new(&r.from).ok().map(|re| (re, r.to.clone())));
+        // Only the panel can wake a sleeping service; other servers send such requests there.
+        if spec.asleep
+            && upstreams.is_empty()
+            && me != "local"
+            && let Some(panel) = table.nodes.get("local")
+        {
+            upstreams.push(Upstream::Node(*panel));
+        }
         hosts.entry(spec.host.clone()).or_default().push(Arc::new(Route {
+            port: spec.port,
             service_id: spec.service_id.clone(),
             project_id: spec.project_id.clone(),
             path: spec.path.clone(),
@@ -133,7 +146,7 @@ fn path_under(path: &str, prefix: &str) -> bool {
     prefix == "/" || path == prefix || path.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Traffic {
     pub requests: u64,
     pub last_at: i64,
@@ -150,6 +163,10 @@ pub struct Proxy {
     rr: AtomicUsize,
     /// Other servers' proxies that just refused a connection, until when to skip them.
     down: Mutex<HashMap<SocketAddr, std::time::Instant>>,
+    /// Containers on their way out (scaling down): no new requests.
+    pub draining: Mutex<std::collections::HashSet<String>>,
+    /// What other servers' proxies counted, per server (reported with their health).
+    pub remote_traffic: Mutex<HashMap<String, HashMap<String, Traffic>>>,
     pub traffic: Mutex<HashMap<String, Traffic>>,
     reload: tokio::sync::Notify,
     http1: Client<HttpConnector, Body>,
@@ -173,6 +190,8 @@ impl Proxy {
             challenges: Mutex::new(HashMap::new()),
             rr: AtomicUsize::new(0),
             down: Mutex::new(HashMap::new()),
+            draining: Mutex::new(Default::default()),
+            remote_traffic: Mutex::new(HashMap::new()),
             traffic: Mutex::new(HashMap::new()),
             reload: tokio::sync::Notify::new(),
             http1: Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).build(conn.clone()),
@@ -183,6 +202,19 @@ impl Proxy {
 
     pub fn routes(&self) -> Arc<Routes> {
         crate::util::read(&self.routes).clone()
+    }
+
+    /// Requests per service on every server: counts added up, the latest request time.
+    pub fn all_traffic(&self) -> HashMap<String, Traffic> {
+        let mut all = crate::util::lock(&self.traffic).clone();
+        for per_node in crate::util::lock(&self.remote_traffic).values() {
+            for (sid, t) in per_node {
+                let e = all.entry(sid.clone()).or_default();
+                e.requests += t.requests;
+                e.last_at = e.last_at.max(t.last_at);
+            }
+        }
+        all
     }
 
     pub fn table(&self) -> Arc<Table> {
@@ -244,16 +276,18 @@ pub fn reload(app: &App) {
 async fn build_table(app: &App) -> Result<Table> {
     let mut routes = vec![];
     let services: HashMap<String, store::Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
-    let mut replicas: HashMap<String, Vec<runtime::Replica>> = HashMap::new();
+    let mut replicas = runtime::all_replicas(app).await.unwrap_or_default();
+    let draining = crate::util::lock(&app.proxy.draining).clone();
     for d in store::domains(app, None)? {
         let Some(s) = services.get(&d.service_id) else { continue };
-        if !replicas.contains_key(&s.id) {
-            replicas.insert(s.id.clone(), runtime::replicas(app, &s.id).await.unwrap_or_default());
-        }
         let live = runtime::live_deploy(app, &s.id);
-        let targets = replicas[&s.id]
+        let asleep = crate::sleep::is_asleep(app, &s.id);
+        let targets = replicas
+            .entry(s.id.clone())
+            .or_default()
             .iter()
-            .filter(|r| r.state == "running")
+            // A sleeping service's requests wait for its wake-up, even while it is still stopping.
+            .filter(|r| r.state == "running" && !asleep && !draining.contains(&r.id))
             .filter(|r| match (&d.container, s.kind.as_str()) {
                 (Some(c), "compose") => r.compose_service.as_deref() == Some(c.as_str()),
                 (None, "compose") => true,
@@ -270,7 +304,8 @@ async fn build_table(app: &App) -> Result<Table> {
             via_tunnel: d.via_tunnel,
             options: d.options.clone(),
             targets,
-            asleep: crate::sleep::is_asleep(app, &s.id),
+            asleep,
+            port: d.port,
         });
     }
     let settings = app.settings();
@@ -291,6 +326,7 @@ async fn build_table(app: &App) -> Result<Table> {
                 options: DomainOptions { timeout_s: Some(3600), ..Default::default() },
                 targets: vec![Target { node: "local".into(), addr }],
                 asleep: false,
+                port,
             });
         }
     }
@@ -305,6 +341,18 @@ async fn rebuild(app: &App) {
             if changed {
                 crate::nodes::push_routes(app);
             }
+        }
+        Err(e) => tracing::error!("building routes: {e:#}"),
+    }
+}
+
+/// Rebuild now and wait until every server has the new table (a woken service's
+/// requests may be forwarded to another server right away).
+pub async fn rebuild_now(app: &App) {
+    match build_table(app).await {
+        Ok(t) => {
+            app.proxy.set_table(t);
+            crate::nodes::push_routes_now(app).await;
         }
         Err(e) => tracing::error!("building routes: {e:#}"),
     }
@@ -538,17 +586,23 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
         }
     }
 
-    if let Some(sid) = &route.service_id {
+    // Counted once, by the first proxy (scale-to-zero and autoscaling read these).
+    if !hop
+        && let Some(sid) = &route.service_id
+    {
         let mut t = crate::util::lock(&app.proxy.traffic);
         let e = t.entry(sid.clone()).or_default();
         e.requests += 1;
         e.last_at = crate::util::now();
     }
     let mut upstreams: Vec<Upstream> = route.upstreams.iter().filter(|u| !hop || matches!(u, Upstream::Local(_))).copied().collect();
-    if upstreams.is_empty() && route.asleep && !hop {
-        match crate::sleep::wake(&app, route.service_id.as_deref().unwrap_or_default()).await {
+    if upstreams.is_empty() && route.asleep && *crate::util::read(&app.proxy.me) == "local" {
+        match crate::sleep::wake(&app, route.service_id.as_deref().unwrap_or_default(), route.port).await {
             Ok(woken) => upstreams = woken,
-            Err(e) => return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Waking up failed", &e.to_string()),
+            Err(e) => {
+                tracing::warn!("waking {host}: {e:#}");
+                return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Waking up failed", &e.to_string());
+            }
         }
     }
     if upstreams.is_empty() {
@@ -793,6 +847,7 @@ mod tests {
             options: DomainOptions::default(),
             targets: vec![Target { node: "local".into(), addr: addr("172.20.0.2:80") }, Target { node: "n1".into(), addr: addr("172.21.0.2:80") }],
             asleep: false,
+            port: 80,
         };
         let nodes = HashMap::from([("local".to_string(), addr("10.99.0.1:80")), ("n1".to_string(), addr("10.99.0.2:80"))]);
         let table = Table { routes: vec![spec], nodes, trusted_proxies: vec![] };
@@ -803,5 +858,11 @@ mod tests {
         let r = &on_worker.hosts["a.test"][0];
         assert_eq!(r.upstreams, vec![Upstream::Node(addr("10.99.0.1:80")), Upstream::Local(addr("172.21.0.2:80"))]);
         assert!(on_worker.trusted.iter().any(|n| n.contains(&"10.99.0.1".parse::<IpAddr>().unwrap())));
+        // A sleeping service: workers hand its requests to the panel, which wakes it.
+        let mut asleep = table.clone();
+        asleep.routes[0].targets.clear();
+        asleep.routes[0].asleep = true;
+        assert_eq!(compile(&asleep, "n1").hosts["a.test"][0].upstreams, vec![Upstream::Node(addr("10.99.0.1:80"))]);
+        assert!(compile(&asleep, "local").hosts["a.test"][0].upstreams.is_empty());
     }
 }

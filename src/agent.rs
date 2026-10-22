@@ -197,6 +197,7 @@ fn fail(e: anyhow::Error) -> Failure {
 async fn health(State(ctx): State<Shared>) -> Json<Value> {
     let mut info = crate::nodes::host_info(&ctx.app).await;
     info["uptime_s"] = json!(ctx.started.elapsed().as_secs());
+    info["traffic"] = json!(*util::lock(&ctx.app.proxy.traffic));
     Json(info)
 }
 

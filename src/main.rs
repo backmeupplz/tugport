@@ -1,6 +1,7 @@
 mod acme;
 mod agent;
 mod alerts;
+mod autoscale;
 mod api;
 mod app;
 mod auth;
@@ -219,6 +220,8 @@ async fn serve() -> Result<()> {
     tokio::spawn(logs::collect(app.clone()));
     tokio::spawn(metrics::sample_loop(app.clone(), true));
     tokio::spawn(nodes::health_loop(app.clone()));
+    tokio::spawn(sleep::run(app.clone()));
+    tokio::spawn(autoscale::run(app.clone()));
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));

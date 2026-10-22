@@ -553,7 +553,7 @@ pub async fn remove_service(app: &App, s: &Service, volumes: bool) -> Result<()>
             }
         }
     }
-    for key in ["pin", "nodes", "stopped", "hook", "live", "asleep", "exposed"] {
+    for key in ["pin", "nodes", "stopped", "hook", "live", "asleep", "exposed", "active", "scale"] {
         let _ = app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("{key}:{}", s.id)]);
     }
     let _ = std::fs::remove_dir_all(app.paths.sources().join(&s.id));
@@ -568,7 +568,7 @@ pub async fn container_ip(docker: &bollard::Docker, id: &str, network: &str) -> 
 }
 
 /// HTTP (with `path`) or TCP check from the replica's own server.
-async fn probe(app: &App, node: &str, ip: &str, port: u16, path: Option<&str>, strict: bool) -> bool {
+pub async fn probe(app: &App, node: &str, ip: &str, port: u16, path: Option<&str>, strict: bool) -> bool {
     match app.node(node).filter(|n| !n.local) {
         Some(n) => {
             let body = serde_json::json!({ "ip": ip, "port": port, "path": path, "strict": strict });

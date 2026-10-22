@@ -181,6 +181,7 @@ pub async fn start(State(app): State<AppState>, a: Auth, Path(id): Path<String>)
         runtime::start(&app, &r.node, &r.id).await?;
     }
     let _ = app.db.conn().execute("DELETE FROM state WHERE key IN (?1, ?2)", [format!("asleep:{}", s.id), format!("stopped:{}", s.id)]);
+    crate::sleep::mark_active(&app, &s.id);
     app.audit(Some(&a.0), "service.start", Some(&s.project_id), Some(&s.id), Some(&s.name), None);
     crate::proxy::reload(&app);
     Ok(Json(json!({ "ok": true })))

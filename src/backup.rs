@@ -29,7 +29,6 @@ pub struct Job {
     pub target_id: String,
     pub kind: String,
     pub volume: Option<String>,
-    pub schedule: String,
     pub keep_last: i64,
 }
 
@@ -47,8 +46,8 @@ pub fn target(app: &App, id: &str) -> Result<Target> {
 pub fn job(app: &App, id: &str) -> Result<Job> {
     app.db
         .conn()
-        .query_row("SELECT id, service_id, target_id, kind, volume, schedule, keep_last FROM backup_jobs WHERE id = ?1", [id], |r| {
-            Ok(Job { id: r.get(0)?, service_id: r.get(1)?, target_id: r.get(2)?, kind: r.get(3)?, volume: r.get(4)?, schedule: r.get(5)?, keep_last: r.get(6)? })
+        .query_row("SELECT id, service_id, target_id, kind, volume, keep_last FROM backup_jobs WHERE id = ?1", [id], |r| {
+            Ok(Job { id: r.get(0)?, service_id: r.get(1)?, target_id: r.get(2)?, kind: r.get(3)?, volume: r.get(4)?, keep_last: r.get(5)? })
         })
         .optional()?
         .ok_or_else(|| anyhow!("backup job {id} not found"))
@@ -149,7 +148,7 @@ async fn live_container(app: &App, service_id: &str) -> Result<runtime::Replica>
 }
 
 /// Run `producer`'s stdout into `consumer`'s stdin; returns the consumer's stdout.
-async fn pipe(mut producer: Command, mut consumer: Command) -> Result<String> {
+pub async fn pipe(mut producer: Command, mut consumer: Command) -> Result<String> {
     producer.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).kill_on_drop(true);
     consumer.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut p = producer.spawn()?;

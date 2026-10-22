@@ -1,6 +1,8 @@
 mod access;
 mod backups;
+mod cloud;
 mod console;
+mod databases;
 mod deploys;
 mod git;
 mod hooks;
@@ -52,6 +54,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/services/{id}/deploy", post(deploys::deploy))
         .route("/api/services/{id}/deploys", get(deploys::list))
         .route("/api/services/{id}/rollback", post(deploys::rollback))
+        .route("/api/services/{id}/replicas", get(databases::list).post(databases::add))
+        .route("/api/services/{id}/promote", post(databases::promote))
         .route("/api/services/{id}/restart", post(deploys::restart))
         .route("/api/services/{id}/stop", post(deploys::stop))
         .route("/api/services/{id}/start", post(deploys::start))
@@ -74,6 +78,13 @@ pub fn router(app: AppState) -> Router {
         .route("/api/nodes/join-token", post(nodes::join_token))
         .route("/api/nodes/join", post(nodes::join))
         .route("/api/nodes/{id}", patch(nodes::update).delete(nodes::remove))
+        .route("/api/cloud/accounts", get(cloud::list_accounts).post(cloud::create_account))
+        .route("/api/cloud/accounts/{id}", delete(cloud::delete_account))
+        .route("/api/cloud/accounts/{id}/options", get(cloud::options))
+        .route("/api/cloud/servers", get(cloud::list_servers).post(cloud::create_server))
+        .route("/api/cloud/servers/{id}", delete(cloud::delete_server))
+        .route("/api/cloud/pools", get(cloud::list_pools).post(cloud::create_pool))
+        .route("/api/cloud/pools/{id}", patch(cloud::update_pool).delete(cloud::delete_pool))
         .route("/api/notifications", get(observe::list_channels).post(observe::create_channel))
         .route("/api/notifications/{id}", delete(observe::delete_channel))
         .route("/api/notifications/{id}/test", post(observe::test_channel))
@@ -96,6 +107,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/hooks/git/{provider}", post(hooks::git_hook))
         // Easypanel's deploy webhook path, so migrated repositories keep deploying.
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .fallback(crate::web::static_handler)
         .layer(axum::middleware::from_fn(json_errors))
         .with_state(app)
@@ -120,6 +132,7 @@ pub fn hooks_router(app: AppState) -> Router {
         .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .route("/api/hooks/git/{provider}", post(hooks::git_hook))
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .with_state(app)
 }
 

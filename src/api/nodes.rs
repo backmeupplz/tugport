@@ -4,7 +4,7 @@ use super::{ApiError, ApiResult, Auth, base_url};
 use crate::app::AppState;
 use crate::nodes;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use rusqlite::params;
 use serde::Deserialize;
@@ -89,10 +89,36 @@ pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn remove(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct RemoveQuery {
+    /// Keep the cloud machine running (Tugport created it, so by default it is deleted too).
+    keep_machine: bool,
+}
+
+/// Remove a server. Movable services go to other servers first; a machine Tugport created
+/// in a cloud account is deleted there as well.
+pub async fn remove(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Json<Value>> {
     a.require_owner()?;
     let name = app.node(&id).map(|n| n.name.clone()).ok_or_else(|| ApiError::not_found("server not found"))?;
-    nodes::remove(&app, &id).await?;
-    app.audit(Some(&a.0), "node.remove", None, None, Some(&name), None);
-    Ok(Json(json!({ "ok": true })))
+    let machine = crate::cloud::machine_of(&app, &id);
+    // Finishes even if the caller goes away: a half-drained server would take no new work.
+    let (app2, id2, m2) = (app.clone(), id.clone(), machine.clone());
+    let done = tokio::spawn(async move {
+        if nodes::online(&app2, &id2) {
+            nodes::drain(&app2, &id2).await?;
+        }
+        nodes::remove(&app2, &id2).await?;
+        match &m2 {
+            Some(m) if q.keep_machine => {
+                app2.db.conn().execute("DELETE FROM cloud_servers WHERE id = ?1", [m])?;
+            }
+            Some(m) => crate::cloud::destroy(&app2, m).await?,
+            None => {}
+        }
+        anyhow::Ok(())
+    });
+    done.await.map_err(anyhow::Error::from)??;
+    app.audit(Some(&a.0), "node.remove", None, None, Some(&name), machine.as_ref().map(|_| if q.keep_machine { "machine kept" } else { "machine deleted" }));
+    Ok(Json(json!({ "ok": true, "machine_deleted": machine.is_some() && !q.keep_machine })))
 }

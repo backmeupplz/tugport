@@ -312,7 +312,7 @@ async fn execute(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> Re
     }
     let image = match (&d.image, &s.spec.source) {
         (Some(image), _) => {
-            log.line(&format!("Rolling back to {image}"));
+            log.line(&format!("{} {image}", if d.trigger == "migration" { "Taking over the running image" } else { "Rolling back to" }));
             if app.docker.inspect_image(image).await.is_err() {
                 runtime::pull(app, image, &|l| log.line(l)).await?;
             }
@@ -344,10 +344,10 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
     let network = runtime::ensure_network(app, &s.project).await?;
     let img = runtime::image_info(app, image).await?;
     let old: Vec<Replica> = runtime::replicas(app, &s.id).await?.into_iter().filter(|r| r.deploy != deploy_id).collect();
-    let n = s.spec.replicas.max(1);
+    let n = crate::autoscale::replicas(app, s);
     let strategy = if !s.spec.ports.is_empty() || s.kind == "database" || s.spec.host_network { Strategy::StopFirst } else { s.spec.rollout.strategy };
     let timeout = Duration::from_secs(s.spec.rollout.health_timeout_s.max(10) as u64);
-    let nodes = crate::nodes::place(app, s, n).await?;
+    let nodes = crate::nodes::place(app, s, n, &[]).await?;
     let mut distinct: Vec<&crate::nodes::NodeHandle> = vec![];
     for node in &nodes {
         if !distinct.iter().any(|d| d.id == node.id) {
@@ -410,7 +410,8 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
     runtime::set_live_deploy(app, &s.id, deploy_id)?;
     app.db.set_state(&format!("exposed:{}", s.id), &serde_json::to_string(&img.exposed)?)?;
     app.db.set_state(&format!("nodes:{}", s.id), &distinct.iter().map(|d| d.id.as_str()).collect::<Vec<_>>().join(","))?;
-    app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("stopped:{}", s.id)])?;
+    app.db.conn().execute("DELETE FROM state WHERE key IN (?1, ?2)", [format!("stopped:{}", s.id), format!("asleep:{}", s.id)])?;
+    crate::sleep::mark_active(app, &s.id);
     crate::proxy::reload(app);
     let serving_old = old.iter().filter(|r| r.state == "running").count();
     if strategy == Strategy::StartFirst && serving_old > 0 && !store::domains(app, Some(&s.id))?.is_empty() {
@@ -418,9 +419,62 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
         log.line(&format!("Traffic switched; letting the old version finish requests for {drain}s"));
         tokio::time::sleep(Duration::from_secs(drain as u64)).await;
     }
-    for r in &old {
+    // Listed again: replicas the autoscaler added meanwhile belong to the old version too.
+    for r in runtime::replicas(app, &s.id).await?.iter().filter(|r| r.deploy != deploy_id) {
         runtime::stop_and_remove(app, r, 30).await.with_context(|| format!("removing {}", r.name))?;
     }
+    Ok(())
+}
+
+/// Run `want` replicas of the live version: start more next to the running ones, or take
+/// the newest extras out of routing, let them finish their requests, and remove them.
+pub async fn scale(app: &AppState, s: &Service, want: u32) -> Result<()> {
+    let live = runtime::live_deploy(app, &s.id).ok_or_else(|| anyhow!("{} is not deployed", s.name))?;
+    let image = get(app, &live)?.and_then(|d| d.image).ok_or_else(|| anyhow!("the live version has no image"))?;
+    let mut reps: Vec<Replica> = runtime::replicas(app, &s.id).await?.into_iter().filter(|r| r.deploy == live).collect();
+    let n = reps.len() as u32;
+    app.db.set_state(&format!("scale:{}", s.id), &want.to_string())?;
+    if want > n {
+        let network = runtime::ensure_network(app, &s.project).await?;
+        let img = runtime::image_info(app, &image).await?;
+        let existing: Vec<String> = reps.iter().map(|r| r.node.clone()).collect();
+        let timeout = Duration::from_secs(s.spec.rollout.health_timeout_s.max(10) as u64);
+        let mut next = reps.iter().map(|r| r.replica).max().unwrap_or(0);
+        for node in crate::nodes::place(app, s, want - n, &existing).await? {
+            next += 1;
+            crate::nodes::ship_image(app, &node, s, &image, &|_| {}).await?;
+            let id = runtime::create_replica(app, &node, s, &live, next, &image, &img, &network, false).await?;
+            let started = async {
+                runtime::start(app, &node.id, &id).await?;
+                runtime::wait_healthy(app, s, &node.id, &id, &network, timeout, img.has_healthcheck, &|_| {}).await
+            };
+            if let Err(e) = started.await {
+                let _ = runtime::remove(app, &node.id, &id, &runtime::container_name(s, &live, next)).await;
+                return Err(e.context("a new replica did not become healthy"));
+            }
+        }
+        crate::proxy::reload(app);
+    } else if want < n {
+        reps.sort_by_key(|r| std::cmp::Reverse(r.replica));
+        reps.truncate((n - want) as usize);
+        crate::util::lock(&app.proxy.draining).extend(reps.iter().map(|r| r.id.clone()));
+        crate::proxy::rebuild_now(app).await;
+        tokio::time::sleep(Duration::from_secs(s.spec.rollout.drain_s as u64)).await;
+        let removed = async {
+            for r in &reps {
+                runtime::stop_and_remove(app, r, 30).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        let mut draining = crate::util::lock(&app.proxy.draining);
+        for r in &reps {
+            draining.remove(&r.id);
+        }
+        removed?;
+    }
+    let nodes: std::collections::BTreeSet<String> = runtime::replicas(app, &s.id).await?.into_iter().filter(|r| r.deploy == live).map(|r| r.node).collect();
+    app.db.set_state(&format!("nodes:{}", s.id), &nodes.into_iter().collect::<Vec<_>>().join(","))?;
     Ok(())
 }
 

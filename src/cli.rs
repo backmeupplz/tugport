@@ -279,10 +279,10 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
                 let svc = api.get(&format!("/api/services/{service}")).await?;
                 let id = svc["service"]["id"].as_str().unwrap_or(&service).to_string();
                 api.events(&format!("/api/services/{id}/logs/stream"), |_, data| {
-                    if let Ok(l) = serde_json::from_str::<Value>(data) {
-                        if q.as_ref().is_none_or(|q| l["line"].as_str().unwrap_or("").to_lowercase().contains(&q.to_lowercase())) {
-                            show(&l);
-                        }
+                    if let Ok(l) = serde_json::from_str::<Value>(data)
+                        && q.as_ref().is_none_or(|q| l["line"].as_str().unwrap_or("").to_lowercase().contains(&q.to_lowercase()))
+                    {
+                        show(&l);
                     }
                     true
                 })

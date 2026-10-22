@@ -368,16 +368,9 @@ pub struct DatabaseSpec {
     pub user: String,
     #[serde(default)]
     pub database: String,
-    /// Read replicas (milestone 3): node ids or regions they run in.
-    #[serde(default)]
-    pub replicas: Vec<ReplicaSpec>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct ReplicaSpec {
-    pub id: String,
-    #[serde(default)]
-    pub placement: Placement,
+    /// Set on a read replica: the service id of the database it follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

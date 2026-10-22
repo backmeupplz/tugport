@@ -1,6 +1,7 @@
 mod acme;
 mod agent;
 mod alerts;
+mod autoscale;
 mod api;
 mod app;
 mod auth;
@@ -9,6 +10,7 @@ mod backup;
 mod builder;
 mod cleanup;
 mod cli;
+mod cloud;
 mod compose;
 mod crypto;
 mod databases;
@@ -21,6 +23,7 @@ mod logs;
 mod mcp;
 mod mesh;
 mod metrics;
+mod migrate;
 mod model;
 mod nodes;
 mod notify;
@@ -28,6 +31,7 @@ mod paths;
 mod proc;
 mod proxy;
 mod registry;
+mod replicas;
 mod runtime;
 mod secrets;
 mod shim;
@@ -73,6 +77,11 @@ enum Cmd {
     Version,
     /// Set this server up (run by the one-line installer).
     Install(install::InstallArgs),
+    /// Move an Easypanel or Coolify server into Tugport.
+    Migrate {
+        #[command(subcommand)]
+        cmd: migrate::Command,
+    },
     #[command(flatten)]
     Client(cli::Client),
 }
@@ -106,6 +115,7 @@ fn main() -> Result<()> {
         }
         Cmd::Server => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve()),
         Cmd::Node => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(agent::run()),
+        Cmd::Migrate { cmd } => migrate::main(cmd),
         Cmd::Client(c) => {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let code = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(cli::run(c, cli.json))?;
@@ -219,6 +229,9 @@ async fn serve() -> Result<()> {
     tokio::spawn(logs::collect(app.clone()));
     tokio::spawn(metrics::sample_loop(app.clone(), true));
     tokio::spawn(nodes::health_loop(app.clone()));
+    tokio::spawn(sleep::run(app.clone()));
+    tokio::spawn(autoscale::run(app.clone()));
+    tokio::spawn(cloud::run(app.clone()));
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));
@@ -252,18 +265,22 @@ async fn serve() -> Result<()> {
     let listen = app.settings().panel_listen;
     let router = api::router(app.clone());
     mcp::install(router.clone());
-    if let Some(legacy) = app.settings().legacy_listen {
-        let router = api::hooks_router(app.clone());
+    // Old panel webhook URLs (Easypanel's :3000). Bound once the setting appears and the port
+    // is free, so a migration can turn it on after stopping the old panel.
+    {
+        let app = app.clone();
         tokio::spawn(async move {
-            let bound = handoff::listener("legacy", async { Ok(tokio::net::TcpListener::bind(&legacy).await?) }).await;
-            match bound {
-                Ok(l) => {
+            loop {
+                if let Some(legacy) = app.settings().legacy_listen
+                    && let Ok(l) = handoff::listener("legacy", async { Ok(tokio::net::TcpListener::bind(&legacy).await?) }).await
+                {
                     tracing::info!("also serving deploy webhooks on {legacy}");
-                    let _ = axum::serve(l, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                    let _ = axum::serve(l, api::hooks_router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>())
                         .with_graceful_shutdown(handoff::DRAIN.notified())
                         .await;
+                    return;
                 }
-                Err(e) => tracing::warn!("cannot listen on {legacy}: {e:#}"),
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }

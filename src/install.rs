@@ -140,14 +140,15 @@ pub fn install(args: InstallArgs) -> Result<()> {
         let _ = ok(Command::new("systemctl").args(["reload", "tugport.service"]));
     }
 
-    let found = detect();
+    let found = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(crate::migrate::detect());
     for f in &found {
-        println!("\nFound {f} on this server.");
+        let name = if f.panel == "easypanel" { "Easypanel" } else { "Coolify" };
+        println!("\nFound {name} {} on this server.", f.version);
     }
     if !args.no_migrate && !found.is_empty() {
         println!("Tugport can move it over service by service while your apps keep running. See the plan first with:");
         for f in &found {
-            println!("    tugport migrate {} --dry-run", f.to_lowercase());
+            println!("    tugport migrate {} --dry-run", f.panel);
         }
     }
 
@@ -197,18 +198,6 @@ WantedBy=multi-user.target\n";
         println!("ufw is active: allow the mesh and web traffic with `ufw allow 51820/udp && ufw allow 80,443/tcp`.");
     }
     Ok(())
-}
-
-/// Easypanel or Coolify running on this machine.
-pub fn detect() -> Vec<&'static str> {
-    let mut out = vec![];
-    if std::path::Path::new("/etc/easypanel").exists() && ok(Command::new("docker").args(["service", "inspect", "easypanel"])) {
-        out.push("Easypanel");
-    }
-    if std::path::Path::new("/data/coolify/source/.env").exists() && ok(Command::new("docker").args(["inspect", "coolify"])) {
-        out.push("Coolify");
-    }
-    out
 }
 
 fn write_units() -> Result<()> {

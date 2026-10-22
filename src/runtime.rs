@@ -98,8 +98,11 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
             let nets = c.network_settings.as_ref().and_then(|n| n.networks.clone()).unwrap_or_default();
             let ip_of = |e: &EndpointSettings| e.ip_address.clone().filter(|ip| !ip.is_empty());
             // The proxy on the replica's server reaches it on the ingress bridge, or on any
-            // bridge it is on (overlay addresses are not reachable from the host).
-            let ip = nets.get(INGRESS).and_then(ip_of).or_else(|| nets.iter().filter(|(k, _)| !k.starts_with("tpm-")).find_map(|(_, e)| ip_of(e)));
+            // bridge it is on (overlay addresses are not reachable from the host), Tugport's
+            // own first (during a migration a container also sits on the old panel's overlays).
+            let mut bridges: Vec<_> = nets.iter().filter(|(k, _)| !k.starts_with("tpm-")).collect();
+            bridges.sort_by_key(|(k, _)| !k.starts_with("tp-"));
+            let ip = nets.get(INGRESS).and_then(ip_of).or_else(|| bridges.into_iter().find_map(|(_, e)| ip_of(e)));
             let health = c.status.as_deref().and_then(|s| {
                 ["(healthy)", "(unhealthy)", "(health: starting)"].iter().find(|h| s.contains(*h)).map(|h| h.trim_matches(['(', ')']).replace("health: ", ""))
             });
@@ -464,7 +467,15 @@ pub async fn create_replica(app: &App, node: &NodeHandle, s: &Service, deploy_id
         group_add: (!spec.groups.is_empty()).then(|| spec.groups.clone()),
         sysctls: (!spec.sysctls.is_empty()).then(|| spec.sysctls.clone().into_iter().collect()),
         privileged: Some(spec.privileged),
-        network_mode: Some(if spec.host_network { "host".into() } else { network.to_string() }),
+        // With several networks Docker cannot attach an overlay that has no containers on
+        // this server yet as the first one; the local ingress bridge always can be.
+        network_mode: Some(if spec.host_network {
+            "host".into()
+        } else if multi {
+            INGRESS.into()
+        } else {
+            network.to_string()
+        }),
         security_opt: (!security_opt.is_empty()).then_some(security_opt),
         port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
         device_requests,
@@ -553,7 +564,7 @@ pub async fn remove_service(app: &App, s: &Service, volumes: bool) -> Result<()>
             }
         }
     }
-    for key in ["pin", "nodes", "stopped", "hook", "live", "asleep", "exposed"] {
+    for key in ["pin", "nodes", "stopped", "hook", "live", "asleep", "exposed", "active", "scale", "replica"] {
         let _ = app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("{key}:{}", s.id)]);
     }
     let _ = std::fs::remove_dir_all(app.paths.sources().join(&s.id));
@@ -568,7 +579,7 @@ pub async fn container_ip(docker: &bollard::Docker, id: &str, network: &str) -> 
 }
 
 /// HTTP (with `path`) or TCP check from the replica's own server.
-async fn probe(app: &App, node: &str, ip: &str, port: u16, path: Option<&str>, strict: bool) -> bool {
+pub async fn probe(app: &App, node: &str, ip: &str, port: u16, path: Option<&str>, strict: bool) -> bool {
     match app.node(node).filter(|n| !n.local) {
         Some(n) => {
             let body = serde_json::json!({ "ip": ip, "port": port, "path": path, "strict": strict });
@@ -650,6 +661,23 @@ pub async fn http_ok(ip: &str, port: u16, path: &str, strict: bool) -> bool {
         Ok(r) => r.status().as_u16() < 500,
         Err(_) => false,
     }
+}
+
+/// Run a shell command in a replica (through Tugport's init, so with its environment) and
+/// return its exit code and output.
+pub async fn exec(app: &App, r: &Replica, script: &str) -> Result<(i64, String)> {
+    let docker = app.docker_on(&r.node)?;
+    let cmd = vec![secrets::INIT_PATH.to_string(), "exec".into(), "--".into(), "sh".into(), "-c".into(), script.to_string()];
+    let config = bollard::models::ExecConfig { attach_stdout: Some(true), attach_stderr: Some(true), cmd: Some(cmd), ..Default::default() };
+    let created = docker.create_exec(&r.id, config).await.with_context(|| format!("running a command in {}", r.name))?;
+    let mut text = String::new();
+    if let bollard::exec::StartExecResults::Attached { mut output, .. } = docker.start_exec(&created.id, None).await? {
+        while let Some(Ok(chunk)) = output.next().await {
+            text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
+        }
+    }
+    let code = docker.inspect_exec(&created.id).await?.exit_code.unwrap_or(-1);
+    Ok((code, text))
 }
 
 /// Tail of a container's output, for explaining failed deploys.

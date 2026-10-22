@@ -113,6 +113,9 @@ export const when = (sec: number | null | undefined) =>
 
 export const clock = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour12: false });
 
+/** Epoch seconds, epoch milliseconds or an RFC 3339 string -> epoch milliseconds. */
+export const toMs = (t: number | string) => (typeof t === "string" ? Date.parse(t) : t > 1e12 ? t : t * 1000);
+
 export function duration(sec: number): string {
   if (sec < 60) return `${Math.max(0, Math.round(sec))}s`;
   const m = Math.floor(sec / 60);

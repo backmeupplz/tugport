@@ -3,8 +3,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { get, isPlanned, useApi, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
-import { Card, ErrorBox, Field, Loaded, Loading, Note, Page, Planned, Select, errText } from "../ui";
-import { bytes, clock, qs } from "../util";
+import { Card, Empty, ErrorBox, Field, Loaded, Loading, Note, Page, Planned, Select, errText } from "../ui";
+import { bytes, clock, qs, toMs } from "../util";
 
 interface LogLine {
   ts: number;
@@ -20,7 +20,6 @@ const LOG_RANGES: [string, string, number][] = [
   ["7d", "Last 7 days", 7 * 86400e3],
 ];
 const MAX_LINES = 5000;
-const ms = (t: number) => (t > 1e12 ? t : t * 1000);
 
 export function Logs(props: { service: Service; replicas: Replica[] }) {
   const id = props.service.id;
@@ -130,7 +129,7 @@ export function Logs(props: { service: Service; replicas: Replica[] }) {
           ) : (
             lines.map((l, i) => (
               <div key={i} class={`whitespace-pre-wrap break-words ${l.stream === "stderr" ? "text-warn" : ""}`}>
-                <span class="select-none text-muted">{clock(ms(l.ts))} </span>
+                <span class="select-none text-muted">{clock(toMs(l.ts))} </span>
                 {many && l.replica && <span class="select-none text-muted">[{l.replica}] </span>}
                 {l.line}
               </div>
@@ -153,7 +152,7 @@ export function ServiceMetrics(props: { service: Service }) {
       <Loaded r={r} planned>
         {(d) => (
           <div class="grid gap-4 lg:grid-cols-2">
-            <Chart title="CPU" lines={[{ label: "CPU", points: d.series.cpu ?? [] }]} fmt={fmt.pct} />
+            <Chart title="CPU (percent of one core)" lines={[{ label: "CPU", points: d.series.cpu ?? [] }]} fmt={fmt.pct} />
             <Chart title="Memory" lines={[{ label: "Memory", points: d.series.memory ?? [] }]} fmt={fmt.bytes} />
             <Chart
               title="Network"
@@ -163,7 +162,7 @@ export function ServiceMetrics(props: { service: Service }) {
               ]}
               fmt={fmt.rate}
             />
-            <Chart title="Restarts" lines={[{ label: "Restarts", points: d.series.restarts ?? [] }]} fmt={fmt.count} />
+            {(d.series.restarts?.length ?? 0) > 0 && <Chart title="Restarts" lines={[{ label: "Restarts", points: d.series.restarts ?? [] }]} fmt={fmt.count} />}
           </div>
         )}
       </Loaded>
@@ -217,8 +216,10 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
       fit.fit();
       const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}`);
       ws.binaryType = "arraybuffer";
+      let opened = false;
       const resize = () => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ resize: [term.cols, term.rows] }));
       ws.onopen = () => {
+        opened = true;
         setState("open");
         resize();
         term.focus();
@@ -226,7 +227,9 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
       ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : new Uint8Array(e.data));
       ws.onclose = () => {
         setState("closed");
-        term.write("\r\n\x1b[2mThe session ended.\x1b[0m\r\n");
+        if (opened) term.write("\r\n\x1b[2mThe session ended.\x1b[0m\r\n");
+        // The server refuses before the upgrade, so the browser never sees the reason.
+        else setError("The console could not connect. Check that the container is still running, then try again.");
       };
       const input = term.onData((d) => ws.readyState === WebSocket.OPEN && ws.send(d));
       const resized = term.onResize(resize);
@@ -247,7 +250,7 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
     }
   };
 
-  if (!props.canUse) return <Note>Opening a console needs the operator role on this project.</Note>;
+  if (!props.canUse) return <Note>A shell can read the service's environment, so opening one needs the operator role on this project and the secrets:read grant.</Note>;
   if (state === "planned") return <Planned />;
   return (
     <div class="space-y-4">
@@ -271,15 +274,19 @@ export function Console(props: { service: Service; replicas: Replica[]; canUse: 
   );
 }
 
-interface Now {
+export interface Now {
+  at: number;
   cpu: number;
   cores: number[];
   load: number[];
   memory: { used: number; total: number };
   swap: { used: number; total: number };
   disks: { mount: string; used: number; total: number }[];
+  disk_io?: { rx: number; tx: number };
   net: { rx: number; tx: number };
-  gpus: { name: string; util: number; mem_used: number; mem_total: number; temp: number; power: number }[];
+  temp?: number | null;
+  gpus: { index: number; name: string; util: number; mem_used: number; mem_total: number; temp: number | null; power: number | null }[];
+  services: { id: string; cpu: number; memory: number; net_rx: number; net_tx: number; restarts: number }[];
 }
 
 export function Server(_: { path?: string }) {
@@ -292,7 +299,10 @@ export function Server(_: { path?: string }) {
     <Page title="Server" sub="This machine, its containers and Tugport itself.">
       <div class="space-y-6">
         <Loaded r={now} planned>
-          {(n) => (
+          {(n) =>
+            !n.at ? (
+              <Empty>Tugport is taking its first measurements, which only takes a few seconds.</Empty>
+            ) : (
             <>
               <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
                 <Tile label="CPU" value={fmt.pct(n.cpu)} sub={`${n.cores.length} cores · load ${n.load.map((l) => l.toFixed(2)).join(" ")}`} pct={n.cpu} />
@@ -316,7 +326,7 @@ export function Server(_: { path?: string }) {
                       ]}
                       fmt={fmt.bytes}
                     />
-                    <Chart title="Disk space used" lines={disks.map((d) => ({ label: d.mount, points: h.series[`disk:${d.mount}`] ?? [] }))} fmt={fmt.bytes} />
+                    <Chart title="Disk space used" lines={disks.map((d) => ({ label: d.mount, points: h.series[`disk:${d.mount}`] ?? [] }))} fmt={fmt.pct} max={100} />
                     <Chart
                       title="Disk I/O"
                       lines={[
@@ -337,11 +347,12 @@ export function Server(_: { path?: string }) {
                   </div>
                 )}
               </Loaded>
-              {n.gpus.map((g, i) => (
-                <Gpu key={i} index={i} gpu={g} range={range} />
+              {n.gpus.map((g) => (
+                <Gpu key={g.index} index={g.index} gpu={g} range={range} />
               ))}
             </>
-          )}
+            )
+          }
         </Loaded>
         <div class="grid gap-6 lg:grid-cols-2">
           <DockerUsage />
@@ -423,7 +434,7 @@ function DockerUsage() {
 
 function TugportLog() {
   const [level, setLevel] = useState("info");
-  const r = useApi<{ lines: { ts: number; level: string; target: string; message: string }[] }>(`/logs/tugport${qs({ limit: 300, level })}`);
+  const r = useApi<{ lines: { ts: number | string; level: string; target: string; message: string }[] }>(`/logs/tugport${qs({ limit: 300, level })}`);
   return (
     <Card
       title="Tugport log"
@@ -446,12 +457,15 @@ function TugportLog() {
         {(d) => (
           <div class="h-80 overflow-auto rounded-md border border-line bg-bg p-2 font-mono text-xs leading-relaxed">
             {d.lines.length === 0 && <p class="text-muted">There is nothing at this level yet.</p>}
-            {d.lines.map((l, i) => (
-              <div key={i} class={`whitespace-pre-wrap break-words ${l.level === "error" ? "text-bad" : l.level === "warn" ? "text-warn" : ""}`}>
-                <span class="text-muted">{clock(ms(l.ts))} </span>
-                {l.message}
-              </div>
-            ))}
+            {d.lines.map((l, i) => {
+              const level = String(l.level).toLowerCase();
+              return (
+                <div key={i} class={`whitespace-pre-wrap break-words ${level === "error" ? "text-bad" : level === "warn" ? "text-warn" : ""}`}>
+                  <span class="select-none text-muted">{clock(toMs(l.ts))} </span>
+                  {l.message}
+                </div>
+              );
+            })}
           </div>
         )}
       </Loaded>

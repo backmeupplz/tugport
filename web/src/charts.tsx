@@ -56,9 +56,17 @@ export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) =>
   const lines = props.lines.slice(0, 3); // a fourth series would need a fourth validated color
   const signature = lines.map((l) => `${l.label}:${l.points.length}:${l.points[l.points.length - 1]?.join(",")}`).join("|");
   const hasData = lines.some((l) => l.points.length > 0);
-  const first = lines[0]?.points ?? [];
-  const now = first.length ? first[first.length - 1][1] : null;
-  const peak = first.length ? Math.max(...first.map((p) => p[1])) : null;
+  const last = (p: Points) => p[p.length - 1][1];
+  // One series: its current value and peak. Several: each one's current value, named.
+  const summary =
+    lines.length === 1
+      ? lines[0].points.length
+        ? `now ${props.fmt(last(lines[0].points))} · peak ${props.fmt(Math.max(...lines[0].points.map((p) => p[1])))}`
+        : ""
+      : lines
+          .filter((l) => l.points.length)
+          .map((l) => `${l.label} ${props.fmt(last(l.points))}`)
+          .join(" · ");
 
   useEffect(() => {
     const el = box.current;
@@ -115,11 +123,7 @@ export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) =>
     <section class="card min-w-0 p-4" aria-label={`${props.title} chart`}>
       <header class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
         <h3 class="text-sm font-medium">{props.title}</h3>
-        {now != null && peak != null && (
-          <span class="text-xs text-muted">
-            now {props.fmt(now)} · peak {props.fmt(peak)}
-          </span>
-        )}
+        {summary && <span class="text-xs text-muted">{summary}</span>}
       </header>
       {hasData ? <div ref={box} /> : <p class="py-12 text-center text-sm text-muted">There is no data for this range yet.</p>}
     </section>

@@ -348,12 +348,29 @@ export const toast = (text: string, tone: "ok" | "bad" = "ok") => pushToast({ id
 
 export function Toasts() {
   const [list, setList] = useState<Toast[]>([]);
+  const ref = useRef<HTMLDivElement>(null);
   pushToast = (t) => {
     setList((l) => [...l, t]);
     setTimeout(() => setList((l) => l.filter((x) => x.id !== t.id)), t.tone === "bad" ? 7000 : 3500);
   };
+  // A manual popover lives in the top layer; showing it again puts it above any open dialog.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el?.showPopover) return;
+    try {
+      if (el.matches(":popover-open")) el.hidePopover();
+      if (list.length) el.showPopover();
+    } catch {
+      // Browsers without popover support still show the fixed-position stack.
+    }
+  }, [list]);
   return (
-    <div aria-live="polite" class="pointer-events-none fixed inset-x-4 bottom-4 z-50 flex flex-col items-end gap-2">
+    <div
+      ref={ref}
+      popover="manual"
+      aria-live="polite"
+      class="pointer-events-none fixed top-auto right-4 bottom-4 left-4 z-50 m-0 flex flex-col items-end gap-2 overflow-visible border-0 bg-transparent p-0"
+    >
       {list.map((t) => (
         <div
           key={t.id}

@@ -325,12 +325,12 @@ function Members(props: { projectId: string; canManage: boolean }) {
                   <Field label="Add a person or agent" class="min-w-40 flex-1">
                     <Select
                       value={add.user}
-                      onChange={(v) => setAdd({ ...add, user: v })}
+                      onChange={(user) => setAdd((a) => ({ ...a, user }))}
                       options={[["", "Choose…"], ...candidates.map((u): [string, string] => [u.id, `${u.name} (${u.kind})`])]}
                     />
                   </Field>
                   <Field label="Role">
-                    <Select value={add.role} onChange={(v) => setAdd({ ...add, role: v })} options={ROLES} />
+                    <Select value={add.role} onChange={(role) => setAdd((a) => ({ ...a, role }))} options={ROLES} />
                   </Field>
                   <button class="btn" disabled={!add.user || s.busy}>
                     Add

@@ -2,7 +2,7 @@ import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { del, get, isPlanned, patch, post, put, useApi, useMe, type Project } from "../api";
 import { Action, Card, Check, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Planned, Select, Tabs, toast, useSubmit } from "../ui";
-import { ago, bytes, cidr, mergePatch, num, when, words } from "../util";
+import { ago, bytes, cidr, mergePatch, num, sentence, when, words } from "../util";
 import { PROVIDER_KINDS } from "./new-service";
 import type { ProjectDetail } from "./projects";
 
@@ -50,6 +50,8 @@ const str = (v: unknown) => (v == null ? "" : String(v));
 function toForm(s: InstanceSettings) {
   return {
     panelDomain: s.panel_domain ?? "",
+    panelPublic: s.panel_public ?? true,
+    panelListen: s.panel_listen ?? "0.0.0.0:8484",
     acmeEmail: s.acme_email ?? "",
     trusted: (s.trusted_proxies ?? []).join("\n"),
     policy: s.deploy_policy ?? "cancel",
@@ -77,6 +79,8 @@ function toSettings(s: InstanceSettings, f: GeneralForm): InstanceSettings {
   return {
     ...s,
     panel_domain: f.panelDomain.trim().toLowerCase() || null,
+    panel_public: f.panelPublic,
+    panel_listen: f.panelListen.trim() || "0.0.0.0:8484",
     acme_email: f.acmeEmail.trim() || null,
     trusted_proxies: words(f.trusted).map(cidr),
     deploy_policy: f.policy,
@@ -117,6 +121,20 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
         <div class="space-y-4">
           <Field label="Panel domain" hint="Point the domain's DNS at this server first. Tugport then serves the panel there with HTTPS, and Git hosts send webhooks to it.">
             <input class="input font-mono" placeholder="deploy.example.com" spellcheck={false} {...text("panelDomain")} />
+          </Field>
+          {"panel_public" in props.settings && (
+            <Check
+              checked={f.panelPublic}
+              onChange={(panelPublic) => set({ panelPublic })}
+              label="Serve the panel on the panel domain"
+              hint="Turn this off to keep the panel private. The panel domain then answers only Git and deploy webhooks, and you open the panel through the address below, such as a tailnet IP."
+            />
+          )}
+          <Field
+            label="Panel address"
+            hint="The address and port the panel itself listens on, like 100.64.0.5:8484 for a tailnet address. A change takes effect when Tugport restarts, so make sure you can reach the new address first."
+          >
+            <input class="input font-mono" spellcheck={false} {...text("panelListen")} />
           </Field>
           <Field label="Email for Let's Encrypt" hint="Let's Encrypt writes here about certificate problems.">
             <input class="input" type="email" {...text("acmeEmail")} />
@@ -268,6 +286,8 @@ function Git(props: { owner: boolean }) {
   const settings = useApi<InstanceSettings>(props.owner ? "/settings" : null);
   const [org, setOrg] = useState("");
   const [f, setF] = useState({ kind: "forgejo", name: "", base_url: "", token: "" });
+  // Functional updates: autofill fires several input events before the next render.
+  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const needsBase = f.kind === "forgejo" || f.kind === "gitea";
   const s = useSubmit(async () => {
     await post("/git/providers", { kind: f.kind, name: f.name.trim() || undefined, base_url: f.base_url.trim() || undefined, token: f.token.trim() });
@@ -331,7 +351,7 @@ function Git(props: { owner: boolean }) {
                 <Field label="Host">
                   <Select
                     value={f.kind}
-                    onChange={(kind) => setF({ ...f, kind })}
+                    onChange={(kind) => upd({kind })}
                     options={[
                       ["forgejo", "Forgejo"],
                       ["gitea", "Gitea"],
@@ -341,14 +361,14 @@ function Git(props: { owner: boolean }) {
                   />
                 </Field>
                 <Field label="Name (optional)">
-                  <input class="input" value={f.name} onInput={(e) => setF({ ...f, name: e.currentTarget.value })} />
+                  <input class="input" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
                 </Field>
               </div>
               <Field label={needsBase ? "Address" : "Address (optional)"} hint={needsBase ? undefined : `Leave this empty for ${f.kind === "gitlab" ? "gitlab.com" : "github.com"}.`}>
-                <input class="input font-mono" type="url" required={needsBase} placeholder="https://git.example.com" value={f.base_url} onInput={(e) => setF({ ...f, base_url: e.currentTarget.value })} />
+                <input class="input font-mono" type="url" required={needsBase} placeholder="https://git.example.com" value={f.base_url} onInput={(e) => upd({base_url: e.currentTarget.value })} />
               </Field>
               <Field label="Access token" hint="It needs read access to repositories and permission to manage their webhooks.">
-                <input class="input font-mono" type="password" required autoComplete="off" value={f.token} onInput={(e) => setF({ ...f, token: e.currentTarget.value })} />
+                <input class="input font-mono" type="password" required autoComplete="off" value={f.token} onInput={(e) => upd({token: e.currentTarget.value })} />
               </Field>
               <ErrorBox error={s.error} />
               <button class="btn btn-primary" disabled={s.busy}>
@@ -399,6 +419,7 @@ function Notifications() {
     tls: true,
     config: {},
   });
+  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const s = useSubmit(async () => {
     const config: Record<string, unknown> = Object.fromEntries(Object.entries(f.config).filter(([, v]) => v.trim() !== ""));
     if (config.port) config.port = Number(config.port);
@@ -451,7 +472,7 @@ function Notifications() {
             <Field label="Kind">
               <Select
                 value={f.kind}
-                onChange={(kind) => setF({ ...f, kind, config: {} })}
+                onChange={(kind) => upd({kind, config: {} })}
                 options={[
                   ["telegram", "Telegram"],
                   ["email", "Email"],
@@ -460,7 +481,7 @@ function Notifications() {
               />
             </Field>
             <Field label="Name">
-              <input class="input" required value={f.name} onInput={(e) => setF({ ...f, name: e.currentTarget.value })} />
+              <input class="input" required value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
             </Field>
           </div>
           {(CHANNEL_FIELDS[f.kind] ?? []).map(([key, label, type]) => (
@@ -471,13 +492,13 @@ function Notifications() {
                 required={!label.includes("optional")}
                 autoComplete="off"
                 value={f.config[key] ?? ""}
-                onInput={(e) => setF({ ...f, config: { ...f.config, [key]: e.currentTarget.value } })}
+                onInput={(e) => ((v) => setF((s) => ({ ...s, config: { ...s.config, [key]: v } })))(e.currentTarget.value)}
               />
             </Field>
           ))}
-          {f.kind === "email" && <Check checked={f.tls} onChange={(tls) => setF({ ...f, tls })} label="Use TLS" />}
+          {f.kind === "email" && <Check checked={f.tls} onChange={(tls) => upd({tls })} label="Use TLS" />}
           <Field label="Events" hint="Use * for everything, or list events such as deploy.failed, deploy.succeeded and certificate.failed.">
-            <input class="input font-mono" value={f.events} onInput={(e) => setF({ ...f, events: e.currentTarget.value })} />
+            <input class="input font-mono" value={f.events} onInput={(e) => upd({events: e.currentTarget.value })} />
           </Field>
           <ErrorBox error={s.error} />
           <div class="flex justify-end gap-2">
@@ -497,6 +518,7 @@ function Notifications() {
 function Registries() {
   const r = useApi<{ registries: { id: string; host: string; username: string }[] }>("/registries");
   const [f, setF] = useState({ host: "", username: "", password: "" });
+  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const s = useSubmit(async () => {
     await post("/registries", f);
     setF({ host: "", username: "", password: "" });
@@ -532,14 +554,14 @@ function Registries() {
       <Card title="Add a registry">
         <form class="space-y-4" onSubmit={s.submit}>
           <Field label="Registry host">
-            <input class="input font-mono" required placeholder="ghcr.io" value={f.host} onInput={(e) => setF({ ...f, host: e.currentTarget.value.trim() })} />
+            <input class="input font-mono" required placeholder="ghcr.io" value={f.host} onInput={(e) => upd({host: e.currentTarget.value.trim() })} />
           </Field>
           <div class="grid gap-4 sm:grid-cols-2">
             <Field label="User name">
-              <input class="input" required autoComplete="off" value={f.username} onInput={(e) => setF({ ...f, username: e.currentTarget.value })} />
+              <input class="input" required autoComplete="off" value={f.username} onInput={(e) => upd({username: e.currentTarget.value })} />
             </Field>
             <Field label="Password or token">
-              <input class="input" type="password" required autoComplete="off" value={f.password} onInput={(e) => setF({ ...f, password: e.currentTarget.value })} />
+              <input class="input" type="password" required autoComplete="off" value={f.password} onInput={(e) => upd({password: e.currentTarget.value })} />
             </Field>
           </div>
           <ErrorBox error={s.error} />
@@ -565,6 +587,8 @@ interface Job {
   volume?: string | null;
   schedule: string;
   keep_last: number;
+  enabled?: boolean;
+  last_run?: { status: string; finished_at: number | null; error: string | null } | null;
 }
 interface Run {
   id: string;
@@ -583,8 +607,12 @@ function Backups() {
   const [addTarget, setAddTarget] = useState(false);
   const [addJob, setAddJob] = useState(false);
   const [runsOf, setRunsOf] = useState<Job | null>(null);
+  const services = useServices();
   if (isPlanned(targets.error) || isPlanned(jobs.error)) return <Planned />;
   const targetName = (id: string) => targets.data?.targets.find((t) => t.id === id)?.name ?? id;
+  const serviceName = (id: string | null) => (id && services?.find(([sid]) => sid === id)?.[1]) || "a deleted service";
+  const what = (j: Job) =>
+    j.kind === "state" ? "Tugport's own state" : j.kind === "database" ? `Database dump of ${serviceName(j.service_id)}` : `Volume ${j.volume ?? ""} of ${serviceName(j.service_id)}`;
   return (
     <>
       <Card
@@ -639,15 +667,24 @@ function Backups() {
                 {d.jobs.map((j) => (
                   <li key={j.id} class="flex flex-wrap items-center gap-3 px-4 py-3">
                     <div class="min-w-0 flex-1">
-                      <span class="font-medium">{j.kind === "state" ? "Tugport state" : `${j.kind}${j.volume ? ` ${j.volume}` : ""}`}</span>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span class="font-medium">{what(j)}</span>
+                        {j.enabled === false && <span class="chip">paused</span>}
+                        {j.last_run && <Pill state={j.last_run.status} />}
+                      </div>
                       <p class="text-xs text-muted">
                         <code>{j.schedule}</code> to {targetName(j.target_id)}, keeping the last {j.keep_last}
+                        {j.last_run?.finished_at ? `, last finished ${ago(j.last_run.finished_at)}` : ""}
                       </p>
+                      {j.last_run?.error && <p class="text-xs text-bad">{j.last_run.error}</p>}
                     </div>
                     <button class="btn" onClick={() => setRunsOf(j)}>
                       Runs
                     </button>
-                    <Action run={() => post(`/backups/jobs/${j.id}/run`)} done="Backup started.">
+                    <Action run={() => patch(`/backups/jobs/${j.id}`, { enabled: j.enabled === false }).then(jobs.reload)}>
+                      {j.enabled === false ? "Resume" : "Pause"}
+                    </Action>
+                    <Action run={() => post(`/backups/jobs/${j.id}/run`).then(jobs.reload)} done="Backup started.">
                       Run now
                     </Action>
                     <Action class="btn btn-ghost text-bad" confirm="Remove this job? Existing backups stay in the target." run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}>
@@ -661,7 +698,7 @@ function Backups() {
         </Loaded>
       </Card>
       {addTarget && <TargetForm onClose={() => setAddTarget(false)} onSaved={targets.reload} />}
-      {addJob && targets.data && <JobForm targets={targets.data.targets} onClose={() => setAddJob(false)} onSaved={jobs.reload} />}
+      {addJob && targets.data && <JobForm targets={targets.data.targets} services={services} onClose={() => setAddJob(false)} onSaved={jobs.reload} />}
       {runsOf && <Runs job={runsOf} onClose={() => setRunsOf(null)} />}
     </>
   );
@@ -669,8 +706,9 @@ function Backups() {
 
 function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
   const [f, setF] = useState<Record<string, string>>({ name: "", kind: "s3" });
+  const upd = (p: Record<string, string>) => setF((s) => ({ ...s, ...p }));
   const s3: [string, string, string?][] = [
-    ["endpoint", "Endpoint", "url"],
+    ["endpoint", "Endpoint (optional, empty for AWS)", "url"],
     ["bucket", "Bucket"],
     ["prefix", "Prefix (optional)"],
     ["region", "Region (optional)"],
@@ -686,7 +724,7 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
   });
   const input = (k: string, label: string, type = "text") => (
     <Field key={k} label={label}>
-      <input class="input" type={type} required={!label.includes("optional")} autoComplete="off" value={f[k] ?? ""} onInput={(e) => setF({ ...f, [k]: e.currentTarget.value })} />
+      <input class="input" type={type} required={!label.includes("optional")} autoComplete="off" value={f[k] ?? ""} onInput={(e) => upd({[k]: e.currentTarget.value })} />
     </Field>
   );
   return (
@@ -697,7 +735,7 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
           <Field label="Kind">
             <Select
               value={f.kind}
-              onChange={(kind) => setF({ ...f, kind })}
+              onChange={(kind) => upd({kind })}
               options={[
                 ["s3", "S3-compatible storage"],
                 ["local", "Folder on this server"],
@@ -720,17 +758,24 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
   );
 }
 
-function JobForm(props: { targets: Target[]; onClose: () => void; onSaved: () => void }) {
+/** Every service as [id, "project.service"], or null while loading. */
+function useServices() {
   const projects = useApi<{ projects: Project[] }>("/projects");
   const [services, setServices] = useState<[string, string][] | null>(null);
-  const [f, setF] = useState({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
-  // ponytail: one request per project to list services; a flat GET /api/services would replace this.
+  // ponytail: one request per project; a flat GET /api/services would replace this.
   useEffect(() => {
     if (!projects.data) return;
     Promise.all(projects.data.projects.map((p) => get<ProjectDetail>(`/projects/${p.id}`)))
-      .then((all) => setServices(all.flatMap((d) => d.services.filter((x) => x.kind !== "compose").map((x): [string, string] => [x.id, `${d.project.name}.${x.name}`]))))
+      .then((all) => setServices(all.flatMap((d) => d.services.map((x): [string, string] => [x.id, `${d.project.name}.${x.name}`]))))
       .catch(() => setServices([]));
   }, [projects.data]);
+  return services;
+}
+
+function JobForm(props: { targets: Target[]; services: [string, string][] | null; onClose: () => void; onSaved: () => void }) {
+  const services = props.services;
+  const [f, setF] = useState({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
+  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const s = useSubmit(async () => {
     await post("/backups/jobs", {
       kind: f.kind,
@@ -749,7 +794,7 @@ function JobForm(props: { targets: Target[]; onClose: () => void; onSaved: () =>
         <Field label="What to back up">
           <Select
             value={f.kind}
-            onChange={(kind) => setF({ ...f, kind })}
+            onChange={(kind) => upd({kind })}
             options={[
               ["database", "A database (consistent dump)"],
               ["volume", "A volume"],
@@ -759,23 +804,23 @@ function JobForm(props: { targets: Target[]; onClose: () => void; onSaved: () =>
         </Field>
         {f.kind !== "state" && (
           <Field label="Service">
-            <Select value={f.service} onChange={(service) => setF({ ...f, service })} options={[["", services ? "Choose…" : "Loading…"], ...(services ?? [])]} />
+            <Select value={f.service} onChange={(service) => upd({service })} options={[["", services ? "Choose…" : "Loading…"], ...(services ?? [])]} />
           </Field>
         )}
         {f.kind === "volume" && (
           <Field label="Volume name">
-            <input class="input font-mono" required value={f.volume} onInput={(e) => setF({ ...f, volume: e.currentTarget.value })} />
+            <input class="input font-mono" required value={f.volume} onInput={(e) => upd({volume: e.currentTarget.value })} />
           </Field>
         )}
         <div class="grid gap-4 sm:grid-cols-3">
           <Field label="Target">
-            <Select value={f.target} onChange={(target) => setF({ ...f, target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
+            <Select value={f.target} onChange={(target) => upd({target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
           </Field>
           <Field label="Schedule" hint="Cron format in the server's time zone.">
-            <input class="input font-mono" required value={f.schedule} onInput={(e) => setF({ ...f, schedule: e.currentTarget.value })} />
+            <input class="input font-mono" required value={f.schedule} onInput={(e) => upd({schedule: e.currentTarget.value })} />
           </Field>
           <Field label="Keep the last">
-            <input class="input" type="number" min={1} value={f.keep} onInput={(e) => setF({ ...f, keep: e.currentTarget.value })} />
+            <input class="input" type="number" min={1} value={f.keep} onInput={(e) => upd({keep: e.currentTarget.value })} />
           </Field>
         </div>
         <ErrorBox error={s.error} />
@@ -794,6 +839,11 @@ function JobForm(props: { targets: Target[]; onClose: () => void; onSaved: () =>
 
 function Runs(props: { job: Job; onClose: () => void }) {
   const r = useApi<{ runs: Run[] }>(`/backups/jobs/${props.job.id}/runs`);
+  const restore = async (id: string, test: boolean) => {
+    const res = await post<{ message?: string }>(`/backups/runs/${id}/restore`, { test });
+    toast(res.message ? sentence(res.message) : test ? "The test restore finished." : "The backup was restored.");
+    await r.reload();
+  };
   return (
     <Modal open onClose={props.onClose} title="Backup runs" wide>
       <Loaded r={r} planned>
@@ -814,10 +864,8 @@ function Runs(props: { job: Job; onClose: () => void }) {
                   </div>
                   {run.snapshot && (
                     <>
-                      <Action run={() => post(`/backups/runs/${run.id}/restore`, { test: true })} done="Test restore started; the result arrives as a notification.">
-                        Test restore
-                      </Action>
-                      <Action class="btn btn-danger" confirm="Restore this backup? It replaces the current data." run={() => post(`/backups/runs/${run.id}/restore`, {})} done="Restore started.">
+                      <Action run={() => restore(run.id, true)}>Test restore</Action>
+                      <Action class="btn btn-danger" confirm="Restore this backup? It replaces the current data." run={() => restore(run.id, false)}>
                         Restore
                       </Action>
                     </>
@@ -833,7 +881,7 @@ function Runs(props: { job: Job; onClose: () => void }) {
 }
 
 function Tunnel() {
-  const r = useApi<{ enabled: boolean; account?: string; tunnel_id?: string; status?: string }>("/tunnel");
+  const r = useApi<{ enabled: boolean; account?: string; tunnel_id?: string; running?: boolean; domains?: string[] }>("/tunnel");
   const [token, setToken] = useState("");
   const s = useSubmit(async () => {
     await put("/tunnel", { api_token: token.trim() });
@@ -847,10 +895,13 @@ function Tunnel() {
           t.enabled ? (
             <div class="space-y-3">
               <p class="flex flex-wrap items-center gap-2">
-                <Pill state={t.status ?? "running"} /> <span class="text-dim">Tunnel {t.tunnel_id}</span>
-                {t.account && <span class="text-muted">on {t.account}</span>}
+                <Pill state={t.running ? "running" : "stopped"} /> <span class="text-dim">Tunnel {t.tunnel_id}</span>
+                {t.account && <span class="text-muted">on account {t.account}</span>}
               </p>
               <p class="text-dim">Domains with the tunnel switch on reach this server through Cloudflare, so the server needs no open ports for them.</p>
+              <p class="text-dim">
+                {t.domains?.length ? `Routed through it: ${t.domains.join(", ")}.` : "No domain uses the tunnel yet; turn on the tunnel switch in a domain's settings."}
+              </p>
               <Action class="btn btn-danger" confirm="Disconnect the tunnel? Domains routed through it stop working until you connect again." run={() => del("/tunnel").then(r.reload)}>
                 Disconnect
               </Action>
@@ -876,6 +927,52 @@ function Tunnel() {
 }
 
 function About() {
+  const me = useMe();
+  return (
+    <>
+      <AboutCard />
+      {me.principal.is_owner && <Updates />}
+    </>
+  );
+}
+
+function Updates() {
+  const r = useApi<{ current: string; latest: { version: string; notes: string } | null; available: boolean }>("/updates");
+  return (
+    <Card title="Updates" actions={<Action run={r.reload}>Check again</Action>}>
+      <Loaded r={r} planned>
+        {(u) =>
+          !u.latest ? (
+            <p class="text-dim">Tugport could not look up the newest release on GitHub just now, so check again later.</p>
+          ) : u.available ? (
+            <div class="space-y-3">
+              <p>
+                Tugport {u.latest.version} is available; this server runs {u.current}.
+              </p>
+              {u.latest.notes && (
+                <details>
+                  <summary class="text-sm text-dim">Release notes</summary>
+                  <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-line bg-bg p-3 text-xs">{u.latest.notes}</pre>
+                </details>
+              )}
+              <Action
+                class="btn btn-primary"
+                confirm={`Install Tugport ${u.latest.version}? Running deploys finish first, and traffic keeps flowing during the switch.`}
+                run={async () => toast(`Updating to ${(await post<{ updating_to: string }>("/updates/apply")).updating_to}. The panel reconnects by itself.`)}
+              >
+                Install {u.latest.version}
+              </Action>
+            </div>
+          ) : (
+            <p class="text-dim">Tugport {u.current} is the newest release.</p>
+          )
+        }
+      </Loaded>
+    </Card>
+  );
+}
+
+function AboutCard() {
   const r = useApi<{ version: string; commit: string; source: string; docker: string | null }>("/about");
   return (
     <Card title="About Tugport">

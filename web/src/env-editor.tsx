@@ -53,13 +53,14 @@ export function EnvEditor(props: {
           setChanges((c) => ({ ...c, ...map }));
           return true;
         };
-        const placeholder = values ? "Hidden; type to replace it" : "Write-only; type a new value";
+        const placeholder = !props.canEdit ? "Hidden" : values ? "Hidden; type to replace it" : "Write-only; type a new value";
 
         return (
           <div class="space-y-4">
             {!data.values_visible && (
               <p class="text-xs text-muted">
-                Values stay hidden because reading them needs the secrets:read grant. You can still replace or delete them.
+                Values stay hidden because reading them needs the secrets:read grant
+                {props.canEdit ? ", but you can still replace or delete them." : ", and changing them needs the operator role."}
               </p>
             )}
             {names.length === 0 && added.length === 0 ? (
@@ -130,7 +131,7 @@ export function EnvEditor(props: {
                     autoComplete="off"
                     spellcheck={false}
                     value={draft.key}
-                    onInput={(e) => setDraft({ ...draft, key: e.currentTarget.value })}
+                    onInput={(e) => ((key) => setDraft((d) => ({ ...d, key })))(e.currentTarget.value)}
                   />
                   <input
                     class="input min-w-0 flex-1 font-mono"
@@ -139,7 +140,7 @@ export function EnvEditor(props: {
                     autoComplete="off"
                     spellcheck={false}
                     value={draft.value}
-                    onInput={(e) => setDraft({ ...draft, value: e.currentTarget.value })}
+                    onInput={(e) => ((value) => setDraft((d) => ({ ...d, value })))(e.currentTarget.value)}
                   />
                   <button class="btn" disabled={!draft.key.trim()}>
                     Add

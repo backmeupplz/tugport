@@ -166,12 +166,13 @@ function TokenReveal(props: { token: string; snippets: Snippets }) {
 }
 
 function AccessTabs(props: { current: string }) {
+  const me = useMe();
   return (
     <Tabs
       label="Access sections"
       current={props.current}
       items={[
-        ["people", "People and agents", "/access"],
+        ["people", me.principal.is_owner ? "People and agents" : "Your keys", "/access"],
         ["audit", "Audit log", "/access/audit"],
       ]}
     />
@@ -322,6 +323,8 @@ export function NewAgent(_: { path?: string }) {
 export function NewPerson(_: { path?: string }) {
   const projects = useApi<{ projects: Project[] }>("/projects");
   const [f, setF] = useState({ name: "", email: "", password: "" });
+  // Functional updates: autofill fires several input events before the next render.
+  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const [access, setAccess] = useState<Access>({ mode: "some", allRole: "viewer", projects: {}, secrets: false, destroy: false });
   const s = useSubmit(async () => {
     const u = await post<User>("/users", { kind: "human", name: f.name.trim(), email: f.email.trim() || undefined, password: f.password, ...accessBody(access) });
@@ -334,13 +337,13 @@ export function NewPerson(_: { path?: string }) {
         <Card title="Person">
           <div class="grid gap-4 sm:grid-cols-2">
             <Field label="Name">
-              <input class="input" required autoFocus maxLength={64} autoComplete="off" value={f.name} onInput={(e) => setF({ ...f, name: e.currentTarget.value })} />
+              <input class="input" required autoFocus maxLength={64} autoComplete="off" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
             </Field>
             <Field label="Email (optional)">
-              <input class="input" type="email" autoComplete="off" value={f.email} onInput={(e) => setF({ ...f, email: e.currentTarget.value })} />
+              <input class="input" type="email" autoComplete="off" value={f.email} onInput={(e) => upd({email: e.currentTarget.value })} />
             </Field>
             <Field label="Password" hint="Use at least 10 characters, and share it through a safe channel.">
-              <input class="input" type="password" required minLength={10} autoComplete="new-password" value={f.password} onInput={(e) => setF({ ...f, password: e.currentTarget.value })} />
+              <input class="input" type="password" required minLength={10} autoComplete="new-password" value={f.password} onInput={(e) => upd({password: e.currentTarget.value })} />
             </Field>
           </div>
         </Card>
@@ -455,6 +458,7 @@ function Keys(props: { user: User; self: boolean }) {
   const [reveal, setReveal] = useState<{ token: string; snippets: Snippets } | null>(null);
   const [creating, setCreating] = useState(false);
   const [f, setF] = useState({ name: "", expires: "90", ips: "" });
+  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const s = useSubmit(async () => {
     const k = await post<{ id: string; token: string; snippets: Snippets }>(`/users/${u.id}/keys`, {
       name: f.name.trim() || undefined,
@@ -536,9 +540,9 @@ function Keys(props: { user: User; self: boolean }) {
       <Modal open={creating} onClose={() => setCreating(false)} title="New API key" wide>
         <form class="space-y-4" onSubmit={s.submit}>
           <Field label="Key name" hint="Helps you tell keys apart, like the machine or pipeline that uses it.">
-            <input class="input" autoFocus placeholder="laptop" value={f.name} onInput={(e) => setF({ ...f, name: e.currentTarget.value })} />
+            <input class="input" autoFocus placeholder="laptop" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
           </Field>
-          <KeyFields expires={f.expires} setExpires={(expires) => setF({ ...f, expires })} ips={f.ips} setIps={(ips) => setF({ ...f, ips })} />
+          <KeyFields expires={f.expires} setExpires={(expires) => upd({expires })} ips={f.ips} setIps={(ips) => upd({ips })} />
           <p class="text-xs text-muted">The key acts with {props.self ? "your" : `${u.name}'s`} access, no more and no less.</p>
           <ErrorBox error={s.error} />
           <div class="flex justify-end gap-2">

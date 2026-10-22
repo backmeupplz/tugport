@@ -4,10 +4,11 @@ import { route } from "preact-router";
 import { FINAL, atLeast, del, get, hasGrant, post, put, useApi, useMe, type Deploy, type Replica, type ServiceDetail } from "../api";
 import { EnvEditor } from "../env-editor";
 import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, toast, useSubmit } from "../ui";
-import { ago, clock, duration } from "../util";
+import { fmt } from "../charts";
+import { ago, bytes, clock, duration } from "../util";
 import { Domains } from "./domains";
 import { DeployKey } from "./new-service";
-import { Console, Logs, ServiceMetrics } from "./observe";
+import { Console, Logs, ServiceMetrics, type Now } from "./observe";
 import { sourceLabel } from "./projects";
 import { ServiceSettings } from "./service-settings";
 
@@ -52,6 +53,7 @@ export function RedeployNote(props: { c: Ctx; children: ComponentChildren }) {
 }
 
 export function ServicePage(props: { project?: string; service?: string; tab?: string; path?: string }) {
+  const me = useMe();
   const sid = useRef("");
   const r = useApi<ServiceDetail>(`/services/${props.project}.${props.service}`, (e) => e.service_id === sid.current && LIVE.has(e.kind));
   sid.current = r.data?.service.id ?? "";
@@ -111,7 +113,7 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
       {tab === "env" && <Env c={c} />}
       {tab === "files" && <Files c={c} />}
       {tab === "settings" && <ServiceSettings c={c} />}
-      {tab === "console" && <Console service={s} replicas={d.status.replicas} canUse={atLeast(d.role, "operator")} />}
+      {tab === "console" && <Console service={s} replicas={d.status.replicas} canUse={atLeast(d.role, "operator") && hasGrant(me, "secrets:read")} />}
       {tab === "danger" && <Danger c={c} />}
       <DeployLog id={logId} onClose={() => setLogId(null)} />
     </Page>
@@ -166,6 +168,7 @@ function Overview({ c }: { c: Ctx }) {
           ) : (
             <Replicas list={st.replicas} live={st.live_deploy} />
           )}
+          {st.running > 0 && <Usage id={id} />}
           <p class="mt-4 text-xs text-muted">
             Other services in this project reach it by the host name <code>{s.name}</code>
             {s.kind === "database" && (
@@ -205,6 +208,22 @@ function Overview({ c }: { c: Ctx }) {
         )}
       </div>
     </div>
+  );
+}
+
+/** Current CPU and memory from the server's latest metrics sample. */
+function Usage(props: { id: string }) {
+  const r = useApi<Now>("/metrics/now", (e) => e.kind === "metrics");
+  const u = r.data?.services?.find((x) => x.id === props.id);
+  if (!u) return null;
+  // Docker reports 0 B where the memory controller is unavailable; leave it out rather than mislead.
+  const memory = u.memory > 0 ? ` and ${bytes(u.memory)} of memory` : "";
+  const restarts = u.restarts ? `, after ${u.restarts} ${u.restarts === 1 ? "restart" : "restarts"}` : "";
+  return (
+    <p class="mt-3 text-dim">
+      Using {fmt.pct(u.cpu)} of a core{memory}
+      {restarts}.
+    </p>
   );
 }
 
@@ -557,13 +576,13 @@ function Files({ c }: { c: Ctx }) {
                   pattern="/.*"
                   placeholder="/etc/app/config.yml"
                   value={edit.target}
-                  onInput={(e) => setEdit({ ...edit, target: e.currentTarget.value })}
+                  onInput={(e) => ((target) => setEdit((x) => x && { ...x, target }))(e.currentTarget.value)}
                 />
               </Field>
             )}
             {!edit.known && <Note>The current content is hidden because reading it needs the secrets:read grant. Saving replaces it.</Note>}
             <Field label="Content">
-              <textarea class="input h-72" spellcheck={false} value={edit.content} onInput={(e) => setEdit({ ...edit, content: e.currentTarget.value })} />
+              <textarea class="input h-72" spellcheck={false} value={edit.content} onInput={(e) => ((content) => setEdit((x) => x && { ...x, content }))(e.currentTarget.value)} />
             </Field>
             <ErrorBox error={s.error} />
             <div class="flex justify-end gap-2">

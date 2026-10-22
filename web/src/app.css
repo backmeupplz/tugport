@@ -132,3 +132,7 @@
 .u-legend .u-marker {
   border-radius: 2px;
 }
+/* The time entry only repeats the axis; the series entries are the hover readout. */
+.u-legend .u-series:first-child {
+  display: none;
+}

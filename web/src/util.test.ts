@@ -13,6 +13,12 @@ test("merge patch keeps only changes and nulls removed keys", () => {
   });
   assert.deepEqual(mergePatch(a, structuredClone(a)), {});
   assert.deepEqual(mergePatch({ resources: { cpus: 1 } }, { resources: { cpus: null } }), { resources: { cpus: null } });
+  // Arrays of objects compare by content, whatever order their keys come in.
+  const mounts = [{ name: "data", readonly: false, target: "/data", type: "volume" }];
+  assert.deepEqual(mergePatch({ mounts }, { mounts: [{ type: "volume", name: "data", target: "/data", readonly: false }] }), {});
+  assert.deepEqual(mergePatch({ mounts }, { mounts: [{ type: "volume", name: "data", target: "/data", readonly: true }] }), {
+    mounts: [{ type: "volume", name: "data", target: "/data", readonly: true }],
+  });
 });
 
 test(".env parsing", () => {

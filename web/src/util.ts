@@ -9,7 +9,10 @@ export function sentence(msg: string): string {
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === "object" && !Array.isArray(x);
-const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+/** Key order differs between the API (sorted) and objects the forms build, so it must not count. */
+const sorted = (x: unknown): unknown =>
+  Array.isArray(x) ? x.map(sorted) : isObj(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, sorted(x[k])])) : x;
+const same = (a: unknown, b: unknown) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
 
 /** RFC 7386 JSON merge patch that turns `a` into `b`. Arrays are replaced whole; removed keys become null. */
 export function mergePatch(a: Record<string, unknown>, b: Record<string, unknown>): Record<string, unknown> {

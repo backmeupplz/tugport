@@ -15,6 +15,7 @@ mod db;
 mod deploy;
 mod git;
 mod handoff;
+mod install;
 mod logs;
 mod mcp;
 mod metrics;
@@ -65,6 +66,8 @@ enum Cmd {
     Recover { key: String },
     /// Print the version.
     Version,
+    /// Set this server up (run by the one-line installer).
+    Install(install::InstallArgs),
     #[command(flatten)]
     Client(cli::Client),
 }
@@ -80,6 +83,7 @@ fn main() -> Result<()> {
             println!("tugport {VERSION} ({COMMIT})");
             Ok(())
         }
+        Cmd::Install(args) => install::install(args),
         Cmd::Recover { key } => {
             let paths = paths::Paths::from_env();
             crypto::restore_master(&paths.etc, &key)?;
@@ -105,7 +109,7 @@ fn main() -> Result<()> {
 }
 
 /// Fresh one-time setup link, or None once an owner exists.
-fn setup_link(db: &db::Db) -> Result<Option<String>> {
+pub fn setup_link(db: &db::Db) -> Result<Option<String>> {
     let users: i64 = db.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
     if users > 0 {
         return Ok(None);

@@ -1,5 +1,6 @@
 mod access;
 mod backups;
+mod cloud;
 mod console;
 mod deploys;
 mod git;
@@ -74,6 +75,13 @@ pub fn router(app: AppState) -> Router {
         .route("/api/nodes/join-token", post(nodes::join_token))
         .route("/api/nodes/join", post(nodes::join))
         .route("/api/nodes/{id}", patch(nodes::update).delete(nodes::remove))
+        .route("/api/cloud/accounts", get(cloud::list_accounts).post(cloud::create_account))
+        .route("/api/cloud/accounts/{id}", delete(cloud::delete_account))
+        .route("/api/cloud/accounts/{id}/options", get(cloud::options))
+        .route("/api/cloud/servers", get(cloud::list_servers).post(cloud::create_server))
+        .route("/api/cloud/servers/{id}", delete(cloud::delete_server))
+        .route("/api/cloud/pools", get(cloud::list_pools).post(cloud::create_pool))
+        .route("/api/cloud/pools/{id}", patch(cloud::update_pool).delete(cloud::delete_pool))
         .route("/api/notifications", get(observe::list_channels).post(observe::create_channel))
         .route("/api/notifications/{id}", delete(observe::delete_channel))
         .route("/api/notifications/{id}/test", post(observe::test_channel))

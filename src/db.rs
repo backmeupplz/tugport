@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-const MIGRATIONS: &[&str] = &[include_str!("migrations/001_init.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("migrations/001_init.sql"), include_str!("migrations/002_cloud.sql")];
 
 /// SQLite in WAL mode behind a mutex. Calls are short; never hold the guard across `.await`.
 pub struct Db(Mutex<Connection>);

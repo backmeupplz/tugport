@@ -10,6 +10,7 @@ mod backup;
 mod builder;
 mod cleanup;
 mod cli;
+mod cloud;
 mod compose;
 mod crypto;
 mod databases;
@@ -229,6 +230,7 @@ async fn serve() -> Result<()> {
     tokio::spawn(nodes::health_loop(app.clone()));
     tokio::spawn(sleep::run(app.clone()));
     tokio::spawn(autoscale::run(app.clone()));
+    tokio::spawn(cloud::run(app.clone()));
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));

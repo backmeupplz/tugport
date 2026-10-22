@@ -267,10 +267,15 @@ pub struct JoinToken {
 }
 
 pub async fn join_token(app: &App, panel_url: &str) -> Result<JoinToken> {
+    join_token_for(app, panel_url, None).await
+}
+
+/// A one-hour join command; `cloud` ties it to a machine Tugport is creating.
+pub async fn join_token_for(app: &App, panel_url: &str, cloud: Option<&str>) -> Result<JoinToken> {
     ensure_mesh(app).await?;
     let token = util::token(40);
     let expires_at = util::now() + 3600;
-    app.db.set_state(&format!("jointoken:{}", util::sha256_hex(&token)), &expires_at.to_string())?;
+    app.db.set_state(&format!("jointoken:{}", util::sha256_hex(&token)), &json!({ "expires_at": expires_at, "cloud": cloud }).to_string())?;
     Ok(JoinToken {
         command: format!("curl -fsSL https://tugport.com/install | sh -s -- --join {panel_url} --token {token}"),
         token,
@@ -301,7 +306,9 @@ pub struct JoinResponse {
 
 pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinResponse> {
     let key = format!("jointoken:{}", util::sha256_hex(req.token.trim()));
-    let expires: i64 = app.db.get_state(&key)?.and_then(|v| v.parse().ok()).ok_or_else(|| anyhow!("this join command is not valid; make a new one in the panel"))?;
+    let stored: Value = app.db.get_state(&key)?.and_then(|v| serde_json::from_str(&v).ok()).ok_or_else(|| anyhow!("this join command is not valid; make a new one in the panel"))?;
+    let expires = stored["expires_at"].as_i64().unwrap_or(0);
+    let cloud = stored["cloud"].as_str().map(String::from);
     app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&key])?;
     if expires < util::now() {
         bail!("this join command expired; make a new one in the panel");
@@ -330,6 +337,16 @@ pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinResponse> {
     )?;
     let sealed = app.keys.seal_str(&format!("nodekey:{node_id}"), &secret)?;
     app.db.set_state(&format!("nodekey:{node_id}"), &crate::crypto::b64(&sealed))?;
+    if let Some(machine) = &cloud {
+        // A machine Tugport created: it gets its region and its pool's labels.
+        app.db.conn().execute(
+            "UPDATE nodes SET region = (SELECT region FROM cloud_servers WHERE id = ?1),
+               labels = COALESCE((SELECT p.labels FROM server_pools p JOIN cloud_servers c ON c.pool_id = p.id WHERE c.id = ?1), '{}')
+             WHERE id = ?2",
+            params![machine, node_id],
+        )?;
+        app.db.conn().execute("UPDATE cloud_servers SET node_id = ?1, status = 'joined' WHERE id = ?2", params![node_id, machine])?;
+    }
     set_peers(app)?;
     load(app)?;
     let swarm_token = sh("docker swarm join-token -q worker").await?.trim().to_string();
@@ -694,7 +711,10 @@ pub async fn remove(app: &AppState, node_id: &str) -> Result<()> {
     let swarm_node = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["swarm_node"].as_str().map(String::from));
     let _ = agent(&node, reqwest::Method::POST, "/agent/leave", None).await;
     app.db.conn().execute("DELETE FROM nodes WHERE id = ?1", [node_id])?;
-    app.db.conn().execute("DELETE FROM state WHERE key IN (?1, ?2)", params![format!("nodekey:{node_id}"), format!("rescheduled:{node_id}")])?;
+    app.db.conn().execute(
+        "DELETE FROM state WHERE key IN (?1, ?2, ?3)",
+        params![format!("nodekey:{node_id}"), format!("rescheduled:{node_id}"), format!("draining:{node_id}")],
+    )?;
     let _ = std::fs::remove_dir_all(app.paths.run.join("docker").join(node_id));
     set_peers(app)?;
     load(app)?;
@@ -707,11 +727,40 @@ pub async fn remove(app: &AppState, node_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether services keep data on this server (it cannot be emptied by moving them).
+pub fn keeps_data(app: &App, node_id: &str) -> Result<bool> {
+    Ok(app.db.conn().query_row("SELECT COUNT(*) > 0 FROM state WHERE key LIKE 'pin:%' AND value = ?1", [node_id], |r| r.get(0))?)
+}
+
+/// Empty a server before removing it: no new replicas there, and the ones it runs move.
+pub async fn drain(app: &AppState, node_id: &str) -> Result<()> {
+    app.db.set_state(&format!("draining:{node_id}"), &util::now().to_string())?;
+    let mut moving = vec![];
+    for s in store::services(app, None)? {
+        let placed = app.db.get_state(&format!("nodes:{}", s.id))?.unwrap_or_default();
+        if s.kind == "compose" || is_pinned(&s) || stopped(app, &s.id) || !placed.split(',').any(|id| id == node_id) {
+            continue;
+        }
+        let Some(image) = runtime::live_deploy(app, &s.id).and_then(|d| crate::deploy::get(app, &d).ok().flatten()).and_then(|d| d.image) else { continue };
+        crate::deploy::enqueue(app, &s, crate::deploy::Request { trigger: "drain".into(), image: Some(image), ..Default::default() })?;
+        moving.push(s.id);
+    }
+    let started = std::time::Instant::now();
+    while moving.iter().any(|id| app.deployer.busy(id)) {
+        if started.elapsed() > Duration::from_secs(1800) {
+            bail!("moving services off the server took too long");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Ok(())
+}
+
 /// Nodes a service may run on, honoring its placement rules.
 pub fn eligible(app: &App, placement: &crate::model::Placement) -> Vec<Arc<NodeHandle>> {
     app.all_nodes()
         .into_iter()
         .filter(|n| online(app, &n.id))
+        .filter(|n| app.db.get_state(&format!("draining:{}", n.id)).ok().flatten().is_none())
         .filter(|n| placement.node.as_ref().is_none_or(|want| *want == n.id || *want == n.name))
         .filter(|n| placement.region.as_ref().is_none_or(|r| n.region.as_ref() == Some(r)))
         .filter(|n| placement.labels.iter().all(|(k, v)| n.labels.get(k) == Some(v)))

@@ -384,6 +384,20 @@ pub fn recent(app: &App, scope: &str, name: &str, secs: i64) -> Option<f64> {
     .flatten()
 }
 
+/// Average CPU of the online servers over the last `secs` seconds.
+pub fn cluster_cpu(app: &App, secs: i64) -> Option<f64> {
+    let conn = app.db.conn();
+    conn.query_row(
+        "SELECT AVG(a) FROM (SELECT AVG(r.v) AS a FROM metrics_raw r JOIN metric_series s ON s.id = r.series
+           JOIN nodes n ON n.id = s.node_id
+           WHERE s.scope = 'host' AND s.name = 'cpu' AND n.status = 'online' AND r.ts >= ?1 GROUP BY r.series)",
+        params![util::now() - secs],
+        |r| r.get::<_, Option<f64>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
 /// Points for a chart, downsampled to roughly 300 per series. Server scopes read `node`;
 /// service scopes add up the service's usage on every server.
 #[allow(clippy::type_complexity)]

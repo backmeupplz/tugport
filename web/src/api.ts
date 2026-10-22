@@ -95,6 +95,8 @@ export interface Project {
   name: string;
   description: string | null;
   services: number;
+  /** How many of its services are in each state, like {running: 2, stopped: 1}. */
+  states?: Record<string, number>;
   role: Role | null;
   created_at: number;
 }

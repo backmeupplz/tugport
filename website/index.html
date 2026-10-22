@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tugport — deploy your apps and watch your server from one binary</title>
+<meta name="description" content="Tugport is a self-hosted deploy platform in one Rust binary. It builds every push from GitHub or Forgejo, keeps the logs of every service, charts your server and gives AI agents API keys with exactly the permissions you choose.">
+<link rel="canonical" href="https://tugport.com/">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Tugport">
+<meta property="og:url" content="https://tugport.com/">
+<meta property="og:title" content="Tugport — deploy your apps and watch your server from one binary">
+<meta property="og:description" content="Tugport builds every push from GitHub or Forgejo, keeps the logs of every service, charts your server and gives AI agents scoped API keys, all from one small Rust binary.">
+<meta property="og:image" content="https://tugport.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Tugport logo with the line: deploy your apps and watch your server from one small binary.">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Tugport — deploy your apps and watch your server from one binary">
+<meta name="twitter:description" content="Tugport builds every push from GitHub or Forgejo, keeps the logs of every service, charts your server and gives AI agents scoped API keys, all from one small Rust binary.">
+<meta name="twitter:image" content="https://tugport.com/og.png">
+<meta name="twitter:image:alt" content="Tugport logo with the line: deploy your apps and watch your server from one small binary.">
+
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#0B1018" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F6F3EE" media="(prefers-color-scheme: light)">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0B1018;
+    --bg-band: #0E141E;
+    --surface: #121A26;
+    --line: #213045;
+    --text: #E9EEF5;
+    --dim: #A3AFC0;
+    --muted: #6B788C;
+    --accent: #FF6A3D;
+    --accent-soft: rgba(255, 106, 61, 0.12);
+    --on-accent: #0B1018;
+    --shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+    color-scheme: dark;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F6F3EE;
+      --bg-band: #EFE9E0;
+      --surface: #FFFFFF;
+      --line: #E1D9CC;
+      --text: #121A26;
+      --dim: #465264;
+      --muted: #7A8494;
+      --accent: #E4532A;
+      --accent-soft: rgba(228, 83, 42, 0.10);
+      --on-accent: #FFFFFF;
+      --shadow: 0 30px 70px rgba(18, 26, 38, 0.18);
+      color-scheme: light;
+    }
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 400 17px/1.65 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  a { color: inherit; }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+  h1, h2, h3 { font-family: "Space Grotesk", Inter, system-ui, sans-serif; letter-spacing: -0.02em; }
+
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+
+  /* Nav */
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
+  .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+  .brand img { width: 36px; height: 36px; }
+  .brand span { font: 700 22px/1 "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
+  .nav-links { display: flex; gap: 28px; font-size: 15px; color: var(--dim); }
+  .nav-links a { text-decoration: none; }
+  .nav-links a:hover { color: var(--text); }
+
+  /* Hero */
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    gap: 64px;
+    align-items: center;
+    padding: 72px 0 104px;
+  }
+  .status {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 7px 14px 7px 12px;
+    border: 1px solid var(--line); border-radius: 14px;
+    font: 500 13px/1.4 "JetBrains Mono", monospace; color: var(--dim);
+    margin-bottom: 28px;
+  }
+  .status::before {
+    content: ""; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+  .hero h1 { font-size: clamp(38px, 5.2vw, 60px); line-height: 1.04; font-weight: 700; margin-bottom: 24px; }
+  .hero h1 em { font-style: normal; color: var(--accent); }
+  .lead { font-size: 19px; color: var(--dim); max-width: 34em; margin-bottom: 36px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 14px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 14px 22px; border-radius: 12px;
+    font: 600 16px/1 Inter, sans-serif; text-decoration: none;
+    transition: transform 0.15s ease, background 0.15s ease;
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-primary { background: var(--accent); color: var(--on-accent); }
+  .btn-ghost { border: 1px solid var(--line); color: var(--text); }
+  .btn-ghost:hover { background: var(--surface); }
+  .btn svg { width: 18px; height: 18px; }
+
+  /* Service card sketch: always dark, like a terminal */
+  .sketch {
+    position: relative;
+    background: #0F1621;
+    border: 1px solid #243246;
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    color: #E9EEF5;
+    padding: 22px;
+    font-size: 14px;
+  }
+  .sketch .tag {
+    position: absolute; top: -11px; right: 18px;
+    padding: 3px 10px; border-radius: 999px;
+    background: #1A2433; border: 1px solid #2B3A50;
+    font: 500 11px/1.4 "JetBrains Mono", monospace; color: #9AA7B8; letter-spacing: 0.04em;
+  }
+  .svc-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .svc-name { display: flex; align-items: center; gap: 10px; font: 600 17px/1.2 "Space Grotesk", sans-serif; }
+  .svc-name i { width: 9px; height: 9px; border-radius: 50%; background: #4ADE80; box-shadow: 0 0 0 4px rgba(74, 222, 128, 0.15); }
+  .svc-name b { color: #7D8BA0; font-weight: 500; }
+  .live { font: 500 12px/1 "JetBrains Mono", monospace; color: #4ADE80; border: 1px solid rgba(74, 222, 128, 0.35); padding: 5px 9px; border-radius: 8px; }
+  .svc-meta { margin: 8px 0 18px; font: 400 12.5px/1.5 "JetBrains Mono", monospace; color: #8C99AC; }
+  .svc-meta em { font-style: normal; color: #FF8A64; }
+  .steps { list-style: none; border-top: 1px solid #223044; border-bottom: 1px solid #223044; padding: 14px 0; display: grid; gap: 9px; }
+  .steps li { display: flex; gap: 10px; align-items: baseline; color: #C9D2DE; }
+  .steps li::before { content: "✓"; color: #4ADE80; font-weight: 600; }
+  .charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 16px 0; border-bottom: 1px solid #223044; }
+  .chart { background: #131C29; border: 1px solid #202D40; border-radius: 12px; padding: 10px 12px 8px; }
+  .chart span { display: flex; justify-content: space-between; font: 500 11.5px/1.3 "JetBrains Mono", monospace; color: #8C99AC; }
+  .chart span b { color: #E9EEF5; font-weight: 500; }
+  .chart svg { display: block; width: 100%; height: 34px; margin-top: 6px; }
+  .logs { padding-top: 14px; font: 400 12.5px/1.75 "JetBrains Mono", monospace; color: #B7C2D1; }
+  .logs div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .logs span { color: #5F6E84; margin-right: 10px; }
+
+  /* Sections */
+  section { padding: 96px 0; }
+  .band { background: var(--bg-band); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .section-head { max-width: 46em; margin-bottom: 52px; }
+  .section-head h2 { font-size: clamp(30px, 3.6vw, 42px); line-height: 1.12; font-weight: 700; margin-bottom: 16px; }
+  .section-head p { color: var(--dim); font-size: 18px; }
+
+  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 28px 26px 30px;
+  }
+  .card svg { width: 30px; height: 30px; color: var(--accent); margin-bottom: 18px; }
+  .card h3 { font-size: 20px; line-height: 1.25; font-weight: 600; margin-bottom: 10px; }
+  .card p { color: var(--dim); font-size: 15.5px; }
+
+  .binary { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 64px; align-items: center; }
+  .binary p { color: var(--dim); font-size: 18px; margin-bottom: 18px; }
+  .binary p:last-child { margin-bottom: 0; }
+  .stacks { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: end; }
+  .stack h4 { font: 500 12.5px/1.4 "JetBrains Mono", monospace; color: var(--muted); margin-bottom: 12px; letter-spacing: 0.02em; }
+  .stack ul { list-style: none; display: grid; gap: 8px; }
+  .stack li {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 10px;
+    padding: 11px 14px; font: 500 14px/1.3 "JetBrains Mono", monospace; color: var(--dim);
+  }
+  .stack.tug li.one {
+    background: var(--accent); border-color: var(--accent); color: var(--on-accent);
+    padding: 22px 14px; font-weight: 600; display: flex; align-items: center; gap: 10px;
+  }
+  .stack.tug li.one img { width: 26px; height: 26px; border-radius: 7px; box-shadow: 0 0 0 2px rgba(11, 16, 24, 0.25); }
+
+  .cta { text-align: center; }
+  .cta .section-head { margin: 0 auto 34px; }
+  .cta .actions { justify-content: center; }
+
+  footer { border-top: 1px solid var(--line); padding: 30px 0 40px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  footer a { text-decoration: none; color: var(--dim); }
+  footer a:hover { color: var(--text); }
+
+  @media (max-width: 980px) {
+    .hero { grid-template-columns: 1fr; gap: 56px; padding: 40px 0 80px; }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .binary { grid-template-columns: 1fr; gap: 40px; }
+  }
+
+  @media (max-width: 640px) {
+    .wrap { padding: 0 16px; }
+    body { font-size: 16px; }
+    .nav-links { gap: 18px; }
+    .nav-links .hide-sm { display: none; }
+    .lead { font-size: 17px; }
+    section { padding: 72px 0; }
+    .grid { grid-template-columns: 1fr; }
+    .charts { grid-template-columns: 1fr 1fr; }
+    .charts .chart:last-child { display: none; }
+    .sketch { padding: 18px; }
+    .stacks { grid-template-columns: 1fr; }
+    .btn { width: 100%; justify-content: center; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <a class="brand" href="/" aria-label="Tugport home">
+      <img src="/logo.svg" alt="">
+      <span>Tugport</span>
+    </a>
+    <div class="nav-links">
+      <a class="hide-sm" href="#features">What it does</a>
+      <a class="hide-sm" href="#binary">Why one binary</a>
+      <a href="https://github.com/backmeupplz/tugport">GitHub</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <div>
+      <p class="status">Tugport is in early development.</p>
+      <h1>Tugport deploys your apps and watches your server from <em>one small binary.</em></h1>
+      <p class="lead">Push to GitHub or Forgejo and Tugport builds the commit, rolls it out without downtime and serves it over HTTPS. The same binary keeps the logs of every service, charts the CPU, memory, disk and GPU of your machine, and gives your AI agents API keys that can do exactly what you allow.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/backmeupplz/tugport">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.56-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
+          Follow the build on GitHub
+        </a>
+        <a class="btn btn-ghost" href="#features">See what it will do</a>
+      </div>
+    </div>
+
+    <figure class="sketch" aria-hidden="true">
+      <span class="tag">concept</span>
+      <div class="svc-head">
+        <div class="svc-name"><i></i>shop <b>/</b> api</div>
+        <span class="live">live</span>
+      </div>
+      <p class="svc-meta">main · 4f2c9e1 · deployed by agent <em>codex</em></p>
+      <ul class="steps">
+        <li>Built with Nixpacks in 41 seconds</li>
+        <li>Both replicas passed the health check</li>
+        <li>Traffic switched over with zero downtime</li>
+      </ul>
+      <div class="charts">
+        <div class="chart">
+          <span>CPU <b>12%</b></span>
+          <svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline fill="none" stroke="#4FD1C5" stroke-width="2" vector-effect="non-scaling-stroke" points="0,28 10,26 20,27 30,20 40,22 50,12 60,18 70,16 80,22 90,19 100,21"/></svg>
+        </div>
+        <div class="chart">
+          <span>Memory <b>318 MB</b></span>
+          <svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline fill="none" stroke="#FF8A64" stroke-width="2" vector-effect="non-scaling-stroke" points="0,20 10,19 20,19 30,18 40,18 50,17 60,17 70,16 80,16 90,15 100,15"/></svg>
+        </div>
+        <div class="chart">
+          <span>GPU <b>4%</b></span>
+          <svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline fill="none" stroke="#A78BFA" stroke-width="2" vector-effect="non-scaling-stroke" points="0,30 10,30 20,29 30,30 40,24 50,30 60,30 70,29 80,30 90,27 100,30"/></svg>
+        </div>
+      </div>
+      <div class="logs">
+        <div><span>14:02:11</span>server listening on :3000</div>
+        <div><span>14:02:12</span>GET /health 200 in 2 ms</div>
+        <div><span>14:02:14</span>POST /orders 201 in 18 ms</div>
+      </div>
+      <figcaption class="sr-only">A sketch of a service page in Tugport showing a live deploy made by an agent, usage charts and recent logs.</figcaption>
+    </figure>
+  </header>
+</div>
+
+<section id="features" class="band">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Tugport does a few things, and it does them properly.</h2>
+      <p>There is no app store and no wall of options. You get what you need to run your own software on your own server, and each piece is built to keep working when something next to it breaks.</p>
+    </div>
+    <div class="grid">
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <h3>Projects keep your services together.</h3>
+        <p>Group apps and databases into projects, give each service its own domains with automatic HTTPS, and keep its environment, volumes and resource limits in one place. Services in the same project reach each other by name on a private network.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7M8.3 7.2l7.4 3.6"/></svg>
+        <h3>Every push can ship itself.</h3>
+        <p>Connect a repository on GitHub or Forgejo, pick a branch, and each push is built from your Dockerfile or with Nixpacks. The new version has to pass its health check before it gets any traffic, and a bad release goes back with one click.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 10h11M4 14h16M4 18h8"/></svg>
+        <h3>Logs stay where you can read them.</h3>
+        <p>Follow any service live, search across all of its replicas, and scroll back through history that survives restarts and redeploys, right next to the build log of every deploy.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 20h18"/><path d="M4 16l4.5-5 3.5 3 4.5-6 3.5 4"/></svg>
+        <h3>Your server is always on a chart.</h3>
+        <p>CPU, memory, disk, network and GPU usage are charted for the whole machine and for each service, from the last minute back to the last month, and Tugport tells you on Telegram when something runs hot or falls over.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3M14 9l2 2"/></svg>
+        <h3>Agents get their own keys and limits.</h3>
+        <p>Create an agent user and its API key in one step, choose which projects it can see and whether it may deploy, change settings or read secrets, and read back everything it did in the audit log. The same rules apply to the API, the CLI and the MCP endpoint.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5"/><path d="M4.5 12v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V12"/></svg>
+        <h3>Databases come with backups.</h3>
+        <p>Run Postgres, MySQL, MongoDB or Redis next to your apps, back them up on a schedule to any S3-compatible storage, and restore a backup in place when you need it.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="binary">
+  <div class="wrap binary">
+    <div>
+      <div class="section-head" style="margin-bottom: 24px">
+        <h2>It is one binary, not a stack of services.</h2>
+      </div>
+      <p>A typical self-hosted panel arrives as a web app with a reverse proxy, a database, a cache, a metrics server and a log shipper beside it, and every one of them needs its own updates and can fail on its own. Tugport keeps the proxy, the certificates, the deploy queue, the metrics and the logs inside one Rust binary, stores its state in a single SQLite file and lets Docker run your containers.</p>
+      <p>That also means a failed build stays a failed build. It never restarts the panel, and it never takes other deploys down with it.</p>
+    </div>
+    <div class="stacks" aria-label="A typical panel runs seven separate pieces, while Tugport runs as one binary next to Docker.">
+      <div class="stack">
+        <h4>a typical panel</h4>
+        <ul>
+          <li>panel web app</li>
+          <li>reverse proxy</li>
+          <li>database</li>
+          <li>cache and queue</li>
+          <li>metrics server</li>
+          <li>log shipper</li>
+          <li>docker</li>
+        </ul>
+      </div>
+      <div class="stack tug">
+        <h4>tugport</h4>
+        <ul>
+          <li class="one"><img src="/logo.svg" alt="">tugport</li>
+          <li>docker</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band cta">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Tugport is being built in the open.</h2>
+      <p>Star the repository to follow along, or open an issue if there is something you need it to do on your server.</p>
+    </div>
+    <div class="actions">
+      <a class="btn btn-primary" href="https://github.com/backmeupplz/tugport">Watch the repository on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Tugport is MIT licensed. © 2026 Nikita Kolmogorov.</span>
+    <a href="https://github.com/backmeupplz/tugport">github.com/backmeupplz/tugport</a>
+  </div>
+</footer>
+
+</body>
+</html>

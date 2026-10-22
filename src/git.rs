@@ -101,7 +101,7 @@ pub fn providers(app: &App) -> Result<Vec<Value>> {
 
 pub fn save_provider(app: &App, id: Option<&str>, kind: Kind, name: &str, base_url: &str, config: &Value) -> Result<String> {
     let id = id.map(String::from).unwrap_or_else(util::id);
-    let sealed = app.keys.seal_str(&format!("git:{id}"), &config.to_string());
+    let sealed = app.keys.seal_str(&format!("git:{id}"), &config.to_string())?;
     app.db.conn().execute(
         "INSERT INTO git_providers (id, kind, name, base_url, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, base_url = excluded.base_url, config = excluded.config",
@@ -110,12 +110,11 @@ pub fn save_provider(app: &App, id: Option<&str>, kind: Kind, name: &str, base_u
     Ok(id)
 }
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
+fn http() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
         .user_agent(concat!("tugport/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap()
+        .build()?)
 }
 
 static TOKENS: Mutex<Option<HashMap<String, (String, i64)>>> = Mutex::new(None);
@@ -133,14 +132,13 @@ fn app_jwt(p: &Provider) -> Result<String> {
 pub async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
     let owner = repo.split('/').next().unwrap_or(repo).to_lowercase();
     let cache_key = format!("{}:{owner}", p.id);
-    if let Some((t, exp)) = TOKENS.lock().unwrap().get_or_insert_with(HashMap::new).get(&cache_key) {
-        if *exp > util::now() + 300 {
+    if let Some((t, exp)) = crate::util::lock(&TOKENS).get_or_insert_with(HashMap::new).get(&cache_key)
+        && *exp > util::now() + 300 {
             return Ok(t.clone());
         }
-    }
     let jwt = app_jwt(p)?;
     let api = p.api();
-    let inst: Value = http()
+    let inst: Value = http()?
         .get(format!("{api}/repos/{repo}/installation"))
         .bearer_auth(&jwt)
         .header("Accept", "application/vnd.github+json")
@@ -151,7 +149,7 @@ pub async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
         .json()
         .await?;
     let inst_id = inst["id"].as_i64().ok_or_else(|| anyhow!("no installation id"))?;
-    let tok: Value = http()
+    let tok: Value = http()?
         .post(format!("{api}/app/installations/{inst_id}/access_tokens"))
         .bearer_auth(&jwt)
         .header("Accept", "application/vnd.github+json")
@@ -162,7 +160,7 @@ pub async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
         .await?;
     let token = tok["token"].as_str().ok_or_else(|| anyhow!("no installation token"))?.to_string();
     let exp = chrono::DateTime::parse_from_rfc3339(tok["expires_at"].as_str().unwrap_or("")).map(|d| d.timestamp()).unwrap_or(util::now() + 3000);
-    TOKENS.lock().unwrap().get_or_insert_with(HashMap::new).insert(cache_key, (token.clone(), exp));
+    crate::util::lock(&TOKENS).get_or_insert_with(HashMap::new).insert(cache_key, (token.clone(), exp));
     Ok(token)
 }
 
@@ -196,7 +194,9 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
         Some(sealed) => {
             let key = app.keys.open_str(&format!("deploykey:{}", s.id), &crate::crypto::unb64(&sealed)?)?;
             let path = deploy_key_path(app, &s.id);
-            std::fs::create_dir_all(path.parent().unwrap())?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
             {
                 use std::io::Write;
                 use std::os::unix::fs::OpenOptionsExt;
@@ -260,7 +260,7 @@ pub async fn report(app: &App, s: &Service, d: &Deploy, state: &str, description
     let Ok(Some(p)) = provider(app, pid) else { return };
     let target = app.settings().panel_domain.map(|h| format!("https://{h}/services/{}/deploys/{}", s.id, d.id));
     let res: Result<()> = async {
-        let client = http();
+        let client = http()?;
         let req = match p.kind {
             Kind::GithubApp | Kind::GithubToken => {
                 let token = match p.kind {
@@ -301,11 +301,11 @@ fn urlencode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-fn hmac_hex(secret: &str, body: &[u8]) -> String {
+fn hmac_hex(secret: &str, body: &[u8]) -> Option<String> {
     use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("hmac");
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(body);
-    hex::encode(mac.finalize().into_bytes())
+    Some(hex::encode(mac.finalize().into_bytes()))
 }
 
 pub fn verify_webhook(p: &Provider, headers: &axum::http::HeaderMap, body: &[u8]) -> bool {
@@ -313,9 +313,13 @@ pub fn verify_webhook(p: &Provider, headers: &axum::http::HeaderMap, body: &[u8]
     let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
     match p.kind {
         Kind::GithubApp | Kind::GithubToken => {
-            h("x-hub-signature-256").and_then(|s| s.strip_prefix("sha256=")).is_some_and(|sig| util::ct_eq(sig, &hmac_hex(secret, body)))
+            let expected = hmac_hex(secret, body);
+            h("x-hub-signature-256").and_then(|s| s.strip_prefix("sha256=")).is_some_and(|sig| expected.is_some_and(|e| util::ct_eq(sig, &e)))
         }
-        Kind::Forgejo => h("x-forgejo-signature").or(h("x-gitea-signature")).is_some_and(|sig| util::ct_eq(sig, &hmac_hex(secret, body))),
+        Kind::Forgejo => {
+            let expected = hmac_hex(secret, body);
+            h("x-forgejo-signature").or(h("x-gitea-signature")).is_some_and(|sig| expected.is_some_and(|e| util::ct_eq(sig, &e)))
+        }
         Kind::Gitlab => h("x-gitlab-token").is_some_and(|t| util::ct_eq(t, secret)),
     }
 }
@@ -409,7 +413,7 @@ pub fn push_touches(watch: &[String], changed: Option<&[String]>) -> bool {
 /// Create the push webhook on a repository (providers without app-level webhooks).
 pub async fn ensure_webhook(p: &Provider, repo: &str, hook_url: &str) -> Result<()> {
     let secret = p.secret().ok_or_else(|| anyhow!("provider has no webhook secret"))?;
-    let client = http();
+    let client = http()?;
     match p.kind {
         Kind::GithubApp => Ok(()),
         Kind::GithubToken => {
@@ -470,7 +474,7 @@ pub async fn ensure_webhook(p: &Provider, repo: &str, hook_url: &str) -> Result<
 
 /// Repositories the provider can see, for the repository picker.
 pub async fn repos(p: &Provider) -> Result<Vec<String>> {
-    let client = http();
+    let client = http()?;
     let names = |v: Vec<Value>, key: &str| -> Vec<String> { v.into_iter().filter_map(|r| r[key].as_str().map(String::from)).collect() };
     Ok(match p.kind {
         Kind::GithubApp => {
@@ -524,7 +528,7 @@ pub async fn repos(p: &Provider) -> Result<Vec<String>> {
 
 /// Turn a GitHub App manifest code into a stored provider.
 pub async fn finish_github_manifest(app: &App, provider_id: &str, code: &str) -> Result<(String, String)> {
-    let v: Value = http()
+    let v: Value = http()?
         .post(format!("https://api.github.com/app-manifests/{code}/conversions"))
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -586,9 +590,9 @@ mod tests {
         let p = Provider { id: "x".into(), kind: Kind::Forgejo, name: "f".into(), base_url: "https://git.example.com".into(), config: json!({ "webhook_secret": "s3cret" }) };
         let body = b"{}";
         let mut h = axum::http::HeaderMap::new();
-        h.insert("x-forgejo-signature", hmac_hex("s3cret", body).parse().unwrap());
+        h.insert("x-forgejo-signature", hmac_hex("s3cret", body).unwrap().parse().unwrap());
         assert!(verify_webhook(&p, &h, body));
-        h.insert("x-forgejo-signature", hmac_hex("wrong", body).parse().unwrap());
+        h.insert("x-forgejo-signature", hmac_hex("wrong", body).unwrap().parse().unwrap());
         assert!(!verify_webhook(&p, &h, body));
     }
 }

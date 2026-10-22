@@ -249,11 +249,10 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
             if matches!(spec.source, Source::Compose { .. }) {
                 return Err(ApiError::bad_request("use kind \"compose\" for Compose stacks"));
             }
-            if let Source::Image { image } = &spec.source {
-                if image.trim().is_empty() {
+            if let Source::Image { image } = &spec.source
+                && image.trim().is_empty() {
                     return Err(ApiError::bad_request("pick an image or a repository"));
                 }
-            }
         }
         "compose" => {
             spec.compose.get_or_insert_with(Default::default);
@@ -264,7 +263,7 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
         "database" => {
             let db = b.database.or(spec.database.take()).ok_or_else(|| ApiError::bad_request("pick a database engine"))?;
             let (url, url_var) = prepare_database(&app, &p, &name, db, &mut spec, &mut env).await?;
-            if store::project_vars(&app, &p.id)?.get(&url_var).is_none() {
+            if !store::project_vars(&app, &p.id)?.contains_key(&url_var) {
                 store::set_project_var(&app, &p.id, &url_var, Some(&url))?;
             }
             reveal_once = Some(json!({ "url": url, "project_var": url_var }));
@@ -279,9 +278,10 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
     }
     let id = util::id();
     let now = util::now();
+    let spec_json = serde_json::to_string(&spec)?;
     app.db.conn().execute(
         "INSERT INTO services (id, project_id, name, kind, spec, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-        params![id, p.id, name, b.kind, serde_json::to_string(&spec).unwrap(), now],
+        params![id, p.id, name, b.kind, spec_json, now],
     )?;
     for (k, v) in &env {
         store::set_env(&app, &id, k, Some(v))?;
@@ -296,7 +296,7 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
 }
 
 async fn prepare_database(
-    app: &AppState,
+    _app: &AppState,
     p: &store::Project,
     name: &str,
     mut db: DatabaseSpec,
@@ -360,7 +360,7 @@ pub struct UpdateService {
 pub async fn update_service(State(app): State<AppState>, a: Auth, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<UpdateService>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Operator)?;
     let Some(patch) = b.spec else { return Ok(Json(json!({ "spec": s.spec }))) };
-    let mut current = serde_json::to_value(&s.spec).unwrap();
+    let mut current = serde_json::to_value(&s.spec)?;
     super::access::merge(&mut current, &patch);
     let next: ServiceSpec = serde_json::from_value(current).map_err(|e| ApiError::bad_request(format!("invalid spec: {e}")))?;
     check_dangerous(&a, &s.project_id, Some(&s.spec), &next, &app.paths)?;
@@ -499,9 +499,10 @@ pub async fn create_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
     let opts = b.options.unwrap_or_default();
     validate_domain(&host, &path, port, &opts)?;
     let did = util::id();
+    let opts_json = serde_json::to_string(&opts)?;
     app.db.conn().execute(
         "INSERT INTO domains (id, service_id, host, path, port, container, https, via_tunnel, options, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![did, s.id, host, path, port, b.container, b.https.unwrap_or(true), b.via_tunnel.unwrap_or(false), serde_json::to_string(&opts).unwrap(), util::now()],
+        params![did, s.id, host, path, port, b.container, b.https.unwrap_or(true), b.via_tunnel.unwrap_or(false), opts_json, util::now()],
     )?;
     app.audit(Some(&a.0), "domain.create", Some(&s.project_id), Some(&s.id), Some(&host), None);
     crate::proxy::reload(&app);
@@ -517,9 +518,10 @@ pub async fn update_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
     let port = b.port.unwrap_or(d.port);
     let opts = b.options.unwrap_or(d.options);
     validate_domain(&host, &path, port, &opts)?;
+    let opts_json = serde_json::to_string(&opts)?;
     app.db.conn().execute(
         "UPDATE domains SET host = ?1, path = ?2, port = ?3, container = ?4, https = ?5, via_tunnel = ?6, options = ?7 WHERE id = ?8",
-        params![host, path, port, b.container.or(d.container), b.https.unwrap_or(d.https), b.via_tunnel.unwrap_or(d.via_tunnel), serde_json::to_string(&opts).unwrap(), id],
+        params![host, path, port, b.container.or(d.container), b.https.unwrap_or(d.https), b.via_tunnel.unwrap_or(d.via_tunnel), opts_json, id],
     )?;
     app.audit(Some(&a.0), "domain.update", Some(&s.project_id), Some(&s.id), Some(&host), None);
     crate::proxy::reload(&app);

@@ -1,7 +1,9 @@
 mod access;
+mod console;
 mod deploys;
 mod git;
 mod hooks;
+mod observe;
 pub mod projects;
 
 use crate::app::AppState;
@@ -53,6 +55,19 @@ pub fn router(app: AppState) -> Router {
         .route("/api/deploys/{id}/log", get(deploys::log_stream))
         .route("/api/deploys/{id}/cancel", post(deploys::cancel))
         .route("/api/events", get(deploys::events))
+        .route("/api/services/{id}/logs", get(observe::service_logs))
+        .route("/api/services/{id}/logs/stream", get(observe::service_log_stream))
+        .route("/api/services/{id}/console", get(console::console))
+        .route("/api/logs/tugport", get(observe::tugport_logs))
+        .route("/api/logs/usage", get(observe::log_usage))
+        .route("/api/metrics", get(observe::metrics_query))
+        .route("/api/metrics/now", get(observe::metrics_now))
+        .route("/api/docker/usage", get(observe::docker_usage))
+        .route("/api/notifications", get(observe::list_channels).post(observe::create_channel))
+        .route("/api/notifications/{id}", delete(observe::delete_channel))
+        .route("/api/notifications/{id}/test", post(observe::test_channel))
+        .route("/api/registries", get(observe::list_registries).post(observe::create_registry))
+        .route("/api/registries/{id}", delete(observe::delete_registry))
         .route("/api/git/providers", get(git::list).post(git::create))
         .route("/api/git/providers/{id}", delete(git::delete))
         .route("/api/git/providers/{id}/repos", get(git::repos))
@@ -104,11 +119,16 @@ impl From<anyhow::Error> for ApiError {
 
 impl From<rusqlite::Error> for ApiError {
     fn from(e: rusqlite::Error) -> Self {
-        if let rusqlite::Error::SqliteFailure(f, _) = &e {
-            if f.code == rusqlite::ErrorCode::ConstraintViolation {
+        if let rusqlite::Error::SqliteFailure(f, _) = &e
+            && f.code == rusqlite::ErrorCode::ConstraintViolation {
                 return ApiError::conflict("already exists");
             }
-        }
+        anyhow::Error::from(e).into()
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(e: serde_json::Error) -> Self {
         anyhow::Error::from(e).into()
     }
 }
@@ -123,13 +143,11 @@ impl IntoResponse for ApiError {
 /// carry the real address in the last X-Forwarded-For entry.
 pub fn client_ip(parts: &Parts) -> Option<IpAddr> {
     let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip())?;
-    if peer.is_loopback() {
-        if let Some(xff) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(last) = xff.rsplit(',').next().and_then(|s| s.trim().parse().ok()) {
+    if peer.is_loopback()
+        && let Some(xff) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+            && let Some(last) = xff.rsplit(',').next().and_then(|s| s.trim().parse().ok()) {
                 return Some(last);
             }
-        }
-    }
     Some(peer)
 }
 

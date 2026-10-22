@@ -121,7 +121,7 @@ pub async fn service_status(app: &App, s: &Service) -> serde_json::Value {
     } else {
         "running"
     };
-    serde_json::to_value(Status { state, running, desired: s.spec.replicas, live_deploy: live, replicas: reps }).unwrap()
+    serde_json::to_value(Status { state, running, desired: s.spec.replicas, live_deploy: live, replicas: reps }).unwrap_or_default()
 }
 
 pub async fn ensure_network(app: &App, project: &str) -> Result<String> {
@@ -253,6 +253,7 @@ pub fn container_name(s: &Service, deploy_id: &str, replica: u32) -> String {
 }
 
 /// Create (not start) one replica of a service running `image`.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_replica(app: &App, s: &Service, deploy_id: &str, replica: u32, image: &str, img: &ImageInfo, network: &str, publish_ports: bool) -> Result<String> {
     let spec = &s.spec;
     let name = container_name(s, deploy_id, replica);
@@ -487,7 +488,9 @@ pub async fn wait_healthy(app: &App, s: &Service, id: &str, network: &str, timeo
 }
 
 async fn http_ok(ip: &str, port: u16, path: &str, strict: bool) -> bool {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build() else {
+        return false;
+    };
     match client.get(format!("http://{ip}:{port}{path}")).send().await {
         Ok(r) if strict => r.status().is_success() || r.status().is_redirection(),
         Ok(r) => r.status().as_u16() < 500,

@@ -33,7 +33,7 @@ pub fn save_channel(app: &App, kind: &str, name: &str, config: &Value, events: &
     let id = util::id();
     app.db.conn().execute(
         "INSERT INTO notification_channels (id, kind, name, config, events, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, kind, name, app.keys.seal_str(&format!("notify:{id}"), &config.to_string()), serde_json::to_string(events)?, util::now()],
+        params![id, kind, name, app.keys.seal_str(&format!("notify:{id}"), &config.to_string())?, serde_json::to_string(events)?, util::now()],
     )?;
     Ok(id)
 }

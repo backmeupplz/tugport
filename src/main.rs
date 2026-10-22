@@ -1,19 +1,25 @@
 mod acme;
+mod alerts;
 mod api;
 mod app;
 mod auth;
+mod autoupdate;
 mod builder;
+mod cleanup;
 mod compose;
 mod crypto;
 mod databases;
 mod db;
 mod deploy;
 mod git;
+mod logs;
+mod metrics;
 mod model;
 mod notify;
 mod paths;
 mod proc;
 mod proxy;
+mod registry;
 mod runtime;
 mod secrets;
 mod shim;
@@ -120,13 +126,16 @@ fn install_init_binary(app: &app::App) -> Result<()> {
 }
 
 async fn serve() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "tugport=info".into()))
-        .init();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
+    use tracing_subscriber::prelude::*;
     let paths = paths::Paths::from_env();
     paths.ensure().with_context(|| format!("creating {} and {}", paths.data.display(), paths.etc.display()))?;
+    let selflog = logs::SelfLog::new(paths.logs().join("_tugport"));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "tugport=info".into()))
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(logs::SelfLogHandle(selflog.clone())))
+        .init();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let master = match crypto::load_master(&paths.etc) {
         Ok(k) => k,
         Err(_) if !paths.etc.join("master.key").exists() && !paths.etc.join("master.key.cred").exists() => {
@@ -155,7 +164,10 @@ async fn serve() -> Result<()> {
         events,
         deployer: deploy::Deployer::default(),
         build_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-        proxy: proxy::Proxy::new(),
+        proxy: proxy::Proxy::new()?,
+        logs: tokio::sync::broadcast::channel(8192).0,
+        selflog,
+        metrics: metrics::Metrics::default(),
     });
     drop(master);
     install_init_binary(&app)?;
@@ -170,6 +182,11 @@ async fn serve() -> Result<()> {
     let port = |var: &str, default: u16| std::env::var(var).ok().and_then(|p| p.parse().ok()).unwrap_or(default);
     tokio::spawn(proxy::watch(app.clone()));
     tokio::spawn(acme::run(app.clone()));
+    tokio::spawn(logs::collect(app.clone()));
+    tokio::spawn(metrics::sample_loop(app.clone()));
+    tokio::spawn(alerts::watch_events(app.clone()));
+    tokio::spawn(cleanup::run(app.clone()));
+    tokio::spawn(autoupdate::run(app.clone()));
     {
         let app = app.clone();
         let (http, https) = (port("TUGPORT_HTTP_PORT", 80), port("TUGPORT_HTTPS_PORT", 443));

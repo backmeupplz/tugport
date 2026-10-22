@@ -25,18 +25,18 @@ impl Keyring {
 
     /// Seal `plain`, binding it to `context` (e.g. `env:<service>:<key>`) so a ciphertext
     /// copied into another row fails to open.
-    pub fn seal(&self, context: &str, plain: &[u8]) -> Vec<u8> {
+    pub fn seal(&self, context: &str, plain: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0u8; 24];
         rand::rng().fill_bytes(&mut nonce);
         let ct = self
             .cipher
             .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad: context.as_bytes() })
-            .expect("xchacha20 encrypt");
+            .map_err(|_| anyhow!("encryption failed for {context}"))?;
         let mut out = Vec::with_capacity(1 + 24 + ct.len());
         out.push(VERSION);
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ct);
-        out
+        Ok(out)
     }
 
     pub fn open(&self, context: &str, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
@@ -50,7 +50,7 @@ impl Keyring {
         Ok(Zeroizing::new(plain))
     }
 
-    pub fn seal_str(&self, context: &str, plain: &str) -> Vec<u8> {
+    pub fn seal_str(&self, context: &str, plain: &str) -> Result<Vec<u8>> {
         self.seal(context, plain.as_bytes())
     }
 
@@ -60,12 +60,12 @@ impl Keyring {
     }
 
     /// Key derived for a purpose (restic repo passwords, signing...): HMAC-SHA256 of the purpose.
-    pub fn derive(&self, purpose: &str) -> String {
+    pub fn derive(&self, purpose: &str) -> Result<String> {
         use hmac::{Hmac, Mac};
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(self.mac_key.as_ref()).expect("hmac key");
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(self.mac_key.as_ref()).map_err(|_| anyhow!("invalid key length"))?;
         mac.update(b"tugport:");
         mac.update(purpose.as_bytes());
-        hex::encode(mac.finalize().into_bytes())
+        Ok(hex::encode(mac.finalize().into_bytes()))
     }
 }
 
@@ -112,7 +112,7 @@ pub fn create_master(etc: &Path) -> Result<(Zeroizing<[u8; 32]>, KeyStore)> {
             .stdin(std::process::Stdio::piped())
             .spawn()?;
         use std::io::Write;
-        child.stdin.take().unwrap().write_all(hex_key.as_bytes())?;
+        child.stdin.take().ok_or_else(|| anyhow!("systemd-creds has no stdin"))?.write_all(hex_key.as_bytes())?;
         if child.wait()?.success() {
             return Ok((key, KeyStore::Tpm));
         }
@@ -159,9 +159,14 @@ fn parse_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
 
 /// Human-friendly recovery key: `TP1-` + base32 in groups of five.
 pub fn recovery_key(key: &[u8; 32]) -> String {
-    let b32 = base32(key);
-    let groups: Vec<&str> = b32.as_bytes().chunks(5).map(|c| std::str::from_utf8(c).unwrap()).collect();
-    format!("TP1-{}", groups.join("-"))
+    let mut out = String::from("TP1-");
+    for (i, c) in base32(key).chars().enumerate() {
+        if i > 0 && i % 5 == 0 {
+            out.push('-');
+        }
+        out.push(c);
+    }
+    out
 }
 
 pub fn parse_recovery(text: &str) -> Result<Zeroizing<[u8; 32]>> {
@@ -225,7 +230,7 @@ mod tests {
     #[test]
     fn seal_roundtrip_and_context_binding() {
         let k = Keyring::new(&[9u8; 32]);
-        let sealed = k.seal_str("env:a:KEY", "hunter2");
+        let sealed = k.seal_str("env:a:KEY", "hunter2").unwrap();
         assert_eq!(&*k.open_str("env:a:KEY", &sealed).unwrap(), "hunter2");
         assert!(k.open_str("env:b:KEY", &sealed).is_err(), "context must bind the ciphertext");
         let mut tampered = sealed.clone();

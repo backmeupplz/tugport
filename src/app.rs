@@ -19,6 +19,9 @@ pub struct App {
     pub deployer: crate::deploy::Deployer,
     pub build_slots: Arc<tokio::sync::Semaphore>,
     pub proxy: crate::proxy::Proxy,
+    pub logs: broadcast::Sender<crate::logs::LogLine>,
+    pub selflog: Arc<crate::logs::SelfLog>,
+    pub metrics: crate::metrics::Metrics,
 }
 
 /// Something that happened, streamed to the UI and API clients that may see it.

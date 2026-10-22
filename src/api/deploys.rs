@@ -206,7 +206,7 @@ pub async fn events(State(app): State<AppState>, a: Auth, Query(q): Query<Events
                 None => p.is_owner,
             };
             let wanted = q_project.as_ref().is_none_or(|x| e.project_id.as_ref() == Some(x)) && q_service.as_ref().is_none_or(|x| e.service_id.as_ref() == Some(x));
-            (visible && wanted).then(|| Ok(sse::Event::default().event(e.kind.clone()).data(serde_json::to_string(&e).unwrap())))
+            (visible && wanted).then(|| Ok(sse::Event::default().event(e.kind.clone()).data(serde_json::to_string(&e).unwrap_or_default())))
         }
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

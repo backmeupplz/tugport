@@ -42,6 +42,19 @@ pub fn valid_name(name: &str) -> bool {
         && !name.ends_with('-')
 }
 
+/// Lock a mutex, recovering the data if a panicking thread poisoned it.
+pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn read<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn ct_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()

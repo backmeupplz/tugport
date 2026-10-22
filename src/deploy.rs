@@ -116,7 +116,7 @@ pub fn enqueue(app: &AppState, s: &Service, req: Request) -> Result<String> {
     )?;
     announce(app, s, &id, "queued");
     let policy = s.spec.deploy_policy.unwrap_or(app.settings().deploy_policy);
-    let mut queues = app.deployer.queues.lock().unwrap();
+    let mut queues = crate::util::lock(&app.deployer.queues);
     let q = queues.entry(s.id.clone()).or_default();
     if let Some((running, token)) = &q.running {
         if policy == DeployPolicy::Cancel {
@@ -138,14 +138,13 @@ pub fn enqueue(app: &AppState, s: &Service, req: Request) -> Result<String> {
 
 /// Cancel a running or waiting deploy.
 pub fn cancel(app: &App, deploy_id: &str) -> bool {
-    let mut queues = app.deployer.queues.lock().unwrap();
+    let mut queues = crate::util::lock(&app.deployer.queues);
     for q in queues.values_mut() {
-        if let Some((id, token)) = &q.running {
-            if id == deploy_id {
+        if let Some((id, token)) = &q.running
+            && id == deploy_id {
                 token.cancel();
                 return true;
             }
-        }
         if q.waiting.as_deref() == Some(deploy_id) {
             q.waiting = None;
             set_status(app, deploy_id, "cancelled", None);
@@ -156,7 +155,7 @@ pub fn cancel(app: &App, deploy_id: &str) -> bool {
 }
 
 pub fn cancel_all(app: &App, service_id: &str) {
-    let mut queues = app.deployer.queues.lock().unwrap();
+    let mut queues = crate::util::lock(&app.deployer.queues);
     if let Some(q) = queues.get_mut(service_id) {
         if let Some(w) = q.waiting.take() {
             set_status(app, &w, "cancelled", None);
@@ -170,7 +169,7 @@ pub fn cancel_all(app: &App, service_id: &str) {
 async fn worker(app: AppState, service_id: String, mut deploy_id: String, mut token: CancellationToken) {
     loop {
         run(&app, &service_id, &deploy_id, token.clone()).await;
-        let mut queues = app.deployer.queues.lock().unwrap();
+        let mut queues = crate::util::lock(&app.deployer.queues);
         let q = queues.entry(service_id.clone()).or_default();
         match q.waiting.take() {
             Some(next) => {
@@ -213,7 +212,7 @@ impl DeployLog {
     pub fn line(&self, text: &str) {
         let text = self.masker.mask(text.trim_end());
         let ts = util::now_ms();
-        if let Some(f) = self.file.lock().unwrap().as_mut() {
+        if let Some(f) = crate::util::lock(&self.file).as_mut() {
             let _ = writeln!(f, "{ts}\t{text}");
         }
         self.app.emit(

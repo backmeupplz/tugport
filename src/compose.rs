@@ -72,7 +72,7 @@ pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Resul
     for (name, svc) in services.iter_mut() {
         let name = name.as_str().unwrap_or_default().to_string();
         let Some(svc) = svc.as_mapping_mut() else { continue };
-        let labels = entry_map(svc, "labels");
+        let Some(labels) = entry_map(svc, "labels") else { continue };
         for (k, v) in [
             (runtime::L_MANAGED, "true".to_string()),
             (runtime::L_PROJECT, s.project_id.clone()),
@@ -83,8 +83,13 @@ pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Resul
             labels.insert(Value::String(k.into()), Value::String(v));
         }
         if !svc.contains_key("logging") {
-            let logging: Value = serde_yaml::from_str("driver: json-file\noptions:\n  max-size: 10m\n  max-file: \"3\"").unwrap();
-            svc.insert("logging".into(), logging);
+            let mut options = Mapping::new();
+            options.insert("max-size".into(), "10m".into());
+            options.insert("max-file".into(), "3".into());
+            let mut logging = Mapping::new();
+            logging.insert("driver".into(), "json-file".into());
+            logging.insert("options".into(), Value::Mapping(options));
+            svc.insert("logging".into(), Value::Mapping(logging));
         }
         if !svc.contains_key("restart") {
             svc.insert("restart".into(), "unless-stopped".into());
@@ -107,7 +112,11 @@ pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Resul
             m.insert(Value::String(network.into()), Value::Mapping(cfg));
         }
     }
-    let networks = doc.as_mapping_mut().unwrap().entry("networks".into()).or_insert_with(|| Value::Mapping(Mapping::new()));
+    let root = doc.as_mapping_mut().ok_or_else(|| anyhow!("the compose file is not a mapping"))?;
+    let networks = root.entry("networks".into()).or_insert_with(|| Value::Mapping(Mapping::new()));
+    if networks.is_null() {
+        *networks = Value::Mapping(Mapping::new());
+    }
     if let Value::Mapping(m) = networks {
         let mut ext = Mapping::new();
         ext.insert("external".into(), Value::Bool(true));
@@ -116,19 +125,23 @@ pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Resul
     Ok(serde_yaml::to_string(&doc)?)
 }
 
-fn entry_map<'a>(svc: &'a mut Mapping, key: &str) -> &'a mut Mapping {
+/// The mapping under `key`, converting the `["a=b"]` list form; None if it holds something else.
+fn entry_map<'a>(svc: &'a mut Mapping, key: &str) -> Option<&'a mut Mapping> {
     let v = svc.entry(key.into()).or_insert_with(|| Value::Mapping(Mapping::new()));
-    if let Value::Sequence(list) = v {
-        // `labels: ["a=b"]` form.
-        let mut m = Mapping::new();
-        for item in list.drain(..) {
-            if let Some((k, val)) = item.as_str().and_then(|s| s.split_once('=')) {
-                m.insert(k.into(), val.into());
+    match v {
+        Value::Null => *v = Value::Mapping(Mapping::new()),
+        Value::Sequence(list) => {
+            let mut m = Mapping::new();
+            for item in list.drain(..) {
+                if let Some((k, val)) = item.as_str().and_then(|s| s.split_once('=')) {
+                    m.insert(k.into(), val.into());
+                }
             }
+            *v = Value::Mapping(m);
         }
-        *v = Value::Mapping(m);
+        _ => {}
     }
-    v.as_mapping_mut().unwrap()
+    v.as_mapping_mut()
 }
 
 pub async fn down(app: &App, s: &Service, volumes: bool) -> Result<()> {

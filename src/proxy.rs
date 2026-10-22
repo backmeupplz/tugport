@@ -72,13 +72,13 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let mut conn = HttpConnector::new();
         conn.set_connect_timeout(Some(Duration::from_secs(5)));
         conn.set_nodelay(true);
-        let self_signed = rcgen::generate_simple_self_signed(vec!["tugport.invalid".into()]).expect("self-signed certificate");
-        let fallback = certified_key(&self_signed.cert.pem(), &self_signed.signing_key.serialize_pem()).expect("fallback key");
-        Proxy {
+        let self_signed = rcgen::generate_simple_self_signed(vec!["tugport.invalid".into()])?;
+        let fallback = certified_key(&self_signed.cert.pem(), &self_signed.signing_key.serialize_pem())?;
+        Ok(Proxy {
             routes: RwLock::new(Arc::new(Routes::default())),
             certs: RwLock::new(HashMap::new()),
             fallback: Arc::new(fallback),
@@ -89,19 +89,19 @@ impl Proxy {
             http1: Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).build(conn.clone()),
             h2c: Client::builder(TokioExecutor::new()).http2_only(true).build(conn),
             auth_cache: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn routes(&self) -> Arc<Routes> {
-        self.routes.read().unwrap().clone()
+        crate::util::read(&self.routes).clone()
     }
 
     pub fn set_cert(&self, host: &str, key: CertifiedKey) {
-        self.certs.write().unwrap().insert(host.to_string(), Arc::new(key));
+        crate::util::write(&self.certs).insert(host.to_string(), Arc::new(key));
     }
 
     pub fn has_cert(&self, host: &str) -> bool {
-        self.certs.read().unwrap().contains_key(host)
+        crate::util::read(&self.certs).contains_key(host)
     }
 }
 
@@ -122,7 +122,7 @@ impl std::fmt::Debug for Resolver {
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let p = &self.0.proxy;
-        let certs = p.certs.read().unwrap();
+        let certs = crate::util::read(&p.certs);
         hello.server_name().and_then(|n| certs.get(&n.to_ascii_lowercase()).cloned()).or_else(|| Some(p.fallback.clone()))
     }
 }
@@ -225,7 +225,7 @@ pub async fn watch(app: AppState) {
     }
     loop {
         match build_routes(&app).await {
-            Ok(r) => *app.proxy.routes.write().unwrap() = Arc::new(r),
+            Ok(r) => *crate::util::write(&app.proxy.routes) = Arc::new(r),
             Err(e) => tracing::error!("building routes: {e:#}"),
         }
         tokio::select! {
@@ -255,10 +255,7 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
         let Ok((stream, peer)) = https.accept().await else { continue };
         let (app, tls) = (app.clone(), tls.clone());
         tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
-                Ok(Ok(s)) => serve_conn(app, TokioIo::new(s), peer, true).await,
-                _ => {}
-            }
+            if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await { serve_conn(app, TokioIo::new(s), peer, true).await }
         });
     }
 }
@@ -295,13 +292,12 @@ where
     let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(io, svc).await;
 }
 
-fn full(status: StatusCode, content_type: &str, body: impl Into<Bytes>) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Full::new(body.into()).map_err(|e| match e {}).boxed())
-        .unwrap()
+fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response<Body> {
+    let mut r = Response::new(Full::new(body.into()).map_err(|e| match e {}).boxed());
+    *r.status_mut() = status;
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
 }
 
 fn redirect(status: StatusCode, to: &str) -> Response<Body> {
@@ -357,14 +353,13 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     let host = host_of(&req);
     let path = req.uri().path().to_string();
 
-    if !tls {
-        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-            return match app.proxy.challenges.lock().unwrap().get(token) {
+    if !tls
+        && let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+            return match crate::util::lock(&app.proxy.challenges).get(token) {
                 Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth.clone()),
                 None => full(StatusCode::NOT_FOUND, "text/plain", "unknown challenge"),
             };
         }
-    }
 
     let routes = app.proxy.routes();
     let Some(route) = routes.find(&host, &path) else {
@@ -412,7 +407,7 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     }
 
     if let Some(sid) = &route.service_id {
-        let mut t = app.proxy.traffic.lock().unwrap();
+        let mut t = crate::util::lock(&app.proxy.traffic);
         let e = t.entry(sid.clone()).or_default();
         e.requests += 1;
         e.last_at = crate::util::now();
@@ -491,8 +486,8 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
         Err(_) => return error_page(Some(&route), StatusCode::GATEWAY_TIMEOUT, "Gateway timeout", "The service took too long to answer."),
     };
 
-    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        if let Some(client_upgrade) = client_upgrade {
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS
+        && let Some(client_upgrade) = client_upgrade {
             let (mut rparts, rbody) = resp.into_parts();
             let mut upstream_resp = Response::from_parts(rparts.clone(), rbody);
             let upstream_upgrade = hyper::upgrade::on(&mut upstream_resp);
@@ -504,13 +499,11 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
             rparts.headers.remove(header::CONTENT_LENGTH);
             return Response::from_parts(rparts, Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         }
-    }
     let (mut rparts, rbody) = resp.into_parts();
-    if (502..=504).contains(&rparts.status.as_u16()) {
-        if let Some(custom) = route.options.error_pages.get(&rparts.status.as_u16()) {
+    if (502..=504).contains(&rparts.status.as_u16())
+        && let Some(custom) = route.options.error_pages.get(&rparts.status.as_u16()) {
             return full(rparts.status, "text/html; charset=utf-8", custom.clone());
         }
-    }
     strip_hop_headers(&mut rparts.headers, false);
     Response::from_parts(rparts, rbody.map_err(|e| Box::new(e) as BoxErr).boxed())
 }
@@ -531,7 +524,7 @@ fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
     };
     let key = crate::util::sha256_hex(format!("{}|{creds}|{:?}", route.path, route.service_id));
     let now = crate::util::now();
-    if app.proxy.auth_cache.lock().unwrap().get(&key).is_some_and(|exp| *exp > now) {
+    if crate::util::lock(&app.proxy.auth_cache).get(&key).is_some_and(|exp| *exp > now) {
         return true;
     }
     let Ok(decoded) = crate::crypto::unb64(creds) else { return false };
@@ -539,11 +532,12 @@ fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
     let Some((user, pass)) = decoded.split_once(':') else { return false };
     let ok = route.options.basic_auth.iter().any(|u| u.user == user && crate::auth::verify_password(pass, &u.hash));
     if ok {
-        app.proxy.auth_cache.lock().unwrap().insert(key, now + 600);
+        crate::util::lock(&app.proxy.auth_cache).insert(key, now + 600);
     }
     ok
 }
 
+#[allow(clippy::result_large_err)]
 async fn forward_auth(
     app: &App,
     fa: &crate::model::ForwardAuth,
@@ -553,7 +547,9 @@ async fn forward_auth(
     client: IpAddr,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, Response<Body>> {
     let _ = app;
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build() else {
+        return Err(page(StatusCode::BAD_GATEWAY, "Sign-in service unavailable", "Tugport could not create an HTTP client."));
+    };
     let mut r = http
         .get(&fa.url)
         .header("x-forwarded-method", req.method().as_str())

@@ -20,29 +20,42 @@ pub struct ConsoleQuery {
     container: Option<String>,
 }
 
-pub async fn console(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<ConsoleQuery>, ws: WebSocketUpgrade) -> ApiResult<Response> {
-    let s = service_or_404(&app, &a, &id, Role::Operator)?;
+/// Browsers cannot read why a WebSocket upgrade failed, so refusals after sign-in arrive
+/// on the socket: one `{"error": ...}` message, then close code 4403.
+pub async fn console(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<ConsoleQuery>, ws: WebSocketUpgrade) -> Response {
+    let target = open_target(&app, &a, &id, q.container.as_deref()).await;
+    ws.on_upgrade(move |mut socket| async move {
+        let (docker, cid, compose) = match target {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = socket.send(Message::Text(serde_json::json!({ "error": e.message }).to_string().into())).await;
+                let _ = socket.send(Message::Close(Some(axum::extract::ws::CloseFrame { code: 4403, reason: "refused".into() }))).await;
+                return;
+            }
+        };
+        if let Err(e) = run(docker, cid, compose, socket).await {
+            tracing::debug!("console closed: {e:#}");
+        }
+    })
+}
+
+async fn open_target(app: &AppState, a: &Auth, id: &str, container: Option<&str>) -> ApiResult<(bollard::Docker, String, bool)> {
+    let s = service_or_404(app, a, id, Role::Operator)?;
     if !a.0.can_read_secrets(&s.project_id) {
         return Err(ApiError::forbidden("a shell can read the service's environment, so it needs the secrets:read grant"));
     }
-    let live = runtime::live_deploy(&app, &s.id);
-    let reps = runtime::replicas(&app, &s.id).await?;
+    let live = runtime::live_deploy(app, &s.id);
+    let reps = runtime::replicas(app, &s.id).await?;
     let target = reps
         .iter()
         .filter(|r| r.state == "running")
-        .find(|r| match &q.container {
-            Some(c) => r.id.starts_with(c.as_str()) || r.name == *c,
+        .find(|r| match container {
+            Some(c) => r.id.starts_with(c) || r.name == c,
             None => s.kind == "compose" || live.as_deref().is_none_or(|l| r.deploy == l),
         })
         .ok_or_else(|| ApiError::bad_request("no running container to open a shell in"))?;
     app.audit(Some(&a.0), "console.open", Some(&s.project_id), Some(&s.id), Some(&target.name), None);
-    let docker = app.docker_on(&target.node)?;
-    let (cid, compose) = (target.id.clone(), s.kind == "compose");
-    Ok(ws.on_upgrade(move |socket| async move {
-        if let Err(e) = run(docker, cid, compose, socket).await {
-            tracing::debug!("console closed: {e:#}");
-        }
-    }))
+    Ok((app.docker_on(&target.node)?, target.id.clone(), s.kind == "compose"))
 }
 
 async fn run(docker: bollard::Docker, container: String, compose: bool, socket: WebSocket) -> anyhow::Result<()> {

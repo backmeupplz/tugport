@@ -46,6 +46,7 @@ pub struct Domain {
     pub container: Option<String>,
     pub https: bool,
     pub via_tunnel: bool,
+    #[serde(serialize_with = "crate::model::public_options")]
     pub options: DomainOptions,
 }
 

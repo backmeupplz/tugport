@@ -202,6 +202,7 @@ async fn serve() -> Result<()> {
     }
     install_init_binary(&app)?;
     deploy::recover_interrupted(&app)?;
+    backup::recover_interrupted(&app)?;
     match secrets::rematerialize(&app).await {
         Ok(n) if n > 0 => tracing::info!("restored secrets for {n} containers"),
         Ok(_) => {}

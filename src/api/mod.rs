@@ -42,11 +42,12 @@ pub fn router(app: AppState) -> Router {
         .route("/api/projects/{id}/members", get(projects::list_members))
         .route("/api/projects/{id}/members/{user}", put(projects::set_member))
         .route("/api/projects/{id}/services", post(projects::create_service))
+        .route("/api/services", get(projects::list_services))
         .route("/api/services/{id}", get(projects::get_service).patch(projects::update_service).delete(projects::delete_service))
         .route("/api/services/{id}/env", get(projects::get_env).put(projects::put_env))
         .route("/api/services/{id}/files", get(projects::list_files).put(projects::put_file))
         .route("/api/services/{id}/domains", get(projects::list_domains).post(projects::create_domain))
-        .route("/api/services/{id}/hook", post(projects::rotate_hook))
+        .route("/api/services/{id}/hook", get(projects::get_hook).post(projects::rotate_hook))
         .route("/api/services/{id}/deploy-key", post(git::deploy_key))
         .route("/api/services/{id}/deploy", post(deploys::deploy))
         .route("/api/services/{id}/deploys", get(deploys::list))
@@ -96,7 +97,21 @@ pub fn router(app: AppState) -> Router {
         // Easypanel's deploy webhook path, so migrated repositories keep deploying.
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .fallback(crate::web::static_handler)
+        .layer(axum::middleware::from_fn(json_errors))
         .with_state(app)
+}
+
+/// Axum answers malformed bodies with plain text; API clients get `{"error": ...}` like everywhere else.
+async fn json_errors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let api = req.uri().path().starts_with("/api/");
+    let resp = next.run(req).await;
+    let status = resp.status();
+    let plain = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("text/plain"));
+    if !api || !plain || !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap_or_default();
+    ApiError::new(status, String::from_utf8_lossy(&body).trim()).into_response()
 }
 
 /// Only the deploy webhooks, for listeners exposed to the internet.
@@ -106,6 +121,12 @@ pub fn hooks_router(app: AppState) -> Router {
         .route("/api/hooks/git/{provider}", post(hooks::git_hook))
         .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .with_state(app)
+}
+
+/// For `Option<Option<T>>` body fields: tells null (`Some(None)`, clear it) from a
+/// field left out (`None`, keep it). Use with `#[serde(default, deserialize_with = "present")]`.
+pub fn present<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 #[derive(Debug)]

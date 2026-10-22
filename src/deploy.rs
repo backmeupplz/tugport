@@ -408,6 +408,7 @@ pub async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, 
     }
 
     runtime::set_live_deploy(app, &s.id, deploy_id)?;
+    app.db.set_state(&format!("exposed:{}", s.id), &serde_json::to_string(&img.exposed)?)?;
     app.db.set_state(&format!("nodes:{}", s.id), &distinct.iter().map(|d| d.id.as_str()).collect::<Vec<_>>().join(","))?;
     app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("stopped:{}", s.id)])?;
     crate::proxy::reload(app);

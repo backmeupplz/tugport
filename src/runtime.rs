@@ -66,7 +66,21 @@ pub fn dockers(app: &App) -> Vec<(String, bollard::Docker)> {
 
 /// Containers that belong to a service on every reachable server, newest first.
 pub async fn replicas(app: &App, service_id: &str) -> Result<Vec<Replica>> {
-    let opts = ListContainersOptions { all: true, filters: Some(label_filter(&[(L_SERVICE, service_id)])), ..Default::default() };
+    Ok(list(app, &[(L_SERVICE, service_id)]).await?.into_iter().map(|(_, r)| r).collect())
+}
+
+/// Every service's containers, with one listing per server.
+pub async fn all_replicas(app: &App) -> Result<HashMap<String, Vec<Replica>>> {
+    let mut out: HashMap<String, Vec<Replica>> = HashMap::new();
+    for (service, r) in list(app, &[(L_MANAGED, "true")]).await? {
+        out.entry(service).or_default().push(r);
+    }
+    Ok(out)
+}
+
+/// (service id, replica) of matching containers on every reachable server, newest first.
+async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica)>> {
+    let opts = ListContainersOptions { all: true, filters: Some(label_filter(labels)), ..Default::default() };
     let lists = futures_util::future::join_all(dockers(app).into_iter().map(|(node, docker)| {
         let opts = opts.clone();
         async move { (node, docker.list_containers(Some(opts)).await) }
@@ -89,7 +103,8 @@ pub async fn replicas(app: &App, service_id: &str) -> Result<Vec<Replica>> {
             let health = c.status.as_deref().and_then(|s| {
                 ["(healthy)", "(unhealthy)", "(health: starting)"].iter().find(|h| s.contains(*h)).map(|h| h.trim_matches(['(', ')']).replace("health: ", ""))
             });
-            out.push(Replica {
+            let Some(service) = labels.get(L_SERVICE).cloned() else { continue };
+            out.push((service, Replica {
                 id: c.id.unwrap_or_default(),
                 name: c.names.and_then(|n| n.first().cloned()).unwrap_or_default().trim_start_matches('/').to_string(),
                 deploy: labels.get(L_DEPLOY).cloned().unwrap_or_default(),
@@ -101,10 +116,10 @@ pub async fn replicas(app: &App, service_id: &str) -> Result<Vec<Replica>> {
                 created: c.created.unwrap_or_default(),
                 node: node.clone(),
                 compose_service: labels.get("com.docker.compose.service").cloned(),
-            });
+            }));
         }
     }
-    out.sort_by(|a, b| b.created.cmp(&a.created).then(a.replica.cmp(&b.replica)));
+    out.sort_by(|(_, a), (_, b)| b.created.cmp(&a.created).then(a.replica.cmp(&b.replica)));
     Ok(out)
 }
 
@@ -127,7 +142,11 @@ pub struct Status {
 }
 
 pub async fn service_status(app: &App, s: &Service) -> serde_json::Value {
-    let reps = replicas(app, &s.id).await.unwrap_or_default();
+    status_of(app, s, replicas(app, &s.id).await.unwrap_or_default())
+}
+
+/// A service's state from its containers.
+pub fn status_of(app: &App, s: &Service, reps: Vec<Replica>) -> serde_json::Value {
     let live = live_deploy(app, &s.id);
     let current: Vec<&Replica> = reps.iter().filter(|r| live.as_deref().is_none_or(|l| r.deploy == l)).collect();
     let running = current.iter().filter(|r| r.state == "running").count();
@@ -534,7 +553,7 @@ pub async fn remove_service(app: &App, s: &Service, volumes: bool) -> Result<()>
             }
         }
     }
-    for key in ["pin", "nodes", "stopped"] {
+    for key in ["pin", "nodes", "stopped", "hook", "live", "asleep", "exposed"] {
         let _ = app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("{key}:{}", s.id)]);
     }
     let _ = std::fs::remove_dir_all(app.paths.sources().join(&s.id));

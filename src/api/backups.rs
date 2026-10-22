@@ -191,7 +191,10 @@ pub async fn run_job(State(app): State<AppState>, a: Auth, Path(id): Path<String
     let (j, project) = job_project(&app, &id)?;
     require_job(&a, &project, Role::Operator)?;
     app.audit(Some(&a.0), "backup.run", project.as_deref(), j.service_id.as_deref(), Some(&j.kind), None);
-    let run = backup::run_job(&app, &j.id).await.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // The run finishes even if the caller goes away.
+    let (app2, jid) = (app.clone(), j.id.clone());
+    let run = tokio::spawn(async move { backup::run_job(&app2, &jid).await }).await.map_err(anyhow::Error::from)?;
+    let run = run.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(json!({ "run_id": run })))
 }
 
@@ -238,6 +241,8 @@ pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<St
         }
     }
     app.audit(Some(&a.0), if test { "backup.test_restore" } else { "backup.restore" }, project.as_deref(), j.service_id.as_deref(), Some(&run_id), None);
-    let msg = backup::restore(&app, &run_id, test).await.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let (app2, rid) = (app.clone(), run_id.clone());
+    let msg = tokio::spawn(async move { backup::restore(&app2, &rid, test).await }).await.map_err(anyhow::Error::from)?;
+    let msg = msg.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true, "message": msg })))
 }

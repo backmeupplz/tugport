@@ -133,10 +133,13 @@ Even on a single server, the panel drives Docker through the same node interface
   - Inside the container they are written to memory-only storage.
   - Tugport's init shim loads them into the app's environment, so they never appear on disk, in `docker inspect` or in image layers. Builds receive them as BuildKit secrets, never as build arguments.
 - **Secret values are masked** in logs, API, CLI and MCP output, notifications and error messages. Agents can write secrets but cannot read them without an explicit grant.
-- **No outbound leaks:**
-  - Tugport sends no telemetry.
-  - Its own outbound calls never carry environment values.
-  - An optional per-service outbound allowlist blocks connections to anywhere else.
+- **A compromised service cannot steal other services' secrets:**
+  - Each container only ever sees its own secrets, delivered as a memory-only file mounted into that container alone.
+  - Services cannot mount the Docker socket, Tugport's data or another service's secrets unless an admin explicitly allows it.
+  - Containers cannot reach the panel or Tugport's internal endpoints, and there is no metadata endpoint to query.
+  - Projects sit on separate networks, so a service cannot reach another project's databases.
+  - Containers start with `no-new-privileges` and are never privileged unless an admin allows it.
+- **No telemetry:** Tugport sends none, and its own outbound calls never carry environment values.
 
 ### Settings
 - **About:** the version, the commit and a link to the source code (github.com/backmeupplz/tugport).

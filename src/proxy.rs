@@ -241,8 +241,7 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
     };
-    let http = bind(http_port).await?;
-    let https = bind(https_port).await?;
+    let (http, https) = tokio::try_join!(bind(http_port), bind(https_port))?;
     tracing::info!("proxy listening on :{http_port} and :{https_port}");
     let a = app.clone();
     tokio::spawn(async move {
@@ -264,10 +263,24 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
     }
 }
 
+/// Bind, waiting while another proxy (Traefik during a migration) still holds the port.
 async fn bind(port: u16) -> Result<tokio::net::TcpListener> {
-    match tokio::net::TcpListener::bind(("::", port)).await {
-        Ok(l) => Ok(l),
-        Err(_) => Ok(tokio::net::TcpListener::bind(("0.0.0.0", port)).await?),
+    let mut warned = false;
+    loop {
+        match tokio::net::TcpListener::bind(("::", port)).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(_) => match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+                Ok(l) => return Ok(l),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        if !warned {
+            tracing::warn!("port {port} is in use; the proxy will take it over as soon as it is free");
+            warned = true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

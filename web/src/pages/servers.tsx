@@ -1,9 +1,10 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { route } from "preact-router";
+import { getCurrentUrl, route } from "preact-router";
 import { canSeeServers, del, patch, post, useApi, useMe, type Event, type Node } from "../api";
-import { Card, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, NameInput, Note, Page, Pill, toast, useSubmit } from "../ui";
+import { Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, NameInput, Note, Page, Pill, toast, useSubmit } from "../ui";
 import { ago, bytes, labelsText, parseLabels } from "../util";
+import { PROVIDERS, ServerTabs, machineText, useCloud, type Account, type Machine, type Pool } from "./cloud";
 import { DockerUsage, ServerCharts, TugportLog } from "./observe";
 
 type Nodes = { mesh: boolean; nodes: Node[] };
@@ -37,9 +38,18 @@ const NoAccess = () => (
 export function Servers(_: { path?: string }) {
   const me = useMe();
   const r = useServers();
+  const cloud = useCloud();
   const [adding, setAdding] = useState(false);
   const owner = me.principal.is_owner;
   if (!canSeeServers(me)) return <NoAccess />;
+  const machines = cloud.machines.data?.servers ?? [];
+  const creating = machines.filter((m) => m.status === "creating").length;
+  const failed = machines.filter((m) => m.status === "failed").length;
+  const provider = (n: Node) => {
+    const m = machines.find((x) => x.node_id === n.id);
+    const kind = m && cloud.accounts.data?.accounts.find((a) => a.id === m.account_id)?.kind;
+    return m ? (kind ? (PROVIDERS[kind] ?? kind) : "a cloud provider") : "";
+  };
   return (
     <Page
       title="Servers"
@@ -52,14 +62,26 @@ export function Servers(_: { path?: string }) {
         )
       }
     >
+      <ServerTabs current="list" />
       <Loaded r={r}>
         {(d) => (
           <div class="space-y-6">
+            {(creating > 0 || failed > 0) && (
+              <Note>
+                {creating > 0 && `Tugport is setting up ${creating === 1 ? "a machine, which shows up here once it joins" : `${creating} machines, which show up here once they join`}. `}
+                {failed > 0 && `${failed === 1 ? "A machine" : `${failed} machines`} could not be created. `}
+                The{" "}
+                <a class="link" href="/servers/cloud">
+                  Cloud tab
+                </a>{" "}
+                has the details.
+              </Note>
+            )}
             <ul class="grid gap-4 lg:grid-cols-2">
               {d.nodes.map((n) => (
                 <li key={n.id}>
                   <a href={`/servers/${n.id}`} class="card block h-full p-4 hover:border-accent/60">
-                    <Heading node={n} />
+                    <Heading node={n} provider={provider(n)} />
                     {n.status !== "online" && (
                       <p class="mt-2 text-dim">
                         {status(n)[1]}
@@ -97,11 +119,12 @@ export function Servers(_: { path?: string }) {
   );
 }
 
-function Heading({ node: n }: { node: Node }) {
+function Heading({ node: n, provider }: { node: Node; provider: string }) {
   return (
     <div class="flex flex-wrap items-center gap-2">
       <h2 class="min-w-0 truncate text-base font-semibold">{n.name}</h2>
       {n.local && <span class="chip">runs the panel</span>}
+      {provider && <span class="chip">created at {provider}</span>}
       <Pill state={n.status} label={status(n)[0]} class="ml-auto" />
     </div>
   );
@@ -137,10 +160,15 @@ function Facts(props: { node: Node; class?: string }) {
 export function ServerPage(props: { id?: string; path?: string }) {
   const me = useMe();
   const r = useServers();
+  const cloud = useCloud();
   const [editing, setEditing] = useState(false);
   const [removing, setRemoving] = useState(false);
   const id = props.id ?? "local";
   const owner = me.principal.is_owner;
+  const accounts = cloud.accounts.data?.accounts;
+  const machine = cloud.machines.data?.servers.find((m) => m.node_id === id);
+  const pools = useApi<{ pools: Pool[] }>(machine?.pool_id ? "/cloud/pools" : null);
+  const pool = pools.data?.pools.find((p) => p.id === machine?.pool_id);
   if (!canSeeServers(me)) return <NoAccess />;
   const n = r.data?.nodes.find((x) => x.id === id);
   if (!n) {
@@ -194,6 +222,8 @@ export function ServerPage(props: { id?: string; path?: string }) {
             {n.mesh_ip
               ? `Its address on the private network between servers is ${n.mesh_ip}${n.local ? "." : `, and it joined ${ago(n.created_at)}.`}`
               : "It is the only server, so there is no private network between servers yet."}
+            {machine && ` Tugport created this machine, ${machineText(machine, accounts)}.`}
+            {pool && ` It belongs to the pool ${pool.name}, which may remove it while the load stays low.`}
           </p>
         </Card>
         <ServerCharts node={n.id} />
@@ -205,7 +235,7 @@ export function ServerPage(props: { id?: string; path?: string }) {
         )}
       </div>
       {editing && <EditServer node={n} onClose={() => setEditing(false)} onSaved={r.reload} />}
-      {removing && <RemoveServer node={n} onClose={() => setRemoving(false)} />}
+      {removing && <RemoveServer node={n} machine={machine} account={accounts?.find((a) => a.id === machine?.account_id)} onClose={() => setRemoving(false)} />}
     </Page>
   );
 }
@@ -227,6 +257,13 @@ function AddServer(props: { list: Nodes; onClose: () => void }) {
           <p class="text-dim">
             Tugport makes a one-line command for the new server. It installs Docker if the server lacks it, connects the server to your other servers over a private WireGuard
             network, and starts the Tugport agent there.
+          </p>
+          <p class="text-xs text-muted">
+            Tugport can also create a server at Hetzner or AWS for you on the{" "}
+            <a class="link" href="/servers/cloud" onClick={props.onClose}>
+              Cloud tab
+            </a>
+            .
           </p>
           <Field
             label="Panel address"
@@ -332,46 +369,75 @@ function EditServer(props: { node: Node; onClose: () => void; onSaved: () => voi
   );
 }
 
-function RemoveServer(props: { node: Node; onClose: () => void }) {
+function RemoveServer(props: { node: Node; machine?: Machine; account?: Account; onClose: () => void }) {
   const n = props.node;
+  const m = props.machine;
+  const provider = props.account ? (PROVIDERS[props.account.kind] ?? props.account.kind) : "the provider";
+  const online = n.status === "online";
   const [typed, setTyped] = useState("");
+  const [keep, setKeep] = useState(false);
+  const deletes = !!m && !keep;
   const s = useSubmit(async () => {
-    await del(`/nodes/${n.id}`);
-    toast(`Removed ${n.name}.`);
+    const r = await del<{ machine_deleted?: boolean }>(`/nodes/${n.id}${keep ? "?keep_machine=true" : ""}`);
+    toast(r.machine_deleted ? `Removed ${n.name} and deleted its machine at ${provider}.` : `Removed ${n.name}.`);
     props.onClose();
-    route("/servers");
+    // The removal outlives the dialog, so leave the page only while it still shows this server.
+    if (getCurrentUrl() === `/servers/${n.id}`) route("/servers");
   });
   return (
     <Modal open onClose={props.onClose} title={`Remove ${n.name}`}>
       <form class="space-y-4" onSubmit={s.submit}>
         <p class="text-dim">
-          Removing {n.name} takes it off the private network and out of the swarm, and it stops the Tugport agent there. The server then no longer serves your domains, and
-          Tugport starts no containers on it.
+          Removing {n.name} takes it off the private network and out of the swarm, and it stops the Tugport agent there, so the server no longer serves your domains or runs
+          new containers.
         </p>
         <ul class="list-disc space-y-1 pl-5 text-dim">
-          <li>Containers on {n.name} are not deleted, but they stop getting traffic, and Tugport no longer manages them.</li>
-          <li>Services with replicas on it run with fewer replicas until their next deploy places them on the remaining servers.</li>
+          {online ? (
+            <li>First, Tugport moves every service that can move to the other servers, which can take a few minutes. The server gets no new containers meanwhile.</li>
+          ) : (
+            <li>
+              Because {n.name} is not answering, Tugport cannot move its services first. Services that can move start on other servers by themselves once it has been away for
+              two minutes.
+            </li>
+          )}
           <li>
-            Volumes and database files stay on {n.name}. A service that kept its data there starts with empty volumes on another server at its next deploy, so back up that
-            data first.
+            Services that keep data on {n.name}, such as databases and services with volumes, do not move. Their data stays there, and their next deploy starts them on another
+            server with empty volumes, so back the data up first.
           </li>
-          <li>To bring the server back later, run a new join command on it.</li>
+          {!m ? (
+            <li>
+              The machine itself keeps running. Containers left on it get no traffic, and Tugport no longer manages them. To bring it back later, run a new join command on it.
+            </li>
+          ) : deletes ? (
+            <li>Then Tugport deletes the machine at {provider}, together with its disk and everything on it.</li>
+          ) : (
+            <li>The machine keeps running at {provider} and costs money until you delete it there. Containers left on it get no traffic, and Tugport no longer manages them.</li>
+          )}
         </ul>
-        {n.status !== "online" && (
+        {m && (
+          <Check
+            checked={keep}
+            onChange={setKeep}
+            label={`Keep the machine at ${provider}`}
+            hint="Tugport created this machine, so removing the server deletes the machine too unless you keep it."
+          />
+        )}
+        {!online && !deletes && (
           <Note tone="warn">
-            {n.name} is not answering right now, so Tugport cannot tell it to leave. If it comes back, stop its agent there with <code>systemctl disable --now tugport-node</code>.
+            Tugport cannot tell {n.name} to leave while it is not answering. If it comes back, stop its agent there with <code>systemctl disable --now tugport-node</code>.
           </Note>
         )}
         <Field label={`Type ${n.name} to confirm`}>
           <input class="input font-mono" autoComplete="off" spellcheck={false} value={typed} onInput={(e) => setTyped(e.currentTarget.value)} />
         </Field>
         <ErrorBox error={s.error} />
+        {s.busy && <p class="text-xs text-muted">The removal goes on even if you close this dialog.</p>}
         <div class="flex justify-end gap-2">
           <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
+            {s.busy ? "Close" : "Cancel"}
           </button>
           <button class="btn btn-danger" disabled={typed !== n.name || s.busy}>
-            Remove {n.name}
+            {s.busy ? (online ? "Moving services and removing…" : "Removing…") : deletes ? `Remove ${n.name} and delete the machine` : `Remove ${n.name}`}
           </button>
         </div>
       </form>

@@ -298,6 +298,8 @@ const TONE: Record<string, string> = {
   copying: "warn",
   online: "ok",
   joining: "warn",
+  joined: "ok",
+  creating: "warn",
   unreachable: "warn",
   offline: "bad",
 };

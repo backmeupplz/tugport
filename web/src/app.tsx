@@ -5,6 +5,7 @@ import { ApiError, MeContext, canSeeServers, del, get, onUnauthorized, post, put
 import { CodeBlock, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useSubmit } from "./ui";
 import { Access, Audit, NewAgent, NewPerson, UserPage } from "./pages/access";
 import { Login, Setup } from "./pages/auth";
+import { CloudPage } from "./pages/cloud";
 import { ProjectPage, Projects } from "./pages/projects";
 import { ServerPage, Servers } from "./pages/servers";
 import { ServicePage } from "./pages/service";
@@ -190,6 +191,7 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
             <ProjectPage path="/projects/:project" />
             <ServicePage path="/projects/:project/:service/:tab?" />
             <Servers path="/servers" />
+            <CloudPage path="/servers/cloud" />
             <ServerPage path="/servers/:id" />
             <ServerPage path="/server" />
             <Access path="/access" />

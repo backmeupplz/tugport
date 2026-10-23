@@ -145,6 +145,7 @@ function Facts(props: { node: Node; class?: string }) {
     ["Memory", i.memory_total ? bytes(i.memory_total) : "Unknown"],
     ["GPU", i.nvidia ? "NVIDIA" : i.dri ? "Through /dev/dri" : i.nvidia === undefined ? "Unknown" : "None"],
     ["Region", n.region || "None"],
+    ["Public traffic", n.ingress ? (n.local ? "Yes (the panel)" : "Yes, DNS may point here") : "No, only serves forwarded requests"],
     ["Labels", labels.length ? labels.map(([k, v]) => <span key={k} class="chip mr-1 font-mono">{`${k}=${v}`}</span>) : "None"],
     ["Last seen", n.last_seen_at ? ago(n.last_seen_at) : "Never"],
   ];
@@ -335,13 +336,13 @@ function AddServer(props: { list: Nodes; onClose: () => void }) {
 
 function EditServer(props: { node: Node; onClose: () => void; onSaved: () => void }) {
   const n = props.node;
-  const [f, setF] = useState({ name: n.name, region: n.region ?? "", labels: labelsText(n.labels) });
+  const [f, setF] = useState({ name: n.name, region: n.region ?? "", labels: labelsText(n.labels), ingress: n.ingress });
   const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const s = useSubmit(async () => {
     const labels = parseLabels(f.labels);
     if (!labels) throw new Error("Write each label as key=value, separated by commas or new lines.");
     // The API ignores a null region, so an empty string clears it.
-    await patch(`/nodes/${n.id}`, { ...(f.name !== n.name && { name: f.name }), region: f.region.trim(), labels });
+    await patch(`/nodes/${n.id}`, { ...(f.name !== n.name && { name: f.name }), region: f.region.trim(), labels, ...(!n.local && f.ingress !== n.ingress && { ingress: f.ingress }) });
     toast(`Saved ${f.name}.`);
     props.onSaved();
     props.onClose();
@@ -358,6 +359,14 @@ function EditServer(props: { node: Node; onClose: () => void; onSaved: () => voi
         <Field label="Labels (optional)" hint="Write key=value pairs, separated by commas or new lines, like disk=ssd. Services can ask for servers with these labels.">
           <textarea class="input h-20" spellcheck={false} value={f.labels} onInput={(e) => upd({ labels: e.currentTarget.value })} />
         </Field>
+        {!n.local && (
+          <Check
+            checked={f.ingress}
+            onChange={(ingress) => upd({ ingress })}
+            label="Let public DNS point at this server"
+            hint="Turn this on only if a domain's DNS points directly at this server. It then receives the TLS certificates and the sign-in settings for every site. Leave it off and this server only serves requests forwarded from the panel, holding no certificates or passwords."
+          />
+        )}
         <p class="text-xs text-muted">Deploys read these details to pick servers, so running containers stay where they are until their service deploys again.</p>
         <ErrorBox error={s.error} />
         <div class="flex justify-end gap-2">

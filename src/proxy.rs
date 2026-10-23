@@ -32,6 +32,10 @@ pub struct Table {
     /// Node id -> that node's proxy on the mesh.
     pub nodes: HashMap<String, SocketAddr>,
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// This server is not an ingress: it serves only requests forwarded from one (the hop header),
+    /// and its routes carry no auth config, so it must refuse direct public requests.
+    #[serde(default)]
+    pub worker: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -87,6 +91,30 @@ pub struct Route {
 pub struct Routes {
     pub hosts: HashMap<String, Vec<Arc<Route>>>,
     pub trusted: Vec<ipnet::IpNet>,
+    pub worker: bool,
+}
+
+/// What a non-ingress server is given: only the routes it hosts a replica of, with its own
+/// targets and without the secrets it never uses. On a request forwarded from an ingress server
+/// (the hop header) such a server skips auth and counts no traffic, so it needs neither the
+/// basic-auth hashes nor the forward-auth settings, nor other servers' addresses or certificates.
+pub fn reduce_for_worker(table: &Table, node: &str) -> Table {
+    let routes = table
+        .routes
+        .iter()
+        .filter(|r| r.targets.iter().any(|t| t.node == node))
+        .map(|r| {
+            let mut options = r.options.clone();
+            options.basic_auth = vec![];
+            options.forward_auth = None;
+            RouteSpec {
+                options,
+                targets: r.targets.iter().filter(|t| t.node == node).cloned().collect(),
+                ..r.clone()
+            }
+        })
+        .collect();
+    Table { routes, nodes: HashMap::new(), trusted_proxies: vec![], worker: true }
 }
 
 /// Turn a table into routes as seen from node `me`.
@@ -133,7 +161,7 @@ pub fn compile(table: &Table, me: &str) -> Routes {
     if let Ok(mesh) = "10.99.0.0/16".parse() {
         trusted.push(mesh);
     }
-    Routes { hosts, trusted }
+    Routes { hosts, trusted, worker: table.worker }
 }
 
 impl Routes {
@@ -335,7 +363,7 @@ async fn build_table(app: &App) -> Result<Table> {
             });
         }
     }
-    Ok(Table { routes, nodes: crate::nodes::proxy_addresses(app), trusted_proxies: settings.trusted_proxies })
+    Ok(Table { routes, nodes: crate::nodes::proxy_addresses(app), trusted_proxies: settings.trusted_proxies, worker: false })
 }
 
 async fn rebuild(app: &App) {
@@ -554,6 +582,12 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     // A neighbour proxy already chose this server and checked auth: serve from local
     // replicas only. Only Tugport itself can open connections from the mesh.
     let hop = req.headers().contains_key(HOP) && in_mesh(peer.ip());
+    // A non-ingress server has no certificates or auth config; it serves only forwarded
+    // (hop) requests. A direct public request means DNS points at it by mistake, and serving
+    // it would skip the site's basic auth, so refuse.
+    if routes.worker && !hop && route.service_id.is_some() {
+        return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Not an entry point", "This server does not serve this site directly; point its DNS at the panel or mark this server as an ingress.");
+    }
     let forwarded_https = via_trusted && req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     let scheme = if tls || forwarded_https { "https" } else { "http" };
     let path_and_query = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
@@ -920,7 +954,7 @@ mod tests {
             port: 80,
         };
         let nodes = HashMap::from([("local".to_string(), addr("10.99.0.1:80")), ("n1".to_string(), addr("10.99.0.2:80"))]);
-        let table = Table { routes: vec![spec], nodes, trusted_proxies: vec![] };
+        let table = Table { routes: vec![spec], nodes, trusted_proxies: vec![], worker: false };
         let on_panel = compile(&table, "local");
         let r = &on_panel.hosts["a.test"][0];
         assert_eq!(r.upstreams, vec![Upstream::Local(addr("172.20.0.2:80")), Upstream::Node(addr("10.99.0.2:80"))]);
@@ -935,4 +969,40 @@ mod tests {
         assert_eq!(compile(&asleep, "n1").hosts["a.test"][0].upstreams, vec![Upstream::Node(addr("10.99.0.1:80"))]);
         assert!(compile(&asleep, "local").hosts["a.test"][0].upstreams.is_empty());
     }
+
+    #[test]
+    fn worker_table_drops_secrets_and_other_nodes() {
+        use crate::model::BasicUser;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let opts = DomainOptions {
+            basic_auth: vec![BasicUser { user: "a".into(), hash: "secret-hash".into(), password: None }],
+            forward_auth: Some(crate::model::ForwardAuth { url: "https://auth.example".into(), response_headers: vec![] }),
+            ..Default::default()
+        };
+        let mine = RouteSpec {
+            host: "a.test".into(), path: "/".into(), service_id: Some("s".into()), project_id: Some("p".into()),
+            https: true, via_tunnel: false, options: opts,
+            targets: vec![Target { node: "n1".into(), addr: addr("172.21.0.2:80") }, Target { node: "local".into(), addr: addr("172.20.0.2:80") }],
+            asleep: false, port: 80,
+        };
+        let other = RouteSpec {
+            host: "b.test".into(), path: "/".into(), service_id: Some("s2".into()), project_id: Some("p2".into()),
+            https: true, via_tunnel: false, options: DomainOptions::default(),
+            targets: vec![Target { node: "local".into(), addr: addr("172.20.0.3:80") }],
+            asleep: false, port: 80,
+        };
+        let table = Table { routes: vec![mine, other], nodes: HashMap::new(), trusted_proxies: vec!["1.2.3.0/24".parse().unwrap()], worker: false };
+        let reduced = reduce_for_worker(&table, "n1");
+        assert_eq!(reduced.routes.len(), 1, "only routes with a target on n1");
+        let r = &reduced.routes[0];
+        assert_eq!(r.host, "a.test");
+        assert!(r.options.basic_auth.is_empty(), "auth hashes stripped");
+        assert!(r.options.forward_auth.is_none(), "forward auth stripped");
+        assert_eq!(r.targets.len(), 1, "only n1's own target");
+        assert_eq!(r.targets[0].node, "n1");
+        assert!(reduced.nodes.is_empty() && reduced.trusted_proxies.is_empty());
+        assert!(reduced.worker);
+        assert!(compile(&reduced, "n1").worker);
+    }
+
 }

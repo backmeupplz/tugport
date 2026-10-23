@@ -309,13 +309,15 @@ Domains with `via_tunnel: true` are routed through the tunnel and get a proxied 
 
 ## Servers
 
-Servers join over an encrypted WireGuard mesh (10.99.0.0/16, UDP 51820). Containers can never open connections into the mesh. Each server runs `tugport node`; the panel drives its Docker, sends it secrets (kept in its memory-only `/run`), routes and certificates, and collects its logs and metrics.
+Servers join over an encrypted WireGuard mesh (10.99.0.0/16, UDP 51820). Containers can never open connections into the mesh. Each server runs `tugport node`; the panel drives its Docker, sends it secrets (kept in its memory-only `/run`), routes, and collects its logs and metrics. Built images travel panel → server over that same channel, so there is no shared registry.
+
+A server is either **ingress** or not. The panel is always ingress. Only ingress servers may terminate public traffic, so only they receive the TLS certificates, the sign-in (basic-auth) and forward-auth settings, and the full route table; a plain server gets only the routes for the services it hosts and serves nothing but requests forwarded from an ingress server. Turn a server into an ingress (under Servers, or `PATCH /api/nodes/{id}` with `ingress: true`) only when a domain's DNS points directly at it.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/nodes` | `{mesh, nodes: [{id, name, local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at}]}`. Needs the owner or a role on all projects. |
+| GET | `/api/nodes` | `{mesh, nodes: [{id, name, local, ingress, address, mesh_ip, region, labels, status, info, last_seen_at, created_at}]}`. Needs the owner or a role on all projects. |
 | POST | `/api/nodes/join-token` | Owner. `{panel_url?}` returns `{token, command, expires_at}`: a one-hour command to run as root on the new server. The first call turns on the mesh. |
-| PATCH | `/api/nodes/{id}` | Owner. `{name?, region?, labels?}`; `region: null` or `""` clears it. |
+| PATCH | `/api/nodes/{id}` | Owner. `{name?, region?, labels?, ingress?}`; `region: null` or `""` clears it. `ingress` has no effect on the panel (always ingress). |
 | DELETE | `/api/nodes/{id}?keep_machine=true&force=true` | Owner. Moves the server's services elsewhere, removes it from the mesh and, if Tugport created it in a cloud account, deletes the machine unless `keep_machine`. Refused (409) while services keep their data there, unless `force`. Returns `{ok, machine_deleted}`. |
 
 Joining never sends the one-time token: the new server sends an id derived from it and an HMAC that binds the token to its WireGuard key, and the panel's answer (the node key and swarm token) is sealed with a key derived from the token. A join over plain HTTP leaks nothing usable.

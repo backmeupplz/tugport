@@ -202,6 +202,7 @@ export interface Node {
   id: string;
   name: string;
   local: boolean;
+  ingress: boolean;
   mesh_ip: string | null;
   region: string | null;
   labels: Record<string, string>;

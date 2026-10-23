@@ -168,8 +168,8 @@ pub fn install_boot_hook() -> Result<()> {
 /// Docker's bridge networks), so a network created in between is never taken for a host
 /// bridge. Networks created later are covered anyway: Docker names them `br-<id>`, and `br-+`
 /// matches them.
-pub fn guard_panel(port: Option<u16>, host_ifaces: &[String], docker_bridges: &[String]) -> Result<()> {
-    let rules = panel_rules(port, docker_bridges, host_ifaces);
+pub fn guard_panel(ports: &[u16], host_ifaces: &[String], docker_bridges: &[String]) -> Result<()> {
+    let rules = panel_rules(ports, docker_bridges, host_ifaces);
     let v4 = guard_panel_with("iptables", &rules);
     // Only containers on IPv6-enabled networks reach a panel listening on `[::]`.
     let v6 = if Command::new("ip6tables").args(["-w", "10", "-n", "-L", "INPUT"]).output().map(|o| o.status.success()).unwrap_or(false) {
@@ -196,8 +196,10 @@ fn docker_named(iface: &str) -> bool {
 /// `br-wan`, OpenStack's `br-ex`) carry real clients and are let through first; bridges that
 /// Docker was told to name otherwise are added to the defaults. Containers get a reset rather
 /// than silence, so a webhook aimed at the wrong address fails at once.
-fn panel_rules(port: Option<u16>, docker_bridges: &[String], host_ifaces: &[String]) -> Vec<Vec<String>> {
-    let Some(port) = port else { return vec![] };
+fn panel_rules(ports: &[u16], docker_bridges: &[String], host_ifaces: &[String]) -> Vec<Vec<String>> {
+    if ports.is_empty() {
+        return vec![];
+    }
     let mut rules: Vec<Vec<String>> = host_ifaces
         .iter()
         .filter(|i| i.starts_with("br-") && !docker_named(i) && !docker_bridges.contains(i))
@@ -206,9 +208,11 @@ fn panel_rules(port: Option<u16>, docker_bridges: &[String], host_ifaces: &[Stri
     let mut bridges: Vec<&str> = vec!["docker0", "docker_gwbridge", "br-+"];
     bridges.extend(docker_bridges.iter().map(String::as_str).filter(|b| !b.starts_with("br-") && !bridges.contains(b)).collect::<Vec<_>>());
     for b in bridges {
-        rules.push(["-i", b, "-p", "tcp", "--dport", &port.to_string(), "-m", "conntrack", "--ctstate", "NEW", "-j", "REJECT", "--reject-with", "tcp-reset"]
-            .map(String::from)
-            .to_vec());
+        for port in ports {
+            rules.push(["-i", b, "-p", "tcp", "--dport", &port.to_string(), "-m", "conntrack", "--ctstate", "NEW", "-j", "REJECT", "--reject-with", "tcp-reset"]
+                .map(String::from)
+                .to_vec());
+        }
     }
     rules
 }
@@ -257,9 +261,10 @@ mod tests {
     #[test]
     fn panel_rules_cover_container_bridges_only() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert!(super::panel_rules(None, &s(&["docker0"]), &s(&["eth0"])).is_empty());
+        assert!(super::panel_rules(&[], &s(&["docker0"]), &s(&["eth0"])).is_empty());
+        assert_eq!(super::panel_rules(&[8484, 9000], &[], &[]).len(), 6);
         let rules: Vec<String> = super::panel_rules(
-            Some(8484),
+            &[8484],
             &s(&["docker0", "br-0123456789ab", "br-custom", "tp-custom"]),
             &s(&["lo", "eth0", "docker0", "br-0123456789ab", "br-ffffffffffff", "br-custom", "br-ex", "br-wan"]),
         )

@@ -693,11 +693,19 @@ pub async fn host_info(app: &App) -> Value {
     })
 }
 
-/// Keep containers on this server off the raw panel port.
+/// The port the panel listens on. It is bound once (or inherited across a reload), so it can
+/// differ from `panel_listen` until the next restart.
+pub static PANEL_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// Keep containers on this server off the raw panel port, both the bound and the configured one.
 pub async fn guard_panel(app: &App) -> Result<()> {
     let host = mesh::interfaces();
-    let bridges = runtime::bridge_interfaces(&app.docker).await.context("blocking containers from the panel")?;
-    mesh::guard_panel(app.settings().panel_port(), &host, &bridges)
+    let bridges = runtime::bridge_interfaces(&app.docker).await.context("listing bridges to block containers from the panel");
+    let mut ports: Vec<u16> = PANEL_PORT.get().copied().into_iter().chain(app.settings().panel_port()).collect();
+    ports.dedup();
+    // Without Docker's list the default bridges and `br-+` are still covered.
+    let guarded = mesh::guard_panel(&ports, &host, bridges.as_deref().unwrap_or_default());
+    bridges.and(guarded)
 }
 
 /// Check every agent, collect its metrics, and keep routes, peers and certificates fresh.

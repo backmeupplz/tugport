@@ -323,6 +323,12 @@ async fn serve() -> Result<()> {
     }
     let listener = handoff::listener("panel", async { Ok(tokio::net::TcpListener::bind(&listen).await?) }).await.with_context(|| format!("listening on {listen}"))?;
     tracing::info!("tugport {VERSION} panel on http://{listen}");
+    if let Ok(addr) = listener.local_addr() {
+        let _ = nodes::PANEL_PORT.set(addr.port());
+        if let Err(e) = nodes::guard_panel(&app).await {
+            tracing::error!("{e:#}");
+        }
+    }
     axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             tokio::select! {

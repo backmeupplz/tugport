@@ -141,6 +141,19 @@ export function sumUsage(samples: Sample[], id: string) {
   return mine.reduce((a, x) => ({ cpu: a.cpu + x.cpu, memory: a.memory + x.memory, restarts: a.restarts + x.restarts }), { cpu: 0, memory: 0, restarts: 0 });
 }
 
+/** A database's project variable, like varName("db-replica-1", "URL") = "DB_REPLICA_1_URL" (replicas::var_name). */
+export const varName = (service: string, suffix: string) => `${service.toUpperCase().replace(/-/g, "_")}_${suffix}`;
+
+export type MachineSize = { id: string; cpus: number; memory_gb: number; disk_gb?: number | null; arch?: string; prices?: { region: string; hourly: string | number }[] };
+/** Sizes a region offers: Hetzner lists a price for each location that sells a size, AWS lists no prices. */
+export const sizesIn = (sizes: MachineSize[], region: string) => sizes.filter((s) => !s.prices?.length || s.prices.some((p) => p.region === region));
+/** "cx22: 2 CPUs, 4 GB memory, 40 GB disk, x86, €0.0080 an hour" (Hetzner prices are in euros). */
+export function sizeLabel(s: MachineSize, region: string): string {
+  const price = Number(s.prices?.find((p) => p.region === region)?.hourly ?? NaN);
+  const parts = [`${s.cpus} ${s.cpus === 1 ? "CPU" : "CPUs"}`, `${s.memory_gb} GB memory`, s.disk_gb ? `${s.disk_gb} GB disk` : "", s.arch === "arm" ? "Arm" : (s.arch ?? "")];
+  return `${s.id}: ${parts.filter(Boolean).join(", ")}${isNaN(price) ? "" : `, €${price.toFixed(4)} an hour`}`;
+}
+
 /** "10.0.0.7" -> "10.0.0.7/32": the API takes CIDR ranges only. */
 export const cidr = (s: string) => (s.includes("/") ? s : s.includes(":") ? `${s}/128` : `${s}/32`);
 /** "" -> null, "12" -> 12 (number inputs map to optional numbers). */

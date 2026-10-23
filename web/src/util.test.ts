@@ -1,7 +1,7 @@
 // Run with `npm test` (Node's built-in runner strips the types).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cidr, joinArgs, labelsText, matchServers, mergePatch, parseEnv, parseLabels, pinReasons, sentence, splitArgs, sumUsage } from "./util.ts";
+import { cidr, joinArgs, labelsText, matchServers, mergePatch, parseEnv, parseLabels, pinReasons, sentence, sizeLabel, sizesIn, splitArgs, sumUsage, varName } from "./util.ts";
 
 test("merge patch keeps only changes and nulls removed keys", () => {
   const a = { replicas: 1, source: { type: "git", repo: "o/r", branch: "main" }, ports: [{ container: 80 }], user: "app" };
@@ -75,6 +75,18 @@ test("placement matches online servers by id or name, region and every label", (
   assert.deepEqual(ids({ labels: { disk: "ssd" } }), ["local", "b"]);
   assert.deepEqual(ids({ labels: { disk: "ssd", gpu: "yes" } }), ["b"]);
   assert.deepEqual(ids({ region: "us", labels: { gpu: "no" } }), []);
+});
+
+test("database variables and machine sizes", () => {
+  assert.equal(varName("db-replica-1", "URL"), "DB_REPLICA_1_URL");
+  assert.equal(varName("db", "READ_URL"), "DB_READ_URL");
+  const cx = { id: "cx22", cpus: 2, memory_gb: 4, disk_gb: 40, arch: "x86", prices: [{ region: "fsn1", hourly: "0.0080000000000000" }] };
+  const t4g = { id: "t4g.small", cpus: 1, memory_gb: 2, arch: "arm" };
+  assert.equal(sizeLabel(cx, "fsn1"), "cx22: 2 CPUs, 4 GB memory, 40 GB disk, x86, €0.0080 an hour");
+  assert.equal(sizeLabel(cx, "ash"), "cx22: 2 CPUs, 4 GB memory, 40 GB disk, x86");
+  assert.equal(sizeLabel(t4g, "eu-west-1"), "t4g.small: 1 CPU, 2 GB memory, Arm");
+  assert.deepEqual(sizesIn([cx, t4g], "fsn1"), [cx, t4g]);
+  assert.deepEqual(sizesIn([cx, t4g], "ash"), [t4g]);
 });
 
 test("usage adds up over servers and skips servers without the service", () => {

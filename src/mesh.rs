@@ -187,6 +187,14 @@ pub fn interfaces() -> Vec<String> {
 
 const PANEL_CHAIN: &str = "TUGPORT-PANEL";
 
+/// Whether the panel chain holds any rules.
+pub fn panel_guarded() -> bool {
+    Command::new("iptables")
+        .args(["-w", "10", "-S", PANEL_CHAIN])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.starts_with("-A ")))
+}
+
 /// Docker's own name for a bridge network's interface: `br-` and 12 hex digits of its id.
 fn docker_named(iface: &str) -> bool {
     iface.strip_prefix("br-").is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))

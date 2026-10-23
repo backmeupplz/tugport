@@ -111,7 +111,9 @@ pub fn install(args: InstallArgs) -> Result<()> {
         std::fs::copy(&exe, target).context("copying the binary to /usr/local/bin")?;
         crate::paths::restrict(target, 0o755)?;
     }
-    crate::mesh::install_boot_hook()?;
+    if let Err(e) = crate::mesh::install_boot_hook() {
+        println!("Could not make Docker wait for the private network at boot ({e:#}); Tugport tries again when it starts.");
+    }
     if let (Some(panel), Some(token)) = (&args.join, &args.token) {
         return join(panel, token);
     }

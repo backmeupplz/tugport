@@ -85,9 +85,10 @@ pub fn set_peers(peers: &[Peer]) -> Result<()> {
 /// arriving over WireGuard itself, or from this host, may start a mesh connection.
 pub fn guard() -> Result<()> {
     const CHAIN: &str = "TUGPORT-MESH";
-    let ok = |args: &[&str]| Command::new("iptables").args(args).output().map(|o| o.status.success()).unwrap_or(false);
+    // -w: at boot Docker, firewalls and Tugport may all hold the xtables lock for a moment.
+    let ok = |args: &[&str]| Command::new("iptables").arg("-w").args(args).output().map(|o| o.status.success()).unwrap_or(false);
     if !ok(&["-n", "-L", CHAIN]) {
-        run(Command::new("iptables").args(["-N", CHAIN])).context("blocking containers from the mesh")?;
+        run(Command::new("iptables").args(["-w", "-N", CHAIN])).context("blocking containers from the mesh")?;
     }
     let forward = if ok(&["-n", "-L", "DOCKER-USER"]) { "DOCKER-USER" } else { "FORWARD" };
     // Published ports are DNAT-ed before filtering, so match the original destination.
@@ -100,10 +101,20 @@ pub fn guard() -> Result<()> {
     ];
     for (op, chain, rule) in rules {
         if !ok(&[&["-C", chain], rule].concat()) {
-            run(Command::new("iptables").args([&[op, chain], rule].concat())).context("blocking containers from the mesh")?;
+            run(Command::new("iptables").args([&["-w", op, chain], rule].concat())).context("blocking containers from the mesh")?;
         }
     }
     Ok(())
+}
+
+/// `tugport mesh-up`: the interface and its peers first, then the guard. Docker is not
+/// running yet, so nothing can reach the mesh before the guard is in place, and a failing
+/// iptables call must not keep swarm mode from binding its address. Without Docker's
+/// DOCKER-USER chain the guard lands in FORWARD; Tugport adds it to DOCKER-USER once it starts.
+pub fn boot(private_key_file: &std::path::Path, own_ip: &str, peers: &[Peer]) -> Result<()> {
+    up(private_key_file, own_ip)?;
+    set_peers(peers)?;
+    guard()
 }
 
 const DOCKER_DROPIN: &str = "/etc/systemd/system/docker.service.d/tugport-mesh.conf";

@@ -63,9 +63,7 @@ pub fn mesh_up(paths: &paths::Paths) -> Result<bool> {
         return Ok(false);
     };
     let config: AgentConfig = serde_json::from_str(&text)?;
-    mesh::guard()?;
-    mesh::up(&paths.etc.join("wg.key"), &config.mesh_ip)?;
-    mesh::set_peers(&config.peers)?;
+    mesh::boot(&paths.etc.join("wg.key"), &config.mesh_ip, &config.peers)?;
     Ok(true)
 }
 

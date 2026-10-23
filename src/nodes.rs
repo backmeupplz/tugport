@@ -248,9 +248,7 @@ pub fn mesh_up(paths: &crate::paths::Paths) -> Result<bool> {
     if conn.query_row("SELECT 1 FROM state WHERE key = 'mesh'", [], |_| Ok(())).optional()?.is_none() {
         return Ok(false);
     }
-    mesh::guard()?;
-    mesh::up(&key_file, mesh::PANEL_IP)?;
-    mesh::set_peers(&peers_for(&conn, None)?)?;
+    mesh::boot(&key_file, mesh::PANEL_IP, &peers_for(&conn, None)?)?;
     Ok(true)
 }
 
@@ -620,13 +618,16 @@ where
 /// mesh up recovers. A worker gets two minutes in pending, the time a normal join takes.
 fn swarm_issue(state: Option<bollard::models::LocalNodeState>, error: Option<&str>, pending_for: Duration) -> Option<String> {
     use bollard::models::LocalNodeState;
-    const FIX: &str = "Deploys that use other servers fail until Docker restarts with the mesh up: run `systemctl restart docker` on this server.";
+    const FIX: &str = "If Docker started before the private network between servers (after a reboot), run `systemctl restart docker` on this server.";
     match state? {
         LocalNodeState::ERROR => Some(match error.map(str::trim).filter(|e| !e.is_empty()) {
-            Some(e) => format!("Swarm mode failed on this server ({e}). {FIX}"),
-            None => format!("Swarm mode failed on this server. {FIX}"),
+            Some(e) => format!("Swarm mode failed on this server ({e}), so deploys that use it fail. {FIX}"),
+            None => format!("Swarm mode failed on this server, so deploys that use it fail. {FIX}"),
         }),
-        LocalNodeState::PENDING if pending_for >= Duration::from_secs(120) => Some(format!("This server has been trying to rejoin the swarm for {} minutes. {FIX}", pending_for.as_secs() / 60)),
+        LocalNodeState::PENDING if pending_for >= Duration::from_secs(120) => Some(format!(
+            "This server has been trying to rejoin the swarm for {} minutes, so services cannot run on it. Check that the panel's server is up and reachable over the private network. {FIX}",
+            pending_for.as_secs() / 60
+        )),
         _ => None,
     }
 }
@@ -1001,10 +1002,11 @@ mod tests {
         // The panel after a reboot: the manager could not bind its mesh address.
         let e = swarm_issue(Some(ERROR), Some("listen tcp 10.99.0.1:2377: bind: cannot assign requested address"), fresh).unwrap();
         assert!(e.contains("10.99.0.1:2377") && e.contains("systemctl restart docker"));
-        assert!(swarm_issue(Some(ERROR), Some(" "), fresh).unwrap().starts_with("Swarm mode failed on this server. "));
+        assert!(swarm_issue(Some(ERROR), Some(" "), fresh).unwrap().starts_with("Swarm mode failed on this server, so"));
         // A worker joining for the first time is pending for a moment; stuck is reported.
-        assert_eq!(swarm_issue(Some(PENDING), None, Duration::from_secs(30)), None);
-        assert!(swarm_issue(Some(PENDING), None, Duration::from_secs(300)).unwrap().contains("for 5 minutes"));
+        assert_eq!(swarm_issue(Some(PENDING), None, Duration::from_secs(119)), None);
+        let p = swarm_issue(Some(PENDING), None, Duration::from_secs(300)).unwrap();
+        assert!(p.contains("for 5 minutes") && p.contains("panel's server is up") && p.contains("systemctl restart docker"));
         for ok in [ACTIVE, INACTIVE, LOCKED, EMPTY] {
             assert_eq!(swarm_issue(Some(ok), None, Duration::from_secs(300)), None);
         }
@@ -1020,9 +1022,13 @@ mod tests {
         // Nothing saved: a fresh or single-server install.
         assert!(!super::mesh_up(&paths).unwrap());
         assert!(!crate::agent::mesh_up(&paths).unwrap());
-        // A panel database without the mesh turned on.
+        // A panel database with the mesh on but no key (it never came up here), then without the mesh.
+        let db = crate::db::Db::open(&paths.db()).unwrap();
+        db.set_state("mesh", "sealed").unwrap();
+        assert!(!super::mesh_up(&paths).unwrap());
+        db.conn().execute("DELETE FROM state WHERE key = 'mesh'", []).unwrap();
+        drop(db);
         std::fs::write(paths.etc.join("wg.key"), "key").unwrap();
-        drop(crate::db::Db::open(&paths.db()).unwrap());
         assert!(!super::mesh_up(&paths).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }

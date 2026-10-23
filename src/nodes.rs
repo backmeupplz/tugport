@@ -830,11 +830,17 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
     let mut push = tokio::process::Command::new("docker");
     push.args(["push", "--quiet", &local]);
     let pushed = crate::proc::output(push).await;
+    // Every server's host can write to the registry, so pull exactly what was pushed: by digest.
+    let digest = app.docker.inspect_image(&local).await.ok().and_then(|i| i.repo_digests).unwrap_or_default().into_iter().find_map(|d| {
+        let (repo, digest) = d.split_once('@')?;
+        (repo == runtime::split_image(&local).0).then(|| digest.to_string())
+    });
     let mut untag = tokio::process::Command::new("docker");
     untag.args(["rmi", &local]);
     let _ = crate::proc::output(untag).await;
     pushed.context("sending the image to the mesh registry")?;
-    let remote = format!("{}:{REGISTRY_PORT}/{image}", mesh::PANEL_IP);
+    let digest = digest.ok_or_else(|| anyhow!("the registry did not report the image's digest"))?;
+    let remote = format!("{}:{REGISTRY_PORT}/{}@{digest}", mesh::PANEL_IP, runtime::split_image(image).0);
     runtime::pull_on(app, &node.docker, &remote, log).await?;
     let (repo, tag) = runtime::split_image(image);
     node.docker

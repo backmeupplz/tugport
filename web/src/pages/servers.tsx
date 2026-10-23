@@ -88,6 +88,7 @@ export function Servers(_: { path?: string }) {
                         {lastAnswer(n)}
                       </p>
                     )}
+                    {n.info?.swarm_problem && <p class="mt-2 text-bad">{n.info.swarm_problem}</p>}
                     <Facts node={n} class="mt-4" />
                   </a>
                 </li>
@@ -216,6 +217,7 @@ export function ServerPage(props: { id?: string; path?: string }) {
             {lastAnswer(n)}
           </Note>
         )}
+        {n.info?.swarm_problem && <Note tone="bad">{n.info.swarm_problem}</Note>}
         <Card>
           <Facts node={n} />
           <p class="mt-4 text-xs text-muted">

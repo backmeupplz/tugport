@@ -75,6 +75,9 @@ enum Cmd {
     Recover { key: String },
     /// Print the version.
     Version,
+    /// Bring the private network between servers up from its saved key and address
+    /// (Docker runs this before it starts; it does nothing without one).
+    MeshUp,
     /// Set this server up (run by the one-line installer).
     Install(install::InstallArgs),
     /// Move an Easypanel or Coolify server into Tugport.
@@ -98,6 +101,15 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Install(args) => install::install(args),
+        Cmd::MeshUp => {
+            let paths = paths::Paths::from_env();
+            if agent::mesh_up(&paths)? || nodes::mesh_up(&paths)? {
+                println!("{} is up.", mesh::IFACE);
+            } else {
+                println!("This server has no mesh.");
+            }
+            Ok(())
+        }
         Cmd::Recover { key } => {
             let paths = paths::Paths::from_env();
             crypto::restore_master(&paths.etc, &key)?;
@@ -226,6 +238,9 @@ async fn serve() -> Result<()> {
     });
     drop(master);
     nodes::load(&app)?;
+    if let Err(e) = mesh::install_boot_hook() {
+        tracing::warn!("making Docker wait for the mesh at boot: {e:#}");
+    }
     if let Err(e) = nodes::restore_mesh(&app) {
         tracing::error!("bringing up the server mesh: {e:#}");
     }

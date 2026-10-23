@@ -106,6 +106,29 @@ pub fn guard() -> Result<()> {
     Ok(())
 }
 
+const DOCKER_DROPIN: &str = "/etc/systemd/system/docker.service.d/tugport-mesh.conf";
+const DROPIN: &str = "# Written by Tugport. Swarm mode and the image registry listen on mesh addresses,\n\
+# so the mesh has to be up before Docker starts (at boot, Docker starts before Tugport).\n\
+[Service]\n\
+ExecStartPre=-/usr/local/bin/tugport mesh-up\n";
+
+/// Make Docker bring the mesh up before it starts. Without it, after a reboot swarm mode
+/// cannot bind its mesh address and stays broken until Docker restarts. Written by the
+/// installer and on every start, so servers installed earlier get it with an update.
+pub fn install_boot_hook() -> Result<()> {
+    let installed = std::path::Path::new("/usr/local/bin/tugport").exists();
+    if !installed || !std::path::Path::new("/run/systemd/system").exists() || std::fs::read_to_string(DOCKER_DROPIN).is_ok_and(|c| c == DROPIN) {
+        return Ok(());
+    }
+    let path = std::path::Path::new(DOCKER_DROPIN);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, DROPIN).with_context(|| format!("writing {DOCKER_DROPIN}"))?;
+    run(Command::new("systemctl").arg("daemon-reload"))?;
+    Ok(())
+}
+
 pub fn available() -> bool {
     Command::new("wg").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }

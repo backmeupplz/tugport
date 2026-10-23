@@ -91,7 +91,8 @@ pub fn guard() -> Result<()> {
     if !ok(&["-n", "-L", CHAIN]) {
         run(Command::new("iptables").args(["-w", "10", "-N", CHAIN])).context("blocking containers from the mesh")?;
     }
-    let forward = if ok(&["-n", "-L", "DOCKER-USER"]) { "DOCKER-USER" } else { "FORWARD" };
+    // In FORWARD the rule would end up below the ACCEPT rules Docker inserts when it starts.
+    let forward = if docker_user_chain().is_ok() { "DOCKER-USER" } else { "FORWARD" };
     // Published ports are DNAT-ed before filtering, so match the original destination.
     let rules: [(&str, &str, &[&str]); 5] = [
         ("-A", CHAIN, &["-i", IFACE, "-j", "RETURN"]),
@@ -111,21 +112,18 @@ pub fn guard() -> Result<()> {
 /// `tugport mesh-up`: the interface and its peers first, then the guard (even when a peer
 /// could not be set). Docker is not
 /// running yet, so nothing can reach the mesh before the guard is in place, and a failing
-/// iptables call must not keep swarm mode from binding its address. The guard goes into
-/// DOCKER-USER, created here when missing: a rule in FORWARD would end up below the ACCEPT
-/// rules Docker inserts when it starts.
+/// iptables call must not keep swarm mode from binding its address.
 pub fn boot(private_key_file: &std::path::Path, own_ip: &str, peers: &[Peer]) -> Result<()> {
     up(private_key_file, own_ip)?;
     let peers = set_peers(peers);
-    let chain = docker_user_chain();
     guard()?;
-    chain.and(peers)
+    peers
 }
 
-/// Create Docker's DOCKER-USER chain and its jump from FORWARD ahead of Docker. Docker (27
-/// to 29) keeps an existing chain with its rules and only moves the jump back to the top of
-/// FORWARD, so the guard stays in front of Docker's rules. The jump also covers a Docker that
-/// never sets up the chain (iptables off, or its nftables backend).
+/// Docker's DOCKER-USER chain and its jump from FORWARD, created when missing (at boot Docker
+/// is not running yet). Docker (27 to 29) keeps an existing chain with its rules and only moves
+/// the jump back to the top of FORWARD, so the guard stays in front of Docker's rules. The jump
+/// also covers a Docker that never sets up the chain (iptables off, or its nftables backend).
 fn docker_user_chain() -> Result<()> {
     const CHAIN: &str = "DOCKER-USER";
     let ok = |args: &[&str]| Command::new("iptables").args(["-w", "10"]).args(args).output().map(|o| o.status.success()).unwrap_or(false);

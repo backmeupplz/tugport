@@ -250,7 +250,7 @@
     <div>
       <p class="status">Tugport is in early development.</p>
       <h1>Tugport deploys your apps and watches your server from <em>one small binary.</em></h1>
-      <p class="lead">Push to GitHub or Forgejo and Tugport builds the commit, rolls it out without downtime and serves it over HTTPS. The same binary keeps the logs of every service, charts the CPU, memory, disk and GPU of your machine, and gives your AI agents API keys that can do exactly what you allow.</p>
+      <p class="lead">Push to GitHub or Forgejo and Tugport builds the commit, rolls it out without downtime and serves it over HTTPS, on one server or across many. The same binary keeps the logs of every service, charts the CPU, memory, disk and GPU of your machine, and gives your AI agents API keys that can do exactly what you allow.</p>
       <div class="actions">
         <a class="btn btn-primary" href="https://github.com/backmeupplz/tugport">
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.56-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
@@ -300,7 +300,7 @@
   <div class="wrap">
     <div class="section-head">
       <h2>Tugport does a few things, and it does them properly.</h2>
-      <p>There is no app store and no wall of options. You get what you need to run your own software on your own server, and each piece is built to keep working when something next to it breaks.</p>
+      <p>There is no app store and no wall of options. You get what you need to run your own software on your own servers, and each piece is built to keep working when something next to it breaks.</p>
     </div>
     <div class="grid">
       <article class="card">
@@ -330,8 +330,23 @@
       </article>
       <article class="card">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5"/><path d="M4.5 12v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V12"/></svg>
-        <h3>Databases come with backups.</h3>
-        <p>Run Postgres, MySQL, MongoDB or Redis next to your apps, back them up on a schedule to any S3-compatible storage, and restore a backup in place when you need it.</p>
+        <h3>Databases come with backups and replicas.</h3>
+        <p>Run Postgres, MySQL, MariaDB, MongoDB or Redis next to your apps, back them up on a schedule to any S3-compatible storage, and add read replicas on other servers that you can promote if the primary is lost.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        <h3>More servers join with one command.</h3>
+        <p>Run the command the panel shows on a new machine, or let Tugport create one at Hetzner or AWS, and it joins an encrypted WireGuard network. Replicas spread across your servers, and when one of them goes away its services start on the others.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+        <h3>The number of copies follows the traffic.</h3>
+        <p>A service can add replicas when its CPU or request rate climbs and drop them again when things are quiet, a pool of cloud servers can grow and shrink the same way, and a site nobody visits can sleep until the next request wakes it.</p>
+      </article>
+      <article class="card">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h14M13 6l6 6-6 6"/></svg>
+        <h3>Easypanel and Coolify move over.</h3>
+        <p>The installer notices an existing Easypanel or Coolify, shows what it will move, and brings over your projects, domains, certificates, environment, volumes and webhooks while the apps keep running, with a rollback if you change your mind.</p>
       </article>
     </div>
   </div>

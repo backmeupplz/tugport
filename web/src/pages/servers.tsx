@@ -27,6 +27,8 @@ const STATUS: Record<string, [string, string]> = {
   ],
 };
 const status = (n: Node) => STATUS[n.status] ?? [n.status, ""];
+/** Broken swarm mode, as of the server's latest answer (an old answer may be stale). */
+const swarmProblem = (n: Node) => (n.status === "online" ? n.info?.swarm_problem : null);
 const lastAnswer = (n: Node) => (n.last_seen_at ? ` It last answered ${ago(n.last_seen_at)}.` : "");
 
 const NoAccess = () => (
@@ -88,6 +90,7 @@ export function Servers(_: { path?: string }) {
                         {lastAnswer(n)}
                       </p>
                     )}
+                    {swarmProblem(n) && <p class="mt-2 text-bad">{swarmProblem(n)}</p>}
                     <Facts node={n} class="mt-4" />
                   </a>
                 </li>
@@ -216,6 +219,7 @@ export function ServerPage(props: { id?: string; path?: string }) {
             {lastAnswer(n)}
           </Note>
         )}
+        {swarmProblem(n) && <Note tone="bad">{swarmProblem(n)}</Note>}
         <Card>
           <Facts node={n} />
           <p class="mt-4 text-xs text-muted">

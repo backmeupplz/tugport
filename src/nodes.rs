@@ -197,20 +197,39 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// After a reboot: the mesh interface and its peers come back before anything uses them.
-pub fn restore_mesh(app: &App) -> Result<()> {
+/// After a reboot: the mesh interface and its peers come back before anything uses them,
+/// then the registry, which Docker may have restarted without its ports.
+pub async fn restore_mesh(app: &App) -> Result<()> {
     if !mesh_enabled(app) {
         return Ok(());
     }
     mesh::guard()?;
     mesh::up(&app.paths.etc.join("wg.key"), mesh::PANEL_IP)?;
-    set_peers(app)
+    set_peers(app)?;
+    ensure_registry().await
+}
+
+/// The registry itself answers on localhost (not just anything that holds the port).
+async fn registry_answers() -> bool {
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(1)).no_proxy().build() else {
+        return false;
+    };
+    client.get(format!("http://127.0.0.1:{REGISTRY_PORT}/v2/")).send().await.is_ok_and(|r| r.headers().contains_key("docker-distribution-api-version"))
 }
 
 /// A private registry on the mesh so servers pull only the image layers they lack.
 async fn ensure_registry() -> Result<()> {
+    // A running container is not enough: after a Docker restart it can run with no published
+    // ports (both are published together, so localhost tells). One that just started gets a
+    // few seconds to answer before it is replaced.
     if sh("docker inspect -f '{{.State.Running}}' tugport-registry").await.map(|s| s.trim() == "true").unwrap_or(false) {
-        return Ok(());
+        for _ in 0..5 {
+            if registry_answers().await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        tracing::warn!("the image registry runs but does not answer on port {REGISTRY_PORT}; starting it again");
     }
     let _ = sh("docker rm -f tugport-registry").await;
     sh(&format!(
@@ -236,8 +255,23 @@ pub async fn reset_registry(app: &App) {
     }
 }
 
-fn peers_for(app: &App, exclude: Option<&str>) -> Result<Vec<Peer>> {
-    let conn = app.db.conn();
+/// `tugport mesh-up` on the panel's server (false when the mesh is off). Docker runs it before
+/// Tugport starts, so it only reads the database and leaves migrations to the panel.
+pub fn mesh_up(paths: &crate::paths::Paths) -> Result<bool> {
+    let key_file = paths.etc.join("wg.key");
+    if !paths.db().exists() || !key_file.exists() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(paths.db(), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    if conn.query_row("SELECT 1 FROM state WHERE key = 'mesh'", [], |_| Ok(())).optional()?.is_none() {
+        return Ok(false);
+    }
+    mesh::boot(&key_file, mesh::PANEL_IP, &peers_for(&conn, None)?)?;
+    Ok(true)
+}
+
+fn peers_for(conn: &rusqlite::Connection, exclude: Option<&str>) -> Result<Vec<Peer>> {
     let mut stmt = conn.prepare("SELECT id, wg_public_key, address, mesh_ip FROM nodes WHERE is_local = 0 AND wg_public_key IS NOT NULL")?;
     let rows: Vec<(String, String, Option<String>, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     Ok(rows
@@ -248,7 +282,8 @@ fn peers_for(app: &App, exclude: Option<&str>) -> Result<Vec<Peer>> {
 }
 
 fn set_peers(app: &App) -> Result<()> {
-    mesh::set_peers(&peers_for(app, None)?)
+    let peers = peers_for(&app.db.conn(), None)?;
+    mesh::set_peers(&peers)
 }
 
 /// The peer list each agent should have: the panel plus every other server.
@@ -257,7 +292,7 @@ fn peers_of_agent(app: &App, node_id: &str) -> Result<Vec<Peer>> {
     // The panel address this server joined through works for it; ours may be private (EC2).
     let endpoint = app.db.get_state(&format!("panelep:{node_id}"))?.unwrap_or(st.endpoint);
     let mut peers = vec![Peer { public_key: st.public_key, endpoint: Some(endpoint), mesh_ip: mesh::PANEL_IP.into() }];
-    peers.extend(peers_for(app, Some(node_id))?);
+    peers.extend(peers_for(&app.db.conn(), Some(node_id))?);
     Ok(peers)
 }
 
@@ -596,10 +631,54 @@ where
     }
 }
 
+/// What is wrong with this server's swarm mode, if anything. When Docker started before the
+/// mesh it could not bind its mesh address: a manager stays in an error state and a worker
+/// stays pending, deploys fail with "not a swarm manager", and only a Docker restart with the
+/// mesh up recovers. A worker gets two minutes in pending, the time a normal join takes.
+fn swarm_issue(state: Option<bollard::models::LocalNodeState>, error: Option<&str>, pending_for: Duration) -> Option<String> {
+    use bollard::models::LocalNodeState;
+    const FIX: &str = "If Docker started before the private network between servers (after a reboot), run `systemctl restart docker` on this server.";
+    match state? {
+        LocalNodeState::ERROR => Some(match error.map(str::trim).filter(|e| !e.is_empty()) {
+            Some(e) => format!("Swarm mode failed on this server ({e}), so deploys that use it fail. {FIX}"),
+            None => format!("Swarm mode failed on this server, so deploys that use it fail. {FIX}"),
+        }),
+        LocalNodeState::PENDING if pending_for >= Duration::from_secs(120) => Some(format!(
+            "This server has been trying to rejoin the swarm for {} minutes, so services cannot run on it. Check that the panel's server is up and reachable over the private network. {FIX}",
+            pending_for.as_secs() / 60
+        )),
+        _ => None,
+    }
+}
+
+/// [`swarm_issue`] for Docker's current info, logged once when it starts and when it clears.
+pub fn swarm_problem(info: Option<&bollard::models::SystemInfo>) -> Option<String> {
+    use bollard::models::LocalNodeState;
+    // (pending since, last problem)
+    static SEEN: Mutex<(Option<std::time::Instant>, bool)> = Mutex::new((None, false));
+    let swarm = info?.swarm.as_ref();
+    let state = swarm.and_then(|s| s.local_node_state);
+    let mut seen = util::lock(&SEEN);
+    if state == Some(LocalNodeState::PENDING) {
+        seen.0.get_or_insert_with(std::time::Instant::now);
+    } else {
+        seen.0 = None;
+    }
+    let problem = swarm_issue(state, swarm.and_then(|s| s.error.as_deref()), seen.0.map(|t| t.elapsed()).unwrap_or_default());
+    match (&problem, seen.1) {
+        (Some(p), false) => tracing::warn!("{p}"),
+        (None, true) => tracing::info!("swarm mode works again"),
+        _ => {}
+    }
+    seen.1 = problem.is_some();
+    problem
+}
+
 /// What a server reports about itself (agents in their health, the panel for its own).
 pub async fn host_info(app: &App) -> Value {
     let info = app.docker.info().await.ok();
     let snap = util::lock(&app.metrics.latest).clone();
+    let swarm_problem = swarm_problem(info.as_ref());
     json!({
         "version": crate::VERSION,
         "docker": info.as_ref().and_then(|i| i.server_version.clone()),
@@ -610,6 +689,7 @@ pub async fn host_info(app: &App) -> Value {
         "nvidia": info.as_ref().and_then(|i| i.runtimes.as_ref()).is_some_and(|r| r.contains_key("nvidia")),
         "dri": std::path::Path::new("/dev/dri").exists(),
         "swarm_node": info.and_then(|i| i.swarm).and_then(|s| s.node_id).filter(|id| !id.is_empty()),
+        "swarm_problem": swarm_problem,
     })
 }
 
@@ -931,6 +1011,46 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
 mod tests {
     use super::join_secret;
     use crate::model::Placement;
+
+    #[test]
+    fn broken_swarm_is_reported() {
+        use super::swarm_issue;
+        use bollard::models::LocalNodeState::*;
+        use std::time::Duration;
+        let fresh = Duration::ZERO;
+        // The panel after a reboot: the manager could not bind its mesh address.
+        let e = swarm_issue(Some(ERROR), Some("listen tcp 10.99.0.1:2377: bind: cannot assign requested address"), fresh).unwrap();
+        assert!(e.contains("10.99.0.1:2377") && e.contains("systemctl restart docker"));
+        assert!(swarm_issue(Some(ERROR), Some(" "), fresh).unwrap().starts_with("Swarm mode failed on this server, so"));
+        // A worker joining for the first time is pending for a moment; stuck is reported.
+        assert_eq!(swarm_issue(Some(PENDING), None, Duration::from_secs(119)), None);
+        let p = swarm_issue(Some(PENDING), None, Duration::from_secs(300)).unwrap();
+        assert!(p.contains("for 5 minutes") && p.contains("panel's server is up") && p.contains("systemctl restart docker"));
+        for ok in [ACTIVE, INACTIVE, LOCKED, EMPTY] {
+            assert_eq!(swarm_issue(Some(ok), None, Duration::from_secs(300)), None);
+        }
+        assert_eq!(swarm_issue(None, None, fresh), None);
+    }
+
+    #[test]
+    fn mesh_up_without_a_mesh_does_nothing() {
+        let dir = std::env::temp_dir().join(format!("tugport-meshup-{}", std::process::id()));
+        let paths = crate::paths::Paths { etc: dir.join("etc"), data: dir.join("data"), run: dir.join("run") };
+        std::fs::create_dir_all(&paths.etc).unwrap();
+        std::fs::create_dir_all(&paths.data).unwrap();
+        // Nothing saved: a fresh or single-server install.
+        assert!(!super::mesh_up(&paths).unwrap());
+        assert!(!crate::agent::mesh_up(&paths).unwrap());
+        // A panel database with the mesh on but no key (it never came up here), then without the mesh.
+        let db = crate::db::Db::open(&paths.db()).unwrap();
+        db.set_state("mesh", "sealed").unwrap();
+        assert!(!super::mesh_up(&paths).unwrap());
+        db.conn().execute("DELETE FROM state WHERE key = 'mesh'", []).unwrap();
+        drop(db);
+        std::fs::write(paths.etc.join("wg.key"), "key").unwrap();
+        assert!(!super::mesh_up(&paths).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn endpoints_prefer_what_can_be_reached() {

@@ -57,6 +57,16 @@ struct Ctx {
 type Shared = Arc<Ctx>;
 type Failure = (StatusCode, Json<Value>);
 
+/// `tugport mesh-up` on a server that joined a panel (false when it has not joined).
+pub fn mesh_up(paths: &paths::Paths) -> Result<bool> {
+    let Ok(text) = std::fs::read_to_string(config_path(paths)) else {
+        return Ok(false);
+    };
+    let config: AgentConfig = serde_json::from_str(&text)?;
+    mesh::boot(&paths.etc.join("wg.key"), &config.mesh_ip, &config.peers)?;
+    Ok(true)
+}
+
 pub async fn run() -> Result<()> {
     use tracing_subscriber::prelude::*;
     let paths = paths::Paths::from_env();
@@ -69,6 +79,9 @@ pub async fn run() -> Result<()> {
         .init();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config: AgentConfig = serde_json::from_str(&std::fs::read_to_string(config_path(&paths)).context("this server has not joined a panel")?)?;
+    if let Err(e) = mesh::install_boot_hook() {
+        tracing::warn!("making Docker wait for the mesh at boot: {e:#}");
+    }
     mesh::guard()?;
     mesh::up(&paths.etc.join("wg.key"), &config.mesh_ip)?;
     mesh::set_peers(&config.peers)?;
@@ -101,14 +114,19 @@ pub async fn run() -> Result<()> {
 
     tokio::spawn(crate::metrics::sample_loop(app.clone(), false));
     // Docker restarts and firewall reloads drop iptables rules; keep containers off the mesh.
-    tokio::spawn(async {
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            if let Err(e) = mesh::guard() {
-                tracing::error!("{e:#}");
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if let Err(e) = mesh::guard() {
+                    tracing::error!("{e:#}");
+                }
+                // Logs a warning when swarm mode breaks, even while the panel is away.
+                crate::nodes::swarm_problem(app.docker.info().await.ok().as_ref());
             }
-        }
-    });
+        });
+    }
     tokio::spawn(docker_proxy(mesh_ip.clone(), secret));
     {
         let app = app.clone();

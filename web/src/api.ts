@@ -216,6 +216,8 @@ export interface Node {
     arch?: string;
     nvidia?: boolean;
     dri?: boolean;
+    /** Set when swarm mode is broken there (deploys that use other servers fail). */
+    swarm_problem?: string | null;
   };
 }
 

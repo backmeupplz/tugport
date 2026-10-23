@@ -9,7 +9,7 @@ use crate::deploy::{Deploy, DeployLog};
 use crate::model::{Build, Source};
 use crate::store::{self, Service};
 use crate::tools::{self, Tool};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -36,10 +36,7 @@ pub async fn build(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> 
             let git_ref = d.commit_sha.clone().or(d.git_ref.clone()).unwrap_or_else(|| branch.clone());
             let checkout = work.join("repo");
             let (sha, msg) = crate::git::checkout(app, s, provider.as_deref(), repo, &git_ref, &checkout, &|l| log.line(l)).await?;
-            let ctx = if path.trim_matches('/').is_empty() { checkout } else { checkout.join(path.trim_matches('/')) };
-            if !ctx.starts_with(work.join("repo")) || !ctx.is_dir() {
-                bail!("the build path {path} does not exist in the repository");
-            }
+            let ctx = crate::util::inside(&checkout, path).filter(|c| c.is_dir()).ok_or_else(|| anyhow!("the build path {path} does not exist in the repository"))?;
             (ctx, Some(sha), Some(msg))
         }
         Source::Dockerfile { content } => {
@@ -61,10 +58,7 @@ pub async fn build(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> 
     match &method {
         Build::Dockerfile { path, target } => {
             log.line(&format!("Building with {path}"));
-            let file = context.join(path);
-            if !file.starts_with(&context) || !file.exists() {
-                bail!("{path} not found in the build context");
-            }
+            let file = crate::util::inside(&context, path).filter(|f| f.is_file()).ok_or_else(|| anyhow!("{path} not found in the build context"))?;
             dockerfile(app, s, &context, &file, target.as_deref(), &image, sha.as_deref(), &env, log).await?
         }
         Build::Railpack => railpack(app, s, &context, &image, sha.as_deref(), &env, log).await?,
@@ -77,15 +71,17 @@ pub async fn build(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> 
     Ok(Built { image, commit_sha: sha, commit_message: message })
 }
 
-/// Build-time env for docker: secrets are read from the process environment, never argv.
+/// Build-time env for docker: secrets are read from the process environment, never argv,
+/// under neutral names, so a variable called PATH or DOCKER_CONFIG cannot steer docker itself.
 fn buildx_base(s: &Service, image: &str, env: &BTreeMap<String, Zeroizing<String>>) -> Command {
     let mut cmd = Command::new("docker");
     cmd.args(["buildx", "build", "--progress=plain", "--load", "-t", image])
         .args(["--label", &format!("tugport.service={}", s.id)])
         .env("DOCKER_BUILDKIT", "1");
-    for (k, v) in env {
-        cmd.arg("--secret").arg(format!("id={k},env={k}"));
-        cmd.env(k, v.as_str());
+    for (i, (k, v)) in env.iter().enumerate() {
+        let alias = format!("TUGPORT_BUILD_SECRET_{i}");
+        cmd.arg("--secret").arg(format!("id={k},env={alias}"));
+        cmd.env(alias, v.as_str());
     }
     if let Some(slice) = build_slice() {
         cmd.arg(format!("--cgroup-parent={slice}"));
@@ -110,6 +106,16 @@ pub fn declared_args(dockerfile: &str) -> Vec<String> {
         .collect()
 }
 
+/// Pass variable `k` as a build arg (`--build-arg NAME` reads the value from the environment).
+fn build_arg(cmd: &mut Command, env: &BTreeMap<String, Zeroizing<String>>, k: &str, log: &DeployLog) {
+    let Some(v) = env.get(k) else { return };
+    if crate::proc::steers_tools(k) {
+        log.line(&format!("{k} is not passed as a build argument, because it would change how docker itself runs"));
+        return;
+    }
+    cmd.env(k, v.as_str()).args(["--build-arg", k]);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dockerfile(
     app: &AppState,
@@ -130,10 +136,7 @@ async fn dockerfile(
         cmd.args(["--target", t]);
     }
     for k in declared.iter().chain(s.spec.build_args.iter()) {
-        if env.contains_key(k) {
-            // `--build-arg NAME` without a value reads it from the environment.
-            cmd.args(["--build-arg", k]);
-        }
+        build_arg(&mut cmd, env, k, log);
     }
     if let Some(sha) = sha {
         cmd.args(["--build-arg", &format!("GIT_SHA={sha}")]);
@@ -150,11 +153,11 @@ async fn railpack(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     log.line("Planning the build with Railpack");
     let mut prepare = Command::new(&bin);
     prepare.arg("prepare").arg(context).arg("--plan-out").arg(&plan).arg("--info-out").arg(out.join("railpack-info.json"));
-    for k in env.keys() {
+    for (k, _) in crate::proc::tool_env(env) {
         // Names only: Railpack reads values from the environment and turns them into build secrets.
         prepare.arg("--env").arg(k);
     }
-    prepare.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    prepare.envs(crate::proc::tool_env(env));
     crate::proc::run_streamed(prepare, &|l| log.line(l)).await.context("railpack could not plan this repository")?;
     let mut cmd = buildx_base(s, image, env);
     cmd.args(["--build-arg", &format!("BUILDKIT_SYNTAX={}", tools::railpack_frontend())]);
@@ -185,10 +188,10 @@ async fn nixpacks(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     // so values stay out of the generated files; buildx supplies them as build args.
     let mut prepare = Command::new(&bin);
     prepare.arg("build").arg(context).arg("--out").arg(context).arg("--name").arg(image);
-    for k in env.keys() {
+    for (k, _) in crate::proc::tool_env(env) {
         prepare.arg("--env").arg(k);
     }
-    prepare.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    prepare.envs(crate::proc::tool_env(env));
     crate::proc::run_streamed(prepare, &|l| log.line(l)).await.context("nixpacks could not plan this repository")?;
     let dockerfile = context.join(".nixpacks").join("Dockerfile");
     if !dockerfile.exists() {
@@ -197,9 +200,7 @@ async fn nixpacks(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     let mut cmd = buildx_base(s, image, env);
     cmd.arg("-f").arg(&dockerfile);
     for k in declared_args(&std::fs::read_to_string(&dockerfile).unwrap_or_default()) {
-        if env.contains_key(&k) {
-            cmd.args(["--build-arg", &k]);
-        }
+        build_arg(&mut cmd, env, &k, log);
     }
     if let Some(sha) = sha {
         cmd.args(["--build-arg", &format!("GIT_SHA={sha}")]);
@@ -222,7 +223,13 @@ async fn buildpacks(app: &AppState, s: &Service, context: &Path, image: &str, bu
         }
     }
     let mut cmd = Command::new(&bin);
-    cmd.args(["build", image, "--builder", builder, "--trust-builder", "--docker-host", "inherit", "--pull-policy", "if-not-present"])
+    cmd.args(["build", image, "--builder", builder, "--docker-host", "inherit", "--pull-policy", "if-not-present"]);
+    // A trusted builder runs with access to the Docker daemon, so only well-known builders get it;
+    // others run their buildpacks in separate containers without it (slower, same result).
+    if trusted_builder(builder) {
+        cmd.arg("--trust-builder");
+    }
+    cmd
         .arg("--path")
         .arg(context)
         .arg("--env-file")
@@ -232,9 +239,25 @@ async fn buildpacks(app: &AppState, s: &Service, context: &Path, image: &str, bu
     res
 }
 
+/// Builders published by the buildpacks projects themselves.
+fn trusted_builder(builder: &str) -> bool {
+    let b = builder.trim_start_matches("docker.io/").trim_start_matches("index.docker.io/");
+    ["heroku/builder:", "paketobuildpacks/builder:", "paketobuildpacks/builder-jammy-", "paketobuildpacks/ubuntu-noble-builder", "gcr.io/buildpacks/builder"]
+        .iter()
+        .any(|p| b.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::declared_args;
+    use super::{declared_args, trusted_builder};
+
+    #[test]
+    fn only_known_builders_are_trusted() {
+        assert!(trusted_builder("heroku/builder:24"));
+        assert!(trusted_builder("docker.io/paketobuildpacks/builder-jammy-base"));
+        assert!(!trusted_builder("example/builder:24"));
+        assert!(!trusted_builder("heroku/builder-evil:1"));
+    }
 
     #[test]
     fn finds_declared_args() {

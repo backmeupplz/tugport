@@ -34,8 +34,14 @@ fn credentials(app: &App, image: &str) -> Option<(String, String)> {
     Some((u, app.keys.open_str(&format!("registry:{host}"), &p).ok()?.to_string()))
 }
 
+/// A client for one registry URL: HTTPS only, and never to this server, the mesh or cloud
+/// metadata (the image name, the token realm and paging links all come from outside).
+async fn client_for(url: &str) -> Result<reqwest::Client> {
+    crate::proxy::outside_client(url, &["https"]).await.ok_or_else(|| anyhow!("{url} is not an address Tugport may ask"))
+}
+
 async fn send(app: &App, image: &str, method: reqwest::Method, url: &str) -> Result<reqwest::Response> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build()?;
+    let client = client_for(url).await?;
     let creds = credentials(app, image);
     let first = client.request(method.clone(), url).header(ACCEPT, MANIFEST_TYPES).send().await?;
     if first.status() != reqwest::StatusCode::UNAUTHORIZED {
@@ -45,11 +51,11 @@ async fn send(app: &App, image: &str, method: reqwest::Method, url: &str) -> Res
     let auth = if let Some(params) = challenge.strip_prefix("Bearer ") {
         let field = |k: &str| params.split(',').find_map(|p| p.trim().strip_prefix(&format!("{k}=")).map(|v| v.trim_matches('"').to_string()));
         let realm = field("realm").ok_or_else(|| anyhow!("registry sent no token realm"))?;
-        let mut req = client.get(&realm).query(&[("service", field("service").unwrap_or_default()), ("scope", field("scope").unwrap_or_default())]);
+        let mut req = client_for(&realm).await?.get(&realm).query(&[("service", field("service").unwrap_or_default()), ("scope", field("scope").unwrap_or_default())]);
         if let Some((u, p)) = &creds {
             req = req.basic_auth(u, Some(p));
         }
-        let tok: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        let tok: serde_json::Value = serde_json::from_slice(&crate::util::read_capped(req.send().await?.error_for_status()?, 1 << 20).await?)?;
         let token = tok["token"].as_str().or(tok["access_token"].as_str()).ok_or_else(|| anyhow!("registry gave no token"))?;
         format!("Bearer {token}")
     } else if let Some((u, p)) = &creds {
@@ -79,7 +85,7 @@ pub async fn tags(app: &App, image: &str) -> Result<Vec<String>> {
     for _ in 0..20 {
         let resp = send(app, image, reqwest::Method::GET, &url).await?.error_for_status()?;
         let next = resp.headers().get("link").and_then(|v| v.to_str().ok()).and_then(|l| l.split(';').next()).map(|l| l.trim_matches(['<', '>', ' ']).to_string());
-        let v: serde_json::Value = resp.json().await?;
+        let v: serde_json::Value = serde_json::from_slice(&crate::util::read_capped(resp, 8 << 20).await?)?;
         out.extend(v["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)));
         match next {
             Some(n) if n.starts_with('/') => url = format!("https://{host}{n}"),

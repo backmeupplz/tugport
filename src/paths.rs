@@ -55,6 +55,9 @@ impl Paths {
         std::fs::create_dir_all(self.secrets())?;
         std::fs::create_dir_all(self.files())?;
         restrict(&self.etc, 0o700)?;
+        // The database, container and deploy logs and Git checkouts (private code): root only.
+        // Containers reach the files mounted into them (the init, Compose folders) regardless.
+        restrict(&self.data, 0o700)?;
         restrict(&self.run, 0o711)?;
         // Only root may walk to delivered secrets; containers reach theirs through bind mounts.
         restrict(&self.secrets(), 0o700)?;

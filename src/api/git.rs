@@ -61,7 +61,12 @@ pub async fn delete(State(app): State<AppState>, a: Auth, Path(id): Path<String>
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn repos(State(app): State<AppState>, _a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+pub async fn repos(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    // The list includes the owner's private repositories: only for people who set up services.
+    let p = &a.0;
+    if !p.is_owner && p.all_projects_role.max(p.project_roles.values().copied().max()).is_none_or(|r| r < Role::Operator) {
+        return Err(ApiError::forbidden("listing repositories needs the operator role on a project"));
+    }
     let p = git::provider(&app, &id)?.ok_or_else(|| ApiError::not_found("unknown provider"))?;
     Ok(Json(json!({ "repos": git::repos(&p).await? })))
 }

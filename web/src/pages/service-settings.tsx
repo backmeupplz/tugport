@@ -478,7 +478,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             );
           })}
           {isDb && f.mounts.length > 0 && <p class="text-xs text-warn">Removing the data volume of a database loses its files on the next deploy.</p>}
-          <button type="button" class="btn" onClick={() => set({ mounts: [...f.mounts, { type: "volume", name: `${s.name}-data`, source: "", target: "", readonly: false }] })}>
+          <button type="button" class="btn" onClick={() => set({ mounts: [...f.mounts, { type: "volume", name: `tp-${s.project}-${s.name}-data`, source: "", target: "", readonly: false }] })}>
             Add mount
           </button>
         </Section>
@@ -501,7 +501,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
           </div>
           <div class="space-y-3 rounded-md border border-bad/40 p-3">
             <p class="text-xs text-bad">These switches give the service control over the whole server. Turning them on needs the admin role and the destroy grant.</p>
-            <Check checked={f.privileged} onChange={(privileged) => set({ privileged })} label="Privileged mode" />
+            <Check
+              checked={f.privileged}
+              onChange={(privileged) => set({ privileged })}
+              label="Privileged mode"
+              hint={isCompose ? "For a Compose stack this also allows host-level Compose options, such as bind mounts outside its folder, the Docker socket and host networking." : undefined}
+            />
             <Check checked={f.socket} onChange={(socket) => set({ socket })} label="Docker socket" hint="The service can then start and stop any container on the server." />
             <Check checked={f.hostNet} onChange={(hostNet) => set({ hostNet })} label="Host networking" hint="The service then shares the server's network stack instead of the project network." />
           </div>

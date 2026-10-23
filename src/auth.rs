@@ -157,6 +157,14 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Argon2 is slow on purpose. It runs off the async threads, which the proxy shares with the
+/// panel, and only a few at a time, so a flood of wrong passwords cannot stall every site.
+pub async fn hashing<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let _slot = SLOTS.acquire().await.ok()?;
+    tokio::task::spawn_blocking(f).await.ok()
+}
+
 pub const SESSION_COOKIE: &str = "tp_session";
 const SESSION_DAYS: i64 = 30;
 

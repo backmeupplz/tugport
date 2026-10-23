@@ -50,7 +50,8 @@ pub enum Client {
     Restart { service: String },
     Stop { service: String },
     Start { service: String },
-    /// Run a command inside a service's container.
+    /// Run a command inside a service's container. A single argument is run as a shell command
+    /// line (`tugport exec web 'ls | wc -l'`); several are passed as separate words.
     Exec {
         service: String,
         #[arg(trailing_var_arg = true, required = true)]
@@ -79,16 +80,39 @@ struct Config {
     token: String,
 }
 
-fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
-    base.join("tugport").join("cli.json")
+fn config_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".config"));
+    // Without HOME the key would land in a folder relative to wherever the command runs.
+    let base = std::env::var_os("XDG_CONFIG_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).or(home).ok_or_else(|| anyhow!("set HOME (or XDG_CONFIG_HOME) so the key has a private place"))?;
+    Ok(base.join("tugport").join("cli.json"))
+}
+
+/// Text from the panel (build output, container logs) as it may be printed on a terminal: no
+/// control sequences, which could rewrite the screen or set the clipboard.
+fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return text.into();
+    }
+    text.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '\u{fffd}' } else { c }).collect::<String>().into()
+}
+
+/// Several words for `sh -c`, each quoted, so none is read as shell syntax.
+fn shell_words(words: &[String]) -> String {
+    if let [line] = words {
+        return line.clone();
+    }
+    let quote = |w: &String| {
+        if !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b)) { w.clone() } else { format!("'{}'", w.replace('\'', "'\\''")) }
+    };
+    words.iter().map(quote).collect::<Vec<_>>().join(" ")
 }
 
 fn config() -> Result<Config> {
     if let (Ok(url), Ok(token)) = (std::env::var("TUGPORT_URL"), std::env::var("TUGPORT_TOKEN")) {
         return Ok(Config { url, token });
     }
-    let text = std::fs::read_to_string(config_path()).context("not logged in; run `tugport login <url> --token <key>` or set TUGPORT_URL and TUGPORT_TOKEN")?;
+    let text = std::fs::read_to_string(config_path()?).context("not logged in; run `tugport login <url> --token <key>` or set TUGPORT_URL and TUGPORT_TOKEN")?;
     Ok(serde_json::from_str(&text)?)
 }
 
@@ -115,7 +139,7 @@ impl Api {
         let status = resp.status();
         let v: Value = resp.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
-            bail!("{}", v["error"].as_str().unwrap_or(status.as_str()));
+            bail!("{}", shown(v["error"].as_str().unwrap_or(status.as_str())));
         }
         Ok(v)
     }
@@ -172,14 +196,16 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
     if let Client::Login { url, token } = &cmd {
         let api = Api::new(Config { url: url.clone(), token: token.clone() })?;
         let me = api.get("/api/me").await.context("the key was not accepted")?;
-        let path = config_path();
+        let path = config_path()?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+            // The mode above only applies to a new file.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             f.write_all(serde_json::to_string_pretty(&Config { url: url.clone(), token: token.clone() })?.as_bytes())?;
         }
         println!("Logged in to {url} as {}.", me["principal"]["name"].as_str().unwrap_or("?"));
@@ -261,7 +287,7 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
                             if json {
                                 println!("{data}");
                             } else {
-                                println!("{} {}", time(l["ts"].as_i64().unwrap_or(0)), l["line"].as_str().unwrap_or(""));
+                                println!("{} {}", time(l["ts"].as_i64().unwrap_or(0)), shown(l["line"].as_str().unwrap_or("")));
                             }
                         }
                         true
@@ -289,7 +315,7 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
                 if json {
                     println!("{l}");
                 } else {
-                    println!("{} {} {}", time(l["ts"].as_i64().unwrap_or(0)), l["replica"].as_str().unwrap_or(""), l["line"].as_str().unwrap_or(""));
+                    println!("{} {} {}", time(l["ts"].as_i64().unwrap_or(0)), l["replica"].as_str().unwrap_or(""), shown(l["line"].as_str().unwrap_or("")));
                 }
             };
             for l in v["lines"].as_array().into_iter().flatten() {
@@ -347,8 +373,8 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
         Client::Stop { service } => action(&api, json, &service, "stop").await,
         Client::Start { service } => action(&api, json, &service, "start").await,
         Client::Exec { service, command } => {
-            let v = api.post(&format!("/api/services/{service}/exec"), json!({ "command": command.join(" ") })).await?;
-            print(json, &v, |v| print!("{}", v["output"].as_str().unwrap_or("")));
+            let v = api.post(&format!("/api/services/{service}/exec"), json!({ "command": shell_words(&command) })).await?;
+            print(json, &v, |v| print!("{}", shown(v["output"].as_str().unwrap_or(""))));
             Ok(v["exit_code"].as_i64().unwrap_or(1) as i32)
         }
         Client::Agent { name, all, projects, grant, expires_days } => {
@@ -377,4 +403,17 @@ async fn action(api: &Api, json: bool, service: &str, verb: &str) -> Result<i32>
 
 fn urlencode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_words;
+
+    #[test]
+    fn exec_words_stay_words() {
+        let w = |a: &[&str]| shell_words(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(w(&["ls | wc -l"]), "ls | wc -l");
+        assert_eq!(w(&["grep", "a; curl x|sh", "f"]), "grep 'a; curl x|sh' f");
+        assert_eq!(w(&["echo", "it's"]), "echo 'it'\\''s'");
+    }
 }

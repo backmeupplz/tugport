@@ -84,6 +84,10 @@ pub async fn create_project(State(app): State<AppState>, a: Auth, Json(b): Json<
     if !util::valid_name(&name) {
         return Err(ApiError::bad_request("project names are lowercase letters, digits and dashes, starting with a letter"));
     }
+    // Its network would be tp-ingress, the shared bridge every proxy reaches replicas through.
+    if name == "ingress" {
+        return Err(ApiError::bad_request("ingress is a name Tugport uses itself; pick another"));
+    }
     let id = util::id();
     app.db.conn().execute(
         "INSERT INTO projects (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -219,7 +223,7 @@ fn check_dangerous(a: &Auth, project_id: &str, old: Option<&ServiceSpec>, new: &
                 return Err(ApiError::bad_request(format!("bind source {source} must be an absolute path")));
             }
             let forbidden = [&paths.etc, &paths.data, &paths.run];
-            if forbidden.iter().any(|f| src.starts_with(f)) {
+            if src.components().any(|c| c == std::path::Component::ParentDir) || forbidden.iter().any(|f| src.starts_with(f)) {
                 return Err(ApiError::bad_request("services cannot mount Tugport's own files"));
             }
             if source.ends_with("docker.sock") && !new.docker_socket {
@@ -230,15 +234,71 @@ fn check_dangerous(a: &Auth, project_id: &str, old: Option<&ServiceSpec>, new: &
     let changed = |f: fn(&ServiceSpec) -> bool| f(new) && old.is_none_or(|o| !f(o));
     let new_binds = binds(new).into_iter().any(|b| old.is_none_or(|o| !binds(o).contains(&b)));
     let new_caps = new.cap_add.iter().any(|c| old.is_none_or(|o| !o.cap_add.contains(c)));
-    if (changed(|s| s.privileged) || changed(|s| s.docker_socket) || changed(|s| s.host_network) || new_binds || new_caps)
+    // Joining a network by name reaches whatever is on it, such as another project's databases.
+    let new_networks = new.networks.iter().any(|n| old.is_none_or(|o| !o.networks.contains(n)));
+    if (changed(|s| s.privileged) || changed(|s| s.docker_socket) || changed(|s| s.host_network) || new_binds || new_caps || new_networks)
         && !a.0.can_destroy(project_id)
     {
         return Err(ApiError::forbidden(
-            "privileged mode, the Docker socket, host networking, bind mounts and extra capabilities need the admin role and the destroy grant",
+            "privileged mode, the Docker socket, host networking, bind mounts, extra capabilities and extra networks need the admin role and the destroy grant",
         ));
+    }
+    // Deploys check these again; refusing them here gives the error before the first deploy.
+    if let Source::Git { provider, repo, branch, path, .. } = &new.source {
+        if !crate::git::valid_repo(repo, provider.is_some()) {
+            return Err(ApiError::bad_request(format!("{repo} is not a repository Tugport can fetch: use an https://, ssh:// or git@host: address")));
+        }
+        let repo_changed = old.is_none_or(|o| !matches!(&o.source, Source::Git { repo: r, .. } if r == repo));
+        if repo_changed && crate::git::url_has_credentials(repo) {
+            return Err(ApiError::bad_request(
+                "the repository address holds credentials, which everyone who can see the service would read; connect a Git provider or add a deploy key instead",
+            ));
+        }
+        if !crate::git::valid_ref(branch) {
+            return Err(ApiError::bad_request(format!("{branch} is not a branch name")));
+        }
+        if util::inside(std::path::Path::new("/"), path).is_none() {
+            return Err(ApiError::bad_request("the path must be a folder inside the repository"));
+        }
+    }
+    let in_repo = |p: &str| util::inside(std::path::Path::new("/"), p).is_some();
+    if new.compose.as_ref().is_some_and(|c| !in_repo(&c.file)) || matches!(&new.build, Build::Dockerfile { path, .. } if !in_repo(path)) {
+        return Err(ApiError::bad_request("file paths must stay inside the repository"));
     }
     if new.replicas > 100 {
         return Err(ApiError::bad_request("at most 100 replicas"));
+    }
+    Ok(())
+}
+
+/// Docker volumes are shared by every service on a server, so a volume a spec adds must be new
+/// on every server or already belong to this project (the admin role with the destroy grant may
+/// attach any volume, such as one a migration left).
+async fn check_volumes(app: &AppState, a: &Auth, project_id: &str, old: Option<&ServiceSpec>, new: &ServiceSpec) -> ApiResult<()> {
+    if a.0.can_destroy(project_id) {
+        return Ok(());
+    }
+    let volumes = |s: &ServiceSpec| -> Vec<String> { s.mounts.iter().filter_map(|m| if let Mount::Volume { name, .. } = m { Some(name.clone()) } else { None }).collect() };
+    let before = old.map(volumes).unwrap_or_default();
+    let added: Vec<String> = volumes(new).into_iter().filter(|v| !before.contains(v)).collect();
+    if added.is_empty() {
+        return Ok(());
+    }
+    let services = store::services(app, None)?;
+    for name in &added {
+        let users: Vec<&Service> = services.iter().filter(|s| volumes(&s.spec).contains(name)).collect();
+        if name.starts_with("tugport") || users.iter().any(|s| s.project_id != project_id) {
+            return Err(ApiError::forbidden(format!("the volume {name} belongs to another project or to Tugport; pick another name")));
+        }
+        if users.is_empty() {
+            for (_, docker) in crate::runtime::dockers(app) {
+                if docker.inspect_volume(name).await.is_ok() {
+                    return Err(ApiError::forbidden(format!(
+                        "a volume named {name} already exists on a server; pick another name, or ask an admin with the destroy grant to attach it"
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -267,6 +327,12 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
     if !util::valid_name(&name) {
         return Err(ApiError::bad_request("service names are lowercase letters, digits and dashes, starting with a letter"));
     }
+    // Container, image, network-alias and Compose project names start with this, and Compose
+    // merges stacks of the same name: `shop` + `api-v2` and `shop-api` + `v2` would collide.
+    let slug = format!("tp-{}-{name}", p.name);
+    if let Some(other) = store::services(&app, None)?.into_iter().find(|o| o.slug() == slug) {
+        return Err(ApiError::conflict(format!("{slug} is already the name of {}/{}; pick another service name", other.project, other.name)));
+    }
     let mut spec: ServiceSpec = match b.spec {
         Some(v) => serde_json::from_value(v).map_err(|e| ApiError::bad_request(format!("invalid spec: {e}")))?,
         None => ServiceSpec::default(),
@@ -292,14 +358,12 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
         "database" => {
             let db = b.database.or(spec.database.take()).ok_or_else(|| ApiError::bad_request("pick a database engine"))?;
             let (url, url_var) = prepare_database(&app, &p, &name, db, &mut spec, &mut env).await?;
-            if !store::project_vars(&app, &p.id)?.contains_key(&url_var) {
-                store::set_project_var(&app, &p.id, &url_var, Some(&url))?;
-            }
             reveal_once = Some(json!({ "url": url, "project_var": url_var }));
         }
         other => return Err(ApiError::bad_request(format!("unknown kind {other}; use app, database or compose"))),
     }
     check_dangerous(&a, &p.id, None, &spec, &app.paths)?;
+    check_volumes(&app, &a, &p.id, None, &spec).await?;
     for k in env.keys() {
         if !store::valid_env_key(k) {
             return Err(ApiError::bad_request(format!("{k} is not a valid variable name")));
@@ -314,6 +378,13 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
     )?;
     for (k, v) in &env {
         store::set_env(&app, &id, k, Some(v))?;
+    }
+    // Only once every check passed, so a refused database leaves no variable behind.
+    if let Some(db) = &reveal_once
+        && let (Some(var), Some(url)) = (db["project_var"].as_str(), db["url"].as_str())
+        && !store::project_vars(&app, &p.id)?.contains_key(var)
+    {
+        store::set_project_var(&app, &p.id, var, Some(url))?;
     }
     app.audit(Some(&a.0), "service.create", Some(&p.id), Some(&id), Some(&name), Some(&b.kind));
     let hook = new_hook_url(&app, &id, &headers)?;
@@ -347,6 +418,12 @@ async fn prepare_database(
     }
     if db.database.is_empty() {
         db.database = "app".into();
+    }
+    // These become the database's user and schema and appear in the connection URL and in the
+    // replica setup scripts; keep them to plain identifiers so neither is malformed.
+    let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') && !s.starts_with(['-', '_']);
+    if !ident(&db.user) || !ident(&db.database) {
+        return Err(ApiError::bad_request("the database user and name are letters, digits, underscores and dashes"));
     }
     let password = util::token(32);
     for (k, v) in databases::init_env(db.engine, &db.user, &db.database, &password) {
@@ -395,6 +472,7 @@ pub async fn update_service(State(app): State<AppState>, a: Auth, headers: Heade
     super::access::merge(&mut current, &patch);
     let next: ServiceSpec = serde_json::from_value(current).map_err(|e| ApiError::bad_request(format!("invalid spec: {e}")))?;
     check_dangerous(&a, &s.project_id, Some(&s.spec), &next, &app.paths)?;
+    check_volumes(&app, &a, &s.project_id, Some(&s.spec), &next).await?;
     if s.kind == "database" && next.replicas > 1 {
         return Err(ApiError::bad_request("databases run one primary; add read replicas instead"));
     }
@@ -523,6 +601,32 @@ fn hash_basic_auth(mut opts: DomainOptions, previous: Option<&DomainOptions>) ->
     Ok(opts)
 }
 
+/// A host belongs to one project, and the panel's own domain to Tugport: otherwise a route on
+/// it (a longer path, say) would take another project's or the panel's requests and cookies.
+fn check_host(app: &AppState, project_id: &str, host: &str) -> ApiResult<()> {
+    if app.settings().panel_domain.is_some_and(|d| d.eq_ignore_ascii_case(host)) {
+        return Err(ApiError::forbidden(format!("{host} is the panel's own domain")));
+    }
+    let taken: bool = app.db.conn().query_row(
+        "SELECT COUNT(*) > 0 FROM domains d JOIN services s ON s.id = d.service_id WHERE d.host = ?1 AND s.project_id != ?2",
+        params![host, project_id],
+        |r| r.get(0),
+    )?;
+    if taken {
+        return Err(ApiError::conflict(format!("{host} is already used by another project")));
+    }
+    Ok(())
+}
+
+/// Routing a name through the tunnel creates or changes its DNS record in the owner's
+/// Cloudflare account, so that is the owner's call.
+fn check_tunnel(a: &Auth, before: bool, after: bool) -> ApiResult<()> {
+    if after && !before && !a.0.is_owner {
+        return Err(ApiError::forbidden("routing a domain through the Cloudflare Tunnel changes DNS records in the owner's Cloudflare account, so only the owner can turn it on"));
+    }
+    Ok(())
+}
+
 fn validate_domain(host: &str, path: &str, port: u16, opts: &DomainOptions) -> ApiResult<()> {
     if !store::valid_host(host) {
         return Err(ApiError::bad_request(format!("{host} is not a valid domain")));
@@ -539,6 +643,11 @@ fn validate_domain(host: &str, path: &str, port: u16, opts: &DomainOptions) -> A
     if let Some(rw) = &opts.rewrite {
         regex::Regex::new(&rw.from).map_err(|e| ApiError::bad_request(format!("rewrite pattern: {e}")))?;
     }
+    if let Some(fa) = &opts.forward_auth
+        && !(fa.url.starts_with("https://") || fa.url.starts_with("http://"))
+    {
+        return Err(ApiError::bad_request("the forward auth address is an http:// or https:// URL"));
+    }
     Ok(())
 }
 
@@ -549,6 +658,8 @@ pub async fn create_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
     let port = b.port.or_else(|| s.spec.database.as_ref().map(|d| databases::preset(d.engine).port)).unwrap_or(0);
     let opts = hash_basic_auth(b.options.unwrap_or_default(), None)?;
     validate_domain(&host, &path, port, &opts)?;
+    check_host(&app, &s.project_id, &host)?;
+    check_tunnel(&a, false, b.via_tunnel.unwrap_or(false))?;
     let did = util::id();
     let opts_json = serde_json::to_string(&opts)?;
     app.db.conn().execute(
@@ -572,6 +683,8 @@ pub async fn update_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
         None => d.options,
     };
     validate_domain(&host, &path, port, &opts)?;
+    check_host(&app, &s.project_id, &host)?;
+    check_tunnel(&a, d.via_tunnel, b.via_tunnel.unwrap_or(d.via_tunnel))?;
     let opts_json = serde_json::to_string(&opts)?;
     app.db.conn().execute(
         "UPDATE domains SET host = ?1, path = ?2, port = ?3, container = ?4, https = ?5, via_tunnel = ?6, options = ?7 WHERE id = ?8",

@@ -110,7 +110,48 @@ pub fn router(app: AppState) -> Router {
         .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
         .fallback(crate::web::static_handler)
         .layer(axum::middleware::from_fn(json_errors))
+        .layer(axum::middleware::from_fn(same_origin))
         .with_state(app)
+}
+
+/// Browsers attach the session cookie to requests other pages start, and a page on another
+/// subdomain of the panel's domain (where apps usually live) even counts as the same site. So a
+/// cookie-authenticated request that changes something, or opens a WebSocket (the console), must
+/// come from the panel's own pages. API keys are never sent by browsers on their own.
+async fn same_origin(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let h = req.headers();
+    let changes = !matches!(*req.method(), axum::http::Method::GET | axum::http::Method::HEAD) || h.contains_key(header::UPGRADE);
+    let by_cookie = !h.contains_key(header::AUTHORIZATION) && cookie(h, auth::SESSION_COOKIE).is_some();
+    if changes && by_cookie && cross_origin(h) {
+        return ApiError::forbidden("this request came from another site; use the panel itself").into_response();
+    }
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    for (k, v) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "same-origin"),
+        (
+            "content-security-policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; \
+             form-action 'self' https://github.com; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+        ),
+    ] {
+        headers.entry(k).or_insert(axum::http::HeaderValue::from_static(v));
+    }
+    resp
+}
+
+/// Whether the browser says (or the Origin shows) that another site started this request.
+fn cross_origin(h: &HeaderMap) -> bool {
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok());
+    if let Some(site) = get("sec-fetch-site") {
+        return !matches!(site, "same-origin" | "none");
+    }
+    match get("origin") {
+        Some(origin) => origin.split_once("://").map(|(_, o)| o) != get("host"),
+        None => false,
+    }
 }
 
 /// Axum answers malformed bodies with plain text; API clients get `{"error": ...}` like everywhere else.
@@ -140,6 +181,28 @@ pub fn hooks_router(app: AppState) -> Router {
 /// field left out (`None`, keep it). Use with `#[serde(default, deserialize_with = "present")]`.
 pub fn present<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     T::deserialize(d).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cross_origin;
+    use axum::http::HeaderMap;
+
+    fn h(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        pairs.iter().map(|(k, v)| (axum::http::HeaderName::from_static(k), v.parse().unwrap())).collect()
+    }
+
+    #[test]
+    fn tells_other_sites_apart() {
+        assert!(!cross_origin(&h(&[("sec-fetch-site", "same-origin"), ("host", "panel.example.com")])));
+        assert!(cross_origin(&h(&[("sec-fetch-site", "same-site"), ("host", "panel.example.com")])));
+        assert!(cross_origin(&h(&[("sec-fetch-site", "cross-site")])));
+        assert!(!cross_origin(&h(&[("origin", "https://panel.example.com"), ("host", "panel.example.com")])));
+        assert!(cross_origin(&h(&[("origin", "https://app.example.com"), ("host", "panel.example.com")])));
+        assert!(cross_origin(&h(&[("origin", "null"), ("host", "panel.example.com")])));
+        // Scripts and the CLI send neither header.
+        assert!(!cross_origin(&h(&[("host", "panel.example.com")])));
+    }
 }
 
 #[derive(Debug)]

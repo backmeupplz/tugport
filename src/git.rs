@@ -185,15 +185,103 @@ pub fn deploy_key_path(app: &App, service_id: &str) -> std::path::PathBuf {
     app.paths.run.join("keys").join(format!("{service_id}.key"))
 }
 
+/// A branch, tag or commit name as git accepts it, and never something git would take as an option.
+pub fn valid_ref(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 255
+        && !r.starts_with(['-', '+', '/', '.'])
+        && !r.ends_with(['/', '.'])
+        && !r.contains("..")
+        && r.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+@#".contains(&b))
+}
+
+/// A repository Tugport may fetch: a provider's `owner/name`, or a network address. Local paths
+/// and `file://` would reach other services' checkouts on this server.
+pub fn valid_repo(repo: &str, provider: bool) -> bool {
+    let r = repo.trim();
+    if r.is_empty() || r.starts_with('-') || r.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    if provider {
+        return !r.contains("..") && !r.contains(['?', '#', ':', '\\']);
+    }
+    ["https://", "http://", "ssh://", "git://"].iter().any(|p| r.starts_with(p))
+        || r.split_once(':').is_some_and(|(user_host, path)| user_host.contains('@') && !user_host.contains('/') && !path.is_empty())
+}
+
+/// Whether an http(s) repository address carries credentials (`https://user:token@host/...`),
+/// which everyone who can see the service would read; providers and deploy keys keep them sealed.
+pub fn url_has_credentials(repo: &str) -> bool {
+    let Some(rest) = repo.strip_prefix("https://").or_else(|| repo.strip_prefix("http://")) else { return false };
+    rest.split(['/', '?', '#']).next().is_some_and(|authority| authority.contains('@'))
+}
+
+/// The address as it may appear in logs: without credentials.
+fn redact(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) if url_has_credentials(url) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            format!("{scheme}://{host}/{path}")
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// Builds and Compose read a checkout as root, so it must not hold symlinks that lead out of it
+/// (to /etc/tugport, say, or another service's files).
+pub fn check_links(root: &Path) -> Result<()> {
+    use std::path::Component;
+    fn walk(root: &Path, dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                let mut at = dir.to_path_buf();
+                let mut inside = !target.is_absolute();
+                for c in target.components() {
+                    match c {
+                        Component::Normal(n) => at.push(n),
+                        Component::CurDir => {}
+                        Component::ParentDir => inside &= at.pop() && at.starts_with(root),
+                        _ => inside = false,
+                    }
+                }
+                if !inside || !at.starts_with(root) {
+                    bail!("the repository has a symlink that points outside it: {} -> {}", path.strip_prefix(root).unwrap_or(&path).display(), target.display());
+                }
+            } else if kind.is_dir() && entry.file_name() != ".git" {
+                walk(root, &path)?;
+            }
+        }
+        Ok(())
+    }
+    walk(root, root)
+}
+
 /// Fetch `git_ref` (branch, tag or commit) into `dest` and check it out. Returns (sha, message).
 pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, git_ref: &str, dest: &Path, log: &(dyn Fn(&str) + Sync)) -> Result<(String, String)> {
+    // Every source of a ref (the spec, webhooks, the API, migration) passes through here.
+    if !valid_ref(git_ref) {
+        bail!("{git_ref:?} is not a branch, tag or commit name");
+    }
+    if !valid_repo(repo, provider_id.is_some()) {
+        bail!("{repo:?} is not a repository Tugport can fetch: use an https://, ssh:// or git@host: address");
+    }
     let provider = match provider_id {
         Some(id) => Some(provider(app, id)?.ok_or_else(|| anyhow!("the Git provider of this service was removed"))?),
         None => None,
     };
     let url = provider.as_ref().map(|p| p.clone_url(repo)).unwrap_or_else(|| repo.to_string());
+    // Scoped to the provider's address, so submodules hosted elsewhere never receive the token,
+    // and passed in the environment, which other users cannot read (unlike argv).
     let header = match &provider {
-        Some(p) => Some(clone_header(p, repo).await?),
+        Some(p) => {
+            let entry = format!("http.{}/.extraheader={}", p.base_url.trim_end_matches('/'), clone_header(p, repo).await?);
+            Some(format!("'{}'", entry.replace('\'', "'\\''")))
+        }
         None => None,
     };
     let ssh_cmd = match app.db.get_state(&format!("deploykey:{}", s.id))? {
@@ -220,9 +308,10 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
     let git = |args: &[&str]| {
         let mut c = Command::new("git");
         if let Some(h) = &header {
-            c.arg("-c").arg(format!("http.extraHeader={h}"));
+            c.env("GIT_CONFIG_PARAMETERS", h);
         }
-        c.arg("-C").arg(dest).args(args).env("GIT_TERMINAL_PROMPT", "0");
+        // Network transports only, for submodules too: no local paths, file:// or ext::.
+        c.arg("-C").arg(dest).args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git");
         if let Some(ssh) = &ssh_cmd {
             c.env("GIT_SSH_COMMAND", ssh);
         }
@@ -235,7 +324,7 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
     } else {
         crate::proc::output(git(&["remote", "set-url", "origin", &url])).await?;
     }
-    log(&format!("Fetching {git_ref} from {}", url));
+    log(&format!("Fetching {git_ref} from {}", redact(&url)));
     let fetched = crate::proc::run_streamed(git(&["fetch", "-q", "--depth", "50", "--no-tags", "origin", git_ref]), log).await;
     if let Err(e) = fetched {
         // Full SHAs not at a branch tip need an unshallow fetch on some hosts.
@@ -249,6 +338,7 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
     if dest.join(".gitmodules").exists() {
         crate::proc::run_streamed(git(&["submodule", "update", "--init", "--recursive", "--depth", "1"]), log).await?;
     }
+    check_links(dest)?;
     let sha = crate::proc::output(git(&["rev-parse", "HEAD"])).await?.trim().to_string();
     let msg = crate::proc::output(git(&["log", "-1", "--format=%B"])).await?.trim().to_string();
     if let Some(ssh) = &ssh_cmd {
@@ -262,7 +352,7 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
 /// Post the deploy state on the commit (shows up as a check next to the commit).
 pub async fn report(app: &App, s: &Service, d: &Deploy, state: &str, description: &str) {
     let Source::Git { provider: Some(pid), repo, .. } = &s.spec.source else { return };
-    let Some(sha) = d.commit_sha.as_ref().or(d.git_ref.as_ref()).filter(|r| r.len() == 40) else { return };
+    let Some(sha) = d.commit_sha.as_ref().or(d.git_ref.as_ref()).filter(|r| r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())) else { return };
     let Ok(Some(p)) = provider(app, pid) else { return };
     let target = app.settings().panel_domain.map(|h| format!("https://{h}/services/{}/deploys/{}", s.id, d.id));
     let res: Result<()> = async {
@@ -588,6 +678,45 @@ mod tests {
         assert_eq!(parse_push(&h, body).unwrap().pusher, "nikita");
         let tag = br#"{"ref":"refs/tags/v1","after":"01","repository":{"full_name":"o/r"}}"#;
         assert!(parse_push(&h, tag).is_none());
+    }
+
+    #[test]
+    fn refuses_option_refs_and_local_repos() {
+        for ok in ["main", "feature/x-1", "v1.2.3", "refs/tags/v1", "0123456789abcdef0123456789abcdef01234567", "release@2"] {
+            assert!(valid_ref(ok), "{ok}");
+        }
+        for bad in ["", "-x", "--upload-pack=x", "--pathspec-from-file=/etc/passwd", "+main", "a..b", "a b", "x:y", "/abs", "a\nb"] {
+            assert!(!valid_ref(bad), "{bad}");
+        }
+        for ok in ["https://github.com/o/r.git", "git@github.com:o/r.git", "ssh://git@host:2222/o/r"] {
+            assert!(valid_repo(ok, false), "{ok}");
+        }
+        for bad in ["/var/lib/tugport/src/x/repo", "file:///etc", "ext::sh -c x", "-u", "../x", "C:/x"] {
+            assert!(!valid_repo(bad, false), "{bad}");
+        }
+        assert!(valid_repo("group/sub/name", true));
+        assert!(!valid_repo("o/../../x", true));
+        assert!(url_has_credentials("https://user:ghp_secret@github.com/o/r.git"));
+        assert!(url_has_credentials("https://token@git.example.com/o/r"));
+        assert!(!url_has_credentials("https://github.com/o/r.git"));
+        assert!(!url_has_credentials("https://github.com/o/r@v1"));
+        assert!(!url_has_credentials("git@github.com:o/r.git"));
+        assert_eq!(redact("https://user:ghp_secret@github.com/o/r.git"), "https://github.com/o/r.git");
+    }
+
+    #[test]
+    fn finds_symlinks_that_leave_the_checkout() {
+        let root = std::env::temp_dir().join(format!("tp-links-{}", util::id()));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::os::unix::fs::symlink("../b", root.join("a/up")).unwrap();
+        std::os::unix::fs::symlink("b/missing", root.join("a/dangling")).unwrap();
+        assert!(check_links(&root).is_ok());
+        std::os::unix::fs::symlink("../../..", root.join("a/b/out")).unwrap();
+        assert!(check_links(&root).is_err());
+        std::fs::remove_file(root.join("a/b/out")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("abs")).unwrap();
+        assert!(check_links(&root).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

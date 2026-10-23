@@ -108,8 +108,9 @@ const PROTOCOL: &str = "2025-06-18";
 pub async fn handle(req: Request) -> Response {
     let conn = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
     let headers = req.headers().clone();
-    let Ok(body) = req.into_body().collect().await.map(|b| b.to_bytes()) else {
-        return (StatusCode::BAD_REQUEST, axum::Json(rpc_error(Value::Null, -32700, "unreadable body"))).into_response();
+    // Read before anything checks the caller, so bounded like other JSON bodies.
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 2 << 20).await else {
+        return (StatusCode::BAD_REQUEST, axum::Json(rpc_error(Value::Null, -32700, "unreadable or too large body"))).into_response();
     };
     let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
         return (StatusCode::BAD_REQUEST, axum::Json(rpc_error(Value::Null, -32700, "parse error"))).into_response();
@@ -192,7 +193,8 @@ async fn call(t: &Tool, mut args: Map<String, Value>, headers: &HeaderMap, conn:
         _ => Value::Object(args),
     };
     let mut req = Request::builder().method(t.method.clone()).uri(&path).header(header::CONTENT_TYPE, "application/json");
-    for name in [header::AUTHORIZATION, header::COOKIE, header::HOST] {
+    // MCP clients authenticate with an API key; a browser's session cookie is not forwarded.
+    for name in [header::AUTHORIZATION, header::HOST] {
         if let Some(v) = headers.get(&name) {
             req = req.header(name, v);
         }

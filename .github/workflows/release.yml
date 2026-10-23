@@ -4,8 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+# Only the job that publishes may write; the build runs npm and cargo build scripts.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -18,19 +19,22 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: The tag matches the crate version
         run: |
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $v in Cargo.toml"; exit 1; }
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
       - name: Build the web panel
         run: |
           if [ -f web/package.json ]; then cd web && npm ci && npm run build; else mkdir -p web/dist && echo '<!doctype html><title>Tugport</title>' > web/dist/index.html; fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.arch }}-unknown-linux-musl
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
       - name: Build a static binary
@@ -40,7 +44,7 @@ jobs:
           cargo build --locked --release --target ${{ matrix.arch }}-unknown-linux-musl
           cp target/${{ matrix.arch }}-unknown-linux-musl/release/tugport tugport-linux-${{ matrix.arch }}
           ./tugport-linux-${{ matrix.arch }} version
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: tugport-linux-${{ matrix.arch }}
           path: tugport-linux-${{ matrix.arch }}
@@ -48,12 +52,14 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           merge-multiple: true
       - run: sha256sum tugport-linux-* > SHA256SUMS && cat SHA256SUMS
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             tugport-linux-x86_64

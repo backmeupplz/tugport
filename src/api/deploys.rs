@@ -37,6 +37,9 @@ fn trigger_for(a: &Auth) -> &'static str {
 pub async fn deploy(State(app): State<AppState>, a: Auth, Path(id): Path<String>, body: Option<Json<DeployBody>>) -> ApiResult<Json<Value>> {
     let b = body.map(|b| b.0).unwrap_or_default();
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
+    if b.git_ref.as_deref().is_some_and(|r| !crate::git::valid_ref(r)) {
+        return Err(ApiError::bad_request("ref is not a branch, tag or commit name"));
+    }
     let mut events = app.events.subscribe();
     let req = Request { trigger: trigger_for(&a).into(), actor: Some(a.0.name.clone()), git_ref: b.git_ref, ..Default::default() };
     let did = deploy::enqueue(&app, &s, req)?;
@@ -206,8 +209,9 @@ pub async fn events(State(app): State<AppState>, a: Auth, Query(q): Query<Events
             let e = e.ok()?;
             let visible = match &e.project_id {
                 Some(pid) => p.can(pid, Role::Viewer),
-                // Server-wide events (servers, metrics, alerts) go to whoever may see servers.
-                None => p.is_owner || p.all_projects_role.is_some(),
+                // Server-wide events (servers, metrics, alerts) go to whoever may see servers; the
+                // audit trail outside projects (sign-ins, users, keys) only to the owner.
+                None => p.is_owner || (p.all_projects_role.is_some() && e.kind != "audit"),
             };
             let wanted = q_project.as_ref().is_none_or(|x| e.project_id.as_ref() == Some(x)) && q_service.as_ref().is_none_or(|x| e.service_id.as_ref() == Some(x));
             (visible && wanted).then(|| Ok(sse::Event::default().event(e.kind.clone()).data(serde_json::to_string(&e).unwrap_or_default())))

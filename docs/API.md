@@ -20,7 +20,7 @@ Every request is checked against the caller's role on the project it touches:
 
 Two grants sit on top of the roles:
 - **`secrets:read`** lets the caller see env values.
-- **`destroy`** is required to delete things and to enable privileged mode, the Docker socket, host networking, bind mounts or extra capabilities.
+- **`destroy`** is required to delete things and to enable privileged mode, the Docker socket, host networking, bind mounts, extra capabilities or extra networks, and to attach a volume that already exists on a server or belongs to another project.
 
 The owner can do everything.
 
@@ -48,12 +48,12 @@ Services can be addressed by id or as `project.service` (for example `shop.api`)
 |---|---|---|
 | GET | `/api/users` | `{users: [{id, kind, name, email, is_owner, all_projects_role, projects: {project_id: role}, grants, disabled, totp, created_at}]}`. Non-owners only see id, kind and name for other users. |
 | POST | `/api/users` | Owner only. `{kind: "human"\|"agent", name, email?, password?, description?, all_projects_role?, projects?: {project: role}, grants?: []}` |
-| GET / PATCH / DELETE | `/api/users/{id}` | PATCH accepts `{name?, email?, password?, description?, disabled?, all_projects_role?, projects?, grants?}`. Only the fields sent change; `all_projects_role: null` removes that role. People may change their own name, email, password and description. |
+| GET / PATCH / DELETE | `/api/users/{id}` | PATCH accepts `{name?, email?, password?, description?, disabled?, all_projects_role?, projects?, grants?}`. Only the fields sent change; `all_projects_role: null` removes that role. People may change their own name, email, password and description; changing one's own password also needs `current_password`. |
 | POST | `/api/agents` | Owner only. Creates an agent and its key in one step. |
 | GET | `/api/users/{id}/keys` | `{keys: [{id, name, prefix, expires_at, allowed_ips, last_used_at, last_used_ip, created_at, revoked_at}]}` |
-| POST | `/api/users/{id}/keys` | `{name?, expires_days?, allowed_ips?}` returns `{id, token, snippets}` |
+| POST | `/api/users/{id}/keys` | `{name?, expires_days?, allowed_ips?}` returns `{id, token, snippets}`. A key making a key for its own user passes on its expiry and address limits. |
 | DELETE | `/api/keys/{id}` | Revokes the key. |
-| POST | `/api/keys/{id}/rotate` | Returns `{id, token, snippets}`; the old key is revoked. |
+| POST | `/api/keys/{id}/rotate` | Returns `{id, token, snippets}`; the old key is revoked. Revoked keys cannot be rotated. |
 | GET | `/api/audit?project&service&actor&before&limit` | `{entries: [{id, at, actor, actor_kind, key_id, ip, action, project_id, service_id, target, detail}]}` |
 
 `POST /api/agents` takes and returns:
@@ -84,7 +84,9 @@ Services can be addressed by id or as `project.service` (for example `shop.api`)
 - an optional `database: {engine: "postgres"|"mysql"|"mariadb"|"mongo"|"redis", user?, database?}`;
 - optional `env: {NAME: value}`.
 
-It returns `{id, name, kind, spec, deploy_hook, database?: {url, project_var}}`. A new database also adds a `<NAME>_URL` project variable.
+It returns `{id, name, kind, spec, deploy_hook, database?: {url, project_var}}`. A new database also adds a `<NAME>_URL` project variable. A service name whose container prefix (`tp-<project>-<name>`) another project's service already has is refused.
+
+A Compose stack's file is checked at every deploy. Without the stack's `privileged` switch (which needs `destroy`, like for apps), it may only use Compose keys that stay inside the stack: no privileged mode, capabilities, devices, host namespaces (`network_mode`, `pid` and `ipc` may only share another service of the stack), providers or API sockets; bind mounts, `env_file`, secrets, configs and build contexts only inside the stack's folder and without `${VAR}`; no external or named networks and volumes, network drivers other than bridge, IPAM settings, `include` or `extends` from other files. A repository whose symlinks point outside it is refused for any build.
 
 `GET /api/services` lists every service the caller can see: `{services: [{id, name, project, project_id, kind, state, running, desired}]}`.
 
@@ -98,7 +100,7 @@ Every field has a default. See `src/model.rs`.
 | `build` | `{type: "auto"}`, `{type: "dockerfile", path, target?}`, `{type: "railpack"}`, `{type: "nixpacks"}` or `{type: "buildpacks", builder}` |
 | Runtime basics | `command`, `entrypoint`, `working_dir`, `user`, `replicas` (ignored while `autoscale` is set) |
 | `ports` | `[{container, host, protocol: tcp\|udp}]` |
-| `mounts` | `[{type: volume, name, target, readonly}, {type: bind, source, target, readonly}, {type: file, target}]` |
+| `mounts` | `[{type: volume, name, target, readonly}, {type: bind, source, target, readonly}, {type: file, target}]`. Docker volumes are shared by everything on a server, so a volume a service adds must be new on every server or already used by this project, unless an admin with `destroy` attaches it. |
 | `resources` | `{cpus, memory_mb, memory_reservation_mb}` |
 | `health` | `{kind: auto\|http\|tcp\|command\|none, path, port, command, interval_s, timeout_s, retries, start_period_s}` |
 | `rollout` | `{strategy: start_first\|stop_first, drain_s, health_timeout_s, keep_images}` |
@@ -108,7 +110,7 @@ Every field has a default. See `src/model.rs`.
 | `placement` | `{node, region, labels}`: `node` is a server id or name; labels must all match. Services with a database, volumes or bind mounts, host ports, host networking or the Docker socket stay on the server they first ran on. Other services spread their replicas over the eligible servers. |
 | `autoscale` | `{min, max, cpu_percent, rps}`: replicas follow total CPU (percent of one core per replica) or requests per second per replica. More start at once; extras leave after five quiet minutes. |
 | `sleep` | `{idle_minutes}`: the service stops after that long without requests and starts again on the next one (web apps only). |
-| Other | `database`, `compose: {file}`, `build_args` |
+| Other | `database`, `compose: {file}`, `build_args`, `networks` (extra Docker networks to join; adding one needs `destroy`) |
 
 ### Service endpoints
 
@@ -120,7 +122,7 @@ Every field has a default. See `src/model.rs`.
 | GET | `/api/services/{id}/env` | `{env: [names] or {NAME: value}, project_vars: [names], values_visible}` |
 | PUT | `/api/services/{id}/env` | `{NAME: "value" \| null}`. Writing never needs `secrets:read`. |
 | GET / PUT | `/api/services/{id}/files` | PUT takes `{target: "/etc/app.conf", content \| null}` |
-| GET / POST | `/api/services/{id}/domains` | POST takes `{host, path?, port, container?, https?, via_tunnel?, options?}` |
+| GET / POST | `/api/services/{id}/domains` | POST takes `{host, path?, port, container?, https?, via_tunnel?, options?}`. A host belongs to one project, the panel's own domain to the panel, and turning on `via_tunnel` (which writes DNS records in the owner's Cloudflare account) needs the owner. |
 | PATCH / DELETE | `/api/domains/{id}` | PATCH takes the same fields; `container: null` clears a Compose container target. |
 | GET | `/api/services/{id}/hook` | The deploy webhook URL `{url}`. Needs `operator` and `secrets:read`. |
 | POST | `/api/services/{id}/hook` | Issues a new deploy webhook URL `{url}`; the old one stops working. |
@@ -189,8 +191,8 @@ A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit
 
 | Method | Path | Notes |
 |---|---|---|
-| POST / GET | `/api/hooks/deploy/{token}?ref=` | Deploys the service. |
-| POST / GET | `/api/deploy/{token}` and `/api/compose/deploy/{token}` | The same, at Easypanel's paths, so migrated webhooks keep working. GitHub push events sent there only deploy pushes to the service's branch. |
+| POST / GET | `/api/hooks/deploy/{token}?ref=` | Deploys the service, at `ref` (a branch, tag or commit) when given. |
+| POST / GET | `/api/deploy/{token}` and `/api/compose/deploy/{token}` | The same, at Easypanel's paths, so migrated webhooks keep working. GitHub push events sent there only deploy pushes to the service's branch, and deploy the branch itself, since such bodies are not signed. |
 | POST | `/api/nodes/join` | Called by `tugport install --join` on a new server; the one-time token is the credential. |
 | POST | `/api/hooks/git/{provider}` | Push events. The signature is checked; watch paths and `[skip deploy]` are honored. |
 
@@ -303,7 +305,7 @@ The `config` for each kind:
 | PUT | `/api/tunnel` | `{api_token}`: creates the tunnel and runs cloudflared. The token needs Account > Cloudflare Tunnel > Edit and Zone > DNS > Edit. A connect that fails removes what it created. |
 | DELETE | `/api/tunnel` | Stops cloudflared and deletes the tunnel and the DNS records Tugport made for it. |
 
-Domains with `via_tunnel: true` are routed through the tunnel and get a proxied CNAME to it. When a domain leaves the tunnel, Tugport deletes the record it made, unless someone has pointed that record elsewhere.
+Domains with `via_tunnel: true` are routed through the tunnel and get a proxied CNAME to it. A name that already has a CNAME Tugport did not make (or A/AAAA records) is left alone and reported. When a domain leaves the tunnel, Tugport deletes the record it made, unless someone has pointed that record elsewhere.
 
 ## Servers
 
@@ -356,4 +358,4 @@ The project gets `<DB>_READ_URL` (for MongoDB, a replica-set URL that reads from
 
 ## MCP
 
-`POST /mcp` speaks streamable HTTP JSON-RPC (`initialize`, `tools/list`, `tools/call`). It uses the same bearer key and the same permissions as the REST API. Its tools cover projects, services, deploys, logs, exec, env, domains, metrics, servers, backups, database replicas and the audit log.
+`POST /mcp` speaks streamable HTTP JSON-RPC (`initialize`, `tools/list`, `tools/call`). It uses the same bearer key and the same permissions as the REST API (never a browser's session cookie). Its tools cover projects, services, deploys, logs, exec, env, domains, metrics, servers, backups, database replicas and the audit log.

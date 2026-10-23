@@ -32,6 +32,9 @@ pub async fn deploy_hook(State(app): State<AppState>, Path(token): Path<String>,
         return Err(ApiError::not_found("unknown deploy hook"));
     };
     let s = store::service(&app, &id)?.ok_or_else(|| ApiError::not_found("unknown deploy hook"))?;
+    if q.git_ref.as_deref().is_some_and(|r| !git::valid_ref(r)) {
+        return Err(ApiError::bad_request("ref is not a branch, tag or commit name"));
+    }
     let mut req = Request { trigger: "webhook".into(), actor: Some("deploy hook".into()), git_ref: q.git_ref, ..Default::default() };
     // Easypanel pointed GitHub webhooks at this URL: only pushes to the deployed branch count.
     if headers.contains_key("x-github-event") {
@@ -43,8 +46,10 @@ pub async fn deploy_hook(State(app): State<AppState>, Path(token): Path<String>,
         let Some(push) = push.filter(|p| branch.is_some_and(|b| *b == p.branch)) else {
             return Ok(Json(json!({ "ignored": "not a push to the deployed branch" })));
         };
+        // The body is not signed, so it only says that the branch moved: the deploy fetches the
+        // branch itself rather than a commit named in the body (which could be any commit).
         let actor = (!push.pusher.is_empty()).then_some(push.pusher);
-        req = Request { trigger: "push".into(), actor, git_ref: Some(push.branch), commit_sha: Some(push.sha), commit_message: Some(push.message), ..Default::default() };
+        req = Request { trigger: "push".into(), actor, git_ref: Some(push.branch), ..Default::default() };
     }
     let did = deploy::enqueue(&app, &s, req)?;
     app.audit(None, "deploy.webhook", Some(&s.project_id), Some(&s.id), Some(&s.name), Some(&did));

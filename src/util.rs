@@ -55,6 +55,28 @@ pub fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> 
     l.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `rel` (a path from a service's settings) under `base`: never absolute or with `..`, so it
+/// cannot leave `base`. Checkouts are free of symlinks that lead out (`git::check_links`).
+pub fn inside(base: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let rel = std::path::Path::new(rel.trim_start_matches('/'));
+    rel.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)).then(|| base.join(rel))
+}
+
+/// A response body, refused past `limit` bytes (for answers from servers Tugport does not run).
+pub async fn read_capped(resp: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk?);
+        if body.len() > limit {
+            anyhow::bail!("the answer is larger than {} KB", limit / 1024);
+        }
+    }
+    Ok(body)
+}
+
 pub fn ct_eq(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
     a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
@@ -73,6 +95,17 @@ mod tests {
         assert!(!valid_name("app-"));
         assert!(!valid_name(""));
         assert!(!valid_name("a_b"));
+    }
+
+    #[test]
+    fn paths_stay_inside() {
+        let base = std::path::Path::new("/w/repo");
+        assert_eq!(inside(base, "").as_deref(), Some(base));
+        assert_eq!(inside(base, "/api/").unwrap(), base.join("api"));
+        assert_eq!(inside(base, "./a/Dockerfile").unwrap(), base.join("a/Dockerfile"));
+        assert!(inside(base, "../x").is_none());
+        assert!(inside(base, "a/../../x").is_none());
+        assert!(inside(base, "//etc/../..").is_none());
     }
 
     #[test]

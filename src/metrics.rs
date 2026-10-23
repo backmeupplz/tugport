@@ -128,7 +128,7 @@ pub async fn sample_loop(app: AppState, keep: bool) {
         for d in disks.list() {
             let mount = d.mount_point().to_string_lossy().to_string();
             let fs = d.file_system().to_string_lossy().to_string();
-            if d.total_space() == 0 || fs.contains("overlay") || fs.contains("tmpfs") || !seen.insert(d.name().to_string_lossy().to_string()) {
+            if !real_disk(&fs, d.total_space(), d.mount_point()) || !seen.insert(d.name().to_string_lossy().to_string()) {
                 continue;
             }
             let u = d.usage();
@@ -262,6 +262,12 @@ async fn containers(app: &App, prev: &mut HashMap<String, ContainerPrev>) -> Vec
     }
     prev.retain(|id, _| live.contains(id));
     per.into_values().collect()
+}
+
+/// A mount worth a disk card. Containers bind-mount single files such as /etc/resolv.conf from the
+/// host disk, and those come first in the mount table, so they must lose to a directory mount.
+fn real_disk(fs: &str, total: u64, mount: &std::path::Path) -> bool {
+    total > 0 && !fs.contains("overlay") && !fs.contains("tmpfs") && mount.is_dir()
 }
 
 fn cgroup_dir(id: &str) -> Option<PathBuf> {
@@ -453,5 +459,16 @@ mod tests {
     fn ranges() {
         assert_eq!(parse_range("7d"), 604800);
         assert_eq!(parse_range("junk"), 3600);
+    }
+
+    #[test]
+    fn file_bind_mounts_are_not_disks() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(real_disk("ext4", 1, root));
+        assert!(!real_disk("ext4", 1, &root.join("Cargo.toml")));
+        assert!(!real_disk("ext4", 1, &root.join("no-such-mount")));
+        assert!(!real_disk("overlay", 1, root));
+        assert!(!real_disk("tmpfs", 1, root));
+        assert!(!real_disk("ext4", 0, root));
     }
 }

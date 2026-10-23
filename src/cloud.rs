@@ -137,6 +137,15 @@ fn aws_arm(size: &str) -> bool {
 
 /// Create a machine that installs Tugport and joins this panel on first boot.
 pub async fn create_server(app: &AppState, account_id: &str, region: &str, size: &str, pool: Option<&str>, panel_url: &str) -> Result<String> {
+    // Region reaches the AWS hostname and the SigV4 signature; the panel URL goes into the new
+    // machine's boot script. Both are the owner's, but a typo should fail here, not sign a
+    // request to the wrong host or garble the join command.
+    if region.is_empty() || !region.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        bail!("{region} is not a valid region");
+    }
+    if reqwest::Url::parse(panel_url).ok().filter(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some()).is_none() {
+        bail!("the panel address must be an http(s) URL the new server can reach");
+    }
     let acc = account(app, account_id)?;
     let id = util::id();
     let name = format!("tugport-{}-{}", region.to_lowercase().replace('_', "-"), &id[..id.len().min(6)]);
@@ -148,7 +157,8 @@ pub async fn create_server(app: &AppState, account_id: &str, region: &str, size:
         let join = crate::nodes::join_token_for(app, panel_url, Some(&id)).await?;
         // Boot-time downloads can meet a passing 5xx; a machine that never joins only costs money.
         let script = format!(
-            "#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8 9 10; do curl -fsSL --retry 5 https://tugport.com/install -o /tmp/tugport-install && break; sleep 15; done\nsh /tmp/tugport-install --join {panel_url} --token {}\n",
+            "#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8 9 10; do curl -fsSL --retry 5 https://tugport.com/install -o /tmp/tugport-install && break; sleep 15; done\nsh /tmp/tugport-install --join '{}' --token '{}'\n",
+            panel_url.replace('\'', "'\\''"),
             join.token
         );
         match &acc.creds {

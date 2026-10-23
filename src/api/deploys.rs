@@ -209,8 +209,9 @@ pub async fn events(State(app): State<AppState>, a: Auth, Query(q): Query<Events
             let e = e.ok()?;
             let visible = match &e.project_id {
                 Some(pid) => p.can(pid, Role::Viewer),
-                // Server-wide events (servers, metrics, alerts) go to whoever may see servers.
-                None => p.is_owner || p.all_projects_role.is_some(),
+                // Server-wide events (servers, metrics, alerts) go to whoever may see servers; the
+                // audit trail outside projects (sign-ins, users, keys) only to the owner.
+                None => p.is_owner || (p.all_projects_role.is_some() && e.kind != "audit"),
             };
             let wanted = q_project.as_ref().is_none_or(|x| e.project_id.as_ref() == Some(x)) && q_service.as_ref().is_none_or(|x| e.service_id.as_ref() == Some(x));
             (visible && wanted).then(|| Ok(sse::Event::default().event(e.kind.clone()).data(serde_json::to_string(&e).unwrap_or_default())))

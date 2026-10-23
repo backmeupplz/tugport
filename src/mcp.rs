@@ -108,8 +108,9 @@ const PROTOCOL: &str = "2025-06-18";
 pub async fn handle(req: Request) -> Response {
     let conn = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
     let headers = req.headers().clone();
-    let Ok(body) = req.into_body().collect().await.map(|b| b.to_bytes()) else {
-        return (StatusCode::BAD_REQUEST, axum::Json(rpc_error(Value::Null, -32700, "unreadable body"))).into_response();
+    // Read before anything checks the caller, so bounded like other JSON bodies.
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 2 << 20).await else {
+        return (StatusCode::BAD_REQUEST, axum::Json(rpc_error(Value::Null, -32700, "unreadable or too large body"))).into_response();
     };
     let Ok(msg) = serde_json::from_slice::<Value>(&body) else {
         return (StatusCode::BAD_REQUEST, axum::Json(rpc_error(Value::Null, -32700, "parse error"))).into_response();

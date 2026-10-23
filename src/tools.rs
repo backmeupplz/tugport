@@ -63,8 +63,9 @@ fn release(tool: Tool) -> Result<Release> {
     })
 }
 
+/// Pinned by digest like the tools themselves: BuildKit runs it for every Railpack build.
 pub fn railpack_frontend() -> &'static str {
-    "ghcr.io/railwayapp/railpack-frontend:v0.43.0"
+    "ghcr.io/railwayapp/railpack-frontend:v0.43.0@sha256:355ef61fae6f2551103cd8b10c710cb07167dd353d561f15c69b8d7ac1c676cc"
 }
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -85,7 +86,7 @@ pub async fn ensure(app: &App, tool: Tool, log: &(dyn Fn(&str) + Sync)) -> Resul
     std::fs::create_dir_all(&work)?;
     let result = async {
         let archive = work.join("archive.tgz");
-        let resp = reqwest::get(r.url).await?.error_for_status()?;
+        let resp = reqwest::Client::builder().https_only(true).build()?.get(r.url).send().await?.error_for_status()?;
         let mut file = tokio::fs::File::create(&archive).await?;
         let mut hasher = Sha256::new();
         let mut stream = resp.bytes_stream();

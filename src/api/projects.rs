@@ -248,6 +248,12 @@ fn check_dangerous(a: &Auth, project_id: &str, old: Option<&ServiceSpec>, new: &
         if !crate::git::valid_repo(repo, provider.is_some()) {
             return Err(ApiError::bad_request(format!("{repo} is not a repository Tugport can fetch: use an https://, ssh:// or git@host: address")));
         }
+        let repo_changed = old.is_none_or(|o| !matches!(&o.source, Source::Git { repo: r, .. } if r == repo));
+        if repo_changed && crate::git::url_has_credentials(repo) {
+            return Err(ApiError::bad_request(
+                "the repository address holds credentials, which everyone who can see the service would read; connect a Git provider or add a deploy key instead",
+            ));
+        }
         if !crate::git::valid_ref(branch) {
             return Err(ApiError::bad_request(format!("{branch} is not a branch name")));
         }
@@ -412,6 +418,12 @@ async fn prepare_database(
     }
     if db.database.is_empty() {
         db.database = "app".into();
+    }
+    // These become the database's user and schema and appear in the connection URL and in the
+    // replica setup scripts; keep them to plain identifiers so neither is malformed.
+    let ident = |s: &str| !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') && !s.starts_with(['-', '_']);
+    if !ident(&db.user) || !ident(&db.database) {
+        return Err(ApiError::bad_request("the database user and name are letters, digits, underscores and dashes"));
     }
     let password = util::token(32);
     for (k, v) in databases::init_env(db.engine, &db.user, &db.database, &password) {

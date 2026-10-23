@@ -710,13 +710,14 @@ pub async fn audit(State(app): State<AppState>, a: Auth, Query(q): Query<AuditQu
         return Err(ApiError::forbidden("pick a project to see its audit log"));
     }
     let conn = app.db.conn();
+    // Entries outside projects (sign-ins and their addresses, users, keys, settings) are the owner's.
     let mut stmt = conn.prepare(
         "SELECT id, at, actor_name, actor_kind, key_id, ip, action, project_id, service_id, target, detail FROM audit
          WHERE (?1 IS NULL OR project_id = ?1) AND (?2 IS NULL OR service_id = ?2) AND (?3 IS NULL OR actor_name = ?3)
-           AND (?4 IS NULL OR id < ?4) ORDER BY id DESC LIMIT ?5",
+           AND (?4 IS NULL OR id < ?4) AND (?6 OR project_id IS NOT NULL) ORDER BY id DESC LIMIT ?5",
     )?;
     let rows: Vec<Value> = stmt
-        .query_map(params![q.project, q.service, q.actor, q.before, q.limit.unwrap_or(100).min(500)], |r| {
+        .query_map(params![q.project, q.service, q.actor, q.before, q.limit.unwrap_or(100).min(500), a.0.is_owner], |r| {
             Ok(json!({
                 "id": r.get::<_, i64>(0)?, "at": r.get::<_, i64>(1)?, "actor": r.get::<_, Option<String>>(2)?,
                 "actor_kind": r.get::<_, Option<String>>(3)?, "key_id": r.get::<_, Option<String>>(4)?, "ip": r.get::<_, Option<String>>(5)?,

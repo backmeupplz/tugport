@@ -413,6 +413,8 @@ fn confirm(question: &str) -> Result<bool> {
 /// would mount Tugport's own files.
 fn review_host_access(plan: &mut Plan) {
     let own = crate::paths::Paths::from_env();
+    // Networks of the migrated projects (services that use another project's names join it).
+    let migrated: Vec<String> = plan.projects.iter().flat_map(|p| [runtime::network_name(&p.name), runtime::overlay_name(&p.name)]).collect();
     for s in plan.services.iter_mut().filter(|s| s.cutover != Cutover::Unsupported) {
         let binds: Vec<String> = s.spec.mounts.iter().filter_map(|m| if let crate::model::Mount::Bind { source, .. } = m { Some(source.clone()) } else { None }).collect();
         let tugports = |b: &String| {
@@ -422,6 +424,14 @@ fn review_host_access(plan: &mut Plan) {
         if binds.iter().any(tugports) {
             s.cutover = Cutover::Unsupported;
             s.notes.push("it mounts Tugport's own files".into());
+            continue;
+        }
+        // Names in Tugport's own namespace would attach another project's data or network.
+        let ours = |n: &str| n.starts_with("tp-") || n.starts_with("tpm-") || n.starts_with("tugport");
+        let volumes = s.spec.mounts.iter().filter_map(|m| if let crate::model::Mount::Volume { name, .. } = m { Some(name.as_str()) } else { None });
+        if volumes.chain(s.spec.networks.iter().map(String::as_str).filter(|n| !migrated.iter().any(|m| m == n))).any(ours) {
+            s.cutover = Cutover::Unsupported;
+            s.notes.push("it uses a volume or network name that belongs to Tugport (tp-, tpm-, tugport)".into());
             continue;
         }
         let mut access: Vec<String> = binds.iter().map(|b| format!("bind mount {b}")).collect();
@@ -508,12 +518,19 @@ fn print_plan(plan: &Plan) {
     if hooks > 0 {
         println!("Deploy webhooks: {hooks} old URLs keep working{}", plan.legacy_listen.as_ref().map(|l| format!(" (Tugport answers on {l} after the switch)")).unwrap_or_default());
     }
-    let mut tokens: BTreeMap<&str, usize> = BTreeMap::new();
-    for (base, _) in plan.services.iter().filter_map(|s| s.git_secret.as_ref()) {
-        *tokens.entry(base).or_default() += 1;
+    let mut tokens: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (base, token) in plan.services.iter().filter_map(|s| s.git_secret.as_ref()) {
+        tokens.entry(base).or_default().push(token);
     }
-    for (base, n) in tokens {
+    for (base, mut list) in tokens {
+        let n = list.len();
+        list.sort();
+        list.dedup();
         println!("Git: {n} repositories on {base} had a token in their URL; it becomes one encrypted Git provider");
+        if list.len() > 1 {
+            // One provider per host means one token for all of them.
+            println!("  ! they used {} different tokens and only the first one is kept, so it reads every one of those repositories", list.len());
+        }
     }
     let count = |f: &dyn Fn(&&&NewService) -> bool| moved.iter().filter(f).count();
     println!(
@@ -770,7 +787,15 @@ async fn swap(app: &AppState, s: &NewService, j: &mut Journal) -> Result<()> {
             save(app, j)?;
         }
         println!("{}: stopping the old copy", s.key);
-        halt(&app.docker, &s.old, false).await?;
+        if let Err(e) = halt(&app.docker, &s.old, false).await {
+            // Whatever did stop comes back, so the service is not left down until a rerun.
+            println!("{}: could not stop the old copy, starting it again", s.key);
+            if let Some(stopped) = moved_mut(j, &s.key)?.stopped.take() {
+                start_old(&app.docker, &stopped).await;
+            }
+            save(app, j)?;
+            return Err(e.context(format!("stopping the old copy of {}", s.key)));
+        }
         println!("{}: starting on Tugport", s.key);
         let svc = store::service(app, &m.id)?.ok_or_else(|| anyhow!("{} vanished", s.key))?;
         if let Err(e) = start(app, &svc, s).await {
@@ -864,14 +889,14 @@ async fn labeled(docker: &Docker, label: &str, all: bool) -> Result<Vec<String>>
 
 async fn swarm_replicas(service: &str) -> Result<u64> {
     let mut cmd = tokio::process::Command::new("docker");
-    cmd.args(["service", "inspect", "--format", "{{.Spec.Mode.Replicated.Replicas}}", service]);
+    cmd.args(["service", "inspect", "--format", "{{.Spec.Mode.Replicated.Replicas}}", "--", service]);
     let out = crate::proc::output(cmd).await?;
     out.trim().parse().with_context(|| format!("{service} is not a replicated service"))
 }
 
 async fn scale(docker: &Docker, service: &str, n: u64, fast: bool) -> Result<()> {
     let mut cmd = tokio::process::Command::new("docker");
-    cmd.args(["service", "scale", "--detach", &format!("{service}={n}")]);
+    cmd.args(["service", "scale", "--detach", "--", &format!("{service}={n}")]);
     crate::proc::output(cmd).await?;
     let label = format!("com.docker.swarm.service.name={service}");
     let started = std::time::Instant::now();
@@ -1007,8 +1032,11 @@ async fn answers(url: &str, host: Option<&str>, timeout: Duration) -> bool {
 /// Processes running `tugport server`.
 fn server_pids() -> Vec<String> {
     let Ok(dir) = std::fs::read_dir("/proc") else { return vec![] };
+    // Containers' processes show up in /proc too; only this host's own count.
+    let ours = std::fs::read_link("/proc/self/ns/pid").ok();
     dir.flatten()
         .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
+        .filter(|e| ours.is_some() && std::fs::read_link(e.path().join("ns/pid")).ok() == ours)
         .filter(|e| {
             let cmd = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
             let mut args = cmd.split(|b| *b == 0);
@@ -1095,8 +1123,13 @@ async fn rollback(app: &AppState, yes: bool) -> Result<()> {
         start_old(&app.docker, &panel).await;
         save(app, &j)?;
     }
-    if let Some(s) = j.settings_before.take() {
-        app.db.set_setting("instance", &s)?;
+    // Only what the migration changed: later changes (a private panel, trusted proxies...) stay.
+    if let Some(before) = j.settings_before.take() {
+        let mut settings = app.settings();
+        settings.acme_email = before.acme_email;
+        settings.panel_domain = before.panel_domain;
+        settings.legacy_listen = before.legacy_listen;
+        app.db.set_setting("instance", &settings)?;
     }
     for m in &j.services {
         if let Some(svc) = store::service(app, &m.id)? {

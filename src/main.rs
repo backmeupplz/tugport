@@ -71,8 +71,9 @@ enum Cmd {
     Node,
     /// Print a one-time link for creating the owner account.
     SetupLink,
-    /// Restore the master key from its recovery key after a reinstall.
-    Recover { key: String },
+    /// Restore the master key from its recovery key after a reinstall. Without KEY it is read
+    /// from standard input, which keeps it out of the shell history.
+    Recover { key: Option<String> },
     /// Print the version.
     Version,
     /// Bring the private network between servers up from its saved key and address
@@ -112,6 +113,15 @@ fn main() -> Result<()> {
         }
         Cmd::Recover { key } => {
             let paths = paths::Paths::from_env();
+            let key = match key {
+                Some(k) => zeroize::Zeroizing::new(k),
+                None => {
+                    eprint!("Recovery key: ");
+                    let mut line = zeroize::Zeroizing::new(String::new());
+                    std::io::stdin().read_line(&mut line)?;
+                    line
+                }
+            };
             crypto::restore_master(&paths.etc, &key)?;
             println!("Master key restored to {}", paths.etc.display());
             Ok(())

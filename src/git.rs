@@ -209,6 +209,25 @@ pub fn valid_repo(repo: &str, provider: bool) -> bool {
         || r.split_once(':').is_some_and(|(user_host, path)| user_host.contains('@') && !user_host.contains('/') && !path.is_empty())
 }
 
+/// Whether an http(s) repository address carries credentials (`https://user:token@host/...`),
+/// which everyone who can see the service would read; providers and deploy keys keep them sealed.
+pub fn url_has_credentials(repo: &str) -> bool {
+    let Some(rest) = repo.strip_prefix("https://").or_else(|| repo.strip_prefix("http://")) else { return false };
+    rest.split(['/', '?', '#']).next().is_some_and(|authority| authority.contains('@'))
+}
+
+/// The address as it may appear in logs: without credentials.
+fn redact(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) if url_has_credentials(url) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            format!("{scheme}://{host}/{path}")
+        }
+        _ => url.to_string(),
+    }
+}
+
 /// Builds and Compose read a checkout as root, so it must not hold symlinks that lead out of it
 /// (to /etc/tugport, say, or another service's files).
 pub fn check_links(root: &Path) -> Result<()> {
@@ -305,7 +324,7 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
     } else {
         crate::proc::output(git(&["remote", "set-url", "origin", &url])).await?;
     }
-    log(&format!("Fetching {git_ref} from {}", url));
+    log(&format!("Fetching {git_ref} from {}", redact(&url)));
     let fetched = crate::proc::run_streamed(git(&["fetch", "-q", "--depth", "50", "--no-tags", "origin", git_ref]), log).await;
     if let Err(e) = fetched {
         // Full SHAs not at a branch tip need an unshallow fetch on some hosts.
@@ -677,6 +696,12 @@ mod tests {
         }
         assert!(valid_repo("group/sub/name", true));
         assert!(!valid_repo("o/../../x", true));
+        assert!(url_has_credentials("https://user:ghp_secret@github.com/o/r.git"));
+        assert!(url_has_credentials("https://token@git.example.com/o/r"));
+        assert!(!url_has_credentials("https://github.com/o/r.git"));
+        assert!(!url_has_credentials("https://github.com/o/r@v1"));
+        assert!(!url_has_credentials("git@github.com:o/r.git"));
+        assert_eq!(redact("https://user:ghp_secret@github.com/o/r.git"), "https://github.com/o/r.git");
     }
 
     #[test]

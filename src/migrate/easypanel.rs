@@ -335,9 +335,11 @@ fn app(svc: &Value, n: &mut NewService, ctx: &Ctx, has_token: bool, registries: 
         n.spec.rollout.strategy = Strategy::StopFirst;
     }
     for port in svc["ports"].as_array().into_iter().flatten() {
-        if let (Some(target), Some(published)) = (port["target"].as_u64(), port["published"].as_u64()) {
+        // Out-of-range numbers are skipped rather than wrapped onto another port (80, say).
+        let num = |k: &str| port[k].as_u64().and_then(|p| u16::try_from(p).ok());
+        if let (Some(target), Some(published)) = (num("target"), num("published")) {
             let protocol = if st(port, "protocol") == "udp" { Protocol::Udp } else { Protocol::Tcp };
-            n.spec.ports.push(Port { container: target as u16, host: published as u16, protocol });
+            n.spec.ports.push(Port { container: target, host: published, protocol });
         }
     }
     for m in svc["mounts"].as_array().into_iter().flatten() {
@@ -406,8 +408,8 @@ fn database(svc: &Value, n: &mut NewService) {
     } else {
         shell(&mut n.spec, st(svc, "command"));
     }
-    if let Some(port) = svc["exposedPort"].as_u64().filter(|p| *p > 0) {
-        n.spec.ports.push(Port { container: databases::preset(engine).port, host: port as u16, protocol: Protocol::Tcp });
+    if let Some(port) = svc["exposedPort"].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|p| *p > 0) {
+        n.spec.ports.push(Port { container: databases::preset(engine).port, host: port, protocol: Protocol::Tcp });
     }
     let check = match engine {
         // The official healthcheck.sh needs a user the old panel never created.
@@ -554,7 +556,7 @@ fn map_domains(svc: &Value, mine: &[&Value], notes: &mut Vec<String>, placeholde
         out.push(NewDomain {
             host,
             path: path.into(),
-            port: dest["port"].as_u64().unwrap_or(80) as u16,
+            port: dest["port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(80),
             container: Some(st(dest, "composeService")).filter(|c| !c.is_empty()).map(String::from),
             https: d["https"].as_bool().unwrap_or(true),
             options: options.clone(),

@@ -234,6 +234,7 @@ async fn ensure_registry() -> Result<()> {
     let _ = sh("docker rm -f tugport-registry").await;
     sh(&format!(
         "docker run -d --name tugport-registry --restart unless-stopped --label tugport.system=registry \
+         -e REGISTRY_STORAGE_DELETE_ENABLED=true \
          -p {ip}:{port}:5000 -p 127.0.0.1:{port}:5000 -v tugport-registry:/var/lib/registry registry:2",
         ip = mesh::PANEL_IP,
         port = REGISTRY_PORT
@@ -479,11 +480,27 @@ pub async fn agent(node: &NodeHandle, method: reqwest::Method, path: &str, body:
     }
     let resp = req.send().await.with_context(|| format!("reaching {}", node.name))?;
     let status = resp.status();
-    let v: Value = resp.json().await.unwrap_or(Value::Null);
+    // Bounded, so a server that misbehaves cannot exhaust the panel's memory.
+    let body = util::read_capped(resp, 8 << 20).await.with_context(|| format!("reading {}'s answer", node.name))?;
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     if !status.is_success() {
         bail!("{}: {}", node.name, v["error"].as_str().unwrap_or(status.as_str()));
     }
     Ok(v)
+}
+
+/// Services whose replicas were placed on `node` by their last rollout or scaling.
+fn placed_on(app: &App, node: &str) -> std::collections::HashSet<String> {
+    let conn = app.db.conn();
+    let Ok(mut stmt) = conn.prepare("SELECT key, value FROM state WHERE key LIKE 'nodes:%'") else { return Default::default() };
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map(|rows| {
+            rows.filter_map(|r| r.ok())
+                .filter(|(_, nodes)| nodes.split(',').any(|n| n == node))
+                .filter_map(|(k, _)| k.strip_prefix("nodes:").map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Where each node's proxy listens on the mesh (for forwarding between servers).
@@ -543,8 +560,12 @@ pub async fn push_certs(app: &App) {
         let Ok(mut stmt) = conn.prepare("SELECT host, cert_pem, key_pem FROM certificates WHERE cert_pem IS NOT NULL") else { return };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     };
+    // Other servers forward the panel's domain to the panel; they never need its key, and one
+    // that is compromised could otherwise pass for the panel.
+    let panel = app.settings().panel_domain;
     let certs: Vec<Value> = rows
         .into_iter()
+        .filter(|(host, _, _)| panel.as_deref().is_none_or(|p| !p.eq_ignore_ascii_case(host)))
         .filter_map(|(host, cert, key)| {
             let key = app.keys.open_str(&format!("cert:{host}"), &key).ok()?;
             Some(json!({ "host": host, "cert": cert, "key": key.as_str() }))
@@ -743,7 +764,11 @@ pub async fn health_loop(app: AppState) {
                     let old_boot = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["boot_id"].as_str().map(String::from));
                     // A reboot empties the server's /run, and with it every container's secrets.
                     let rebooted = old_boot.is_some_and(|b| Some(b.as_str()) != h["boot_id"].as_str());
-                    if let Ok(t) = serde_json::from_value(h["traffic"].clone()) {
+                    if let Ok(mut t) = serde_json::from_value::<HashMap<String, crate::proxy::Traffic>>(h["traffic"].clone()) {
+                        // Any server's proxy serves any domain, so only the ids and times are checked.
+                        let known: std::collections::HashSet<String> = store::services(&app, None).map(|l| l.into_iter().map(|s| s.id).collect()).unwrap_or_default();
+                        t.retain(|sid, _| known.contains(sid));
+                        t.values_mut().for_each(|x| x.last_at = x.last_at.min(now));
                         util::lock(&app.proxy.remote_traffic).insert(n.id.clone(), t);
                     }
                     let mut h = h;
@@ -765,8 +790,16 @@ pub async fn health_loop(app: AppState) {
                         }
                     }
                     if let Ok(snap) = agent(&n, reqwest::Method::GET, "/agent/metrics", None).await
-                        && let Ok(snap) = serde_json::from_value::<crate::metrics::Snapshot>(snap)
+                        && let Ok(mut snap) = serde_json::from_value::<crate::metrics::Snapshot>(snap)
                     {
+                        // About itself only: services placed there, on the panel's clock (a future
+                        // time would never expire), within sane sizes.
+                        let here = placed_on(&app, &n.id);
+                        snap.services.retain(|s| here.contains(&s.id));
+                        snap.at = now;
+                        snap.cores.truncate(1024);
+                        snap.disks.truncate(64);
+                        snap.gpus.truncate(16);
                         if let Err(e) = crate::metrics::store_for(&app, &n.id, &snap) {
                             tracing::debug!("storing metrics of {}: {e:#}", n.name);
                         }
@@ -1030,7 +1063,11 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
     pushed.context("sending the image to the mesh registry")?;
     let digest = digest.ok_or_else(|| anyhow!("the registry did not report the image's digest"))?;
     let remote = format!("{}:{REGISTRY_PORT}/{}@{digest}", mesh::PANEL_IP, runtime::split_image(image).0);
-    runtime::pull_on(app, &node.docker, &remote, log).await?;
+    let pulled = runtime::pull_on(app, &node.docker, &remote, log).await;
+    // Every server can read the registry: the image stays listed only while it is shipped.
+    let manifest = format!("http://127.0.0.1:{REGISTRY_PORT}/v2/{}/manifests/{digest}", runtime::split_image(image).0);
+    let _ = reqwest::Client::new().delete(manifest).timeout(Duration::from_secs(10)).send().await;
+    pulled?;
     let (repo, tag) = runtime::split_image(image);
     node.docker
         .tag_image(&remote, Some(bollard::query_parameters::TagImageOptions { repo: Some(repo.into()), tag: Some(tag.into()) }))

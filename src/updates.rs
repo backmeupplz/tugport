@@ -26,7 +26,7 @@ fn asset_name() -> String {
 }
 
 pub async fn latest() -> Result<Release> {
-    let client = reqwest::Client::builder().user_agent(concat!("tugport/", env!("CARGO_PKG_VERSION"))).timeout(Duration::from_secs(30)).build()?;
+    let client = reqwest::Client::builder().user_agent(concat!("tugport/", env!("CARGO_PKG_VERSION"))).https_only(true).timeout(Duration::from_secs(30)).build()?;
     let v: serde_json::Value = client.get(format!("https://api.github.com/repos/{REPO}/releases/latest")).send().await?.error_for_status()?.json().await?;
     let version = v["tag_name"].as_str().ok_or_else(|| anyhow!("no release found"))?.trim_start_matches('v').to_string();
     let find = |name: &str| {
@@ -55,7 +55,7 @@ pub async fn apply(app: &AppState) -> Result<()> {
     }
     let exe = crate::handoff::binary_path()?;
     let tmp = exe.with_extension("download");
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?;
+    let client = reqwest::Client::builder().https_only(true).timeout(Duration::from_secs(600)).build()?;
     let sums = client.get(&r.sums).send().await?.error_for_status()?.text().await?;
     let expected = sums
         .lines()

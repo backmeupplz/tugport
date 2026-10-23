@@ -440,9 +440,9 @@ pub fn map(rows: &HashMap<String, Vec<Value>>, running: &[Running], key: &[u8; 3
             }
             n.spec.ports = port_mappings(st(d, "ports_mappings"), &mut n.notes);
             if d["is_public"].as_bool() == Some(true)
-                && let Some(port) = d["public_port"].as_u64()
+                && let Some(port) = d["public_port"].as_u64().and_then(|p| u16::try_from(p).ok())
             {
-                n.spec.ports.push(Port { container: crate::databases::preset(engine).port, host: port as u16, protocol: Protocol::Tcp });
+                n.spec.ports.push(Port { container: crate::databases::preset(engine).port, host: port, protocol: Protocol::Tcp });
                 n.notes.push(format!("its public port {port} moves from Coolify's TCP proxy to the database container"));
             }
             n.spec.health = Health { kind: HealthKind::Command, command: Some(crate::databases::health(engine).into()), start_period_s: 30, ..Health::default() };

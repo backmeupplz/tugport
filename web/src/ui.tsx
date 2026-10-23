@@ -294,6 +294,8 @@ const TONE: Record<string, string> = {
   failed: "bad",
   dead: "bad",
   asleep: "info",
+  following: "ok",
+  copying: "warn",
   online: "ok",
   joining: "warn",
   unreachable: "warn",

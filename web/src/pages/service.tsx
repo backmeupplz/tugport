@@ -5,7 +5,8 @@ import { FINAL, atLeast, del, get, hasGrant, nodeName, post, put, useApi, useEve
 import { EnvEditor } from "../env-editor";
 import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, errText, toast, useSubmit } from "../ui";
 import { fmt } from "../charts";
-import { ago, bytes, clock, duration, qs, sumUsage } from "../util";
+import { ago, bytes, clock, duration, qs, sumUsage, varName } from "../util";
+import { ReadReplicas, ReplicaOf } from "./database";
 import { Domains } from "./domains";
 import { DeployKey } from "./new-service";
 import { Console, Logs, ServiceMetrics, type Now } from "./observe";
@@ -17,6 +18,7 @@ const TABS: [string, string][] = [
   ["deploys", "Deploys"],
   ["logs", "Logs"],
   ["metrics", "Metrics"],
+  ["replicas", "Read replicas"],
   ["domains", "Domains"],
   ["env", "Environment"],
   ["files", "Files"],
@@ -74,7 +76,9 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
     );
   }
   const s = d.service;
-  const tab = TABS.some(([id]) => id === props.tab) ? (props.tab as string) : "overview";
+  // Read replicas belong to primary databases; a replica follows one instead.
+  const tabs = TABS.filter(([id]) => id !== "replicas" || (s.kind === "database" && !s.spec.database?.primary));
+  const tab = tabs.some(([id]) => id === props.tab) ? (props.tab as string) : "overview";
   const base = `/projects/${s.project}/${s.name}`;
   const c: Ctx = { d, reload: r.reload, openLog: setLogId, nodes };
   const label = (x: Replica) => (x.compose_service ?? x.name) + (multiServer(c) ? ` on ${nodeName(nodes, x.node)}` : "");
@@ -112,9 +116,10 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
         )
       }
     >
-      <Tabs label="Service sections" current={tab} items={TABS.map(([id, label]) => [id, label, id === "overview" ? base : `${base}/${id}`])} />
+      <Tabs label="Service sections" current={tab} items={tabs.map(([id, label]) => [id, label, id === "overview" ? base : `${base}/${id}`])} />
       {tab === "overview" && <Overview c={c} />}
       {tab === "deploys" && <Deploys c={c} />}
+      {tab === "replicas" && <ReadReplicas c={c} />}
       {tab === "logs" && <Logs service={s} replicas={d.status.replicas} label={label} />}
       {tab === "metrics" && <ServiceMetrics service={s} />}
       {tab === "domains" && <Domains c={c} />}
@@ -135,7 +140,8 @@ function Overview({ c }: { c: Ctx }) {
   const canDeploy = atLeast(d.role, "deployer");
   const id = s.id;
   const src = s.spec.source;
-  const envName = `${s.name.toUpperCase().replace(/-/g, "_")}_URL`;
+  const envName = varName(s.name, "URL");
+  const primaryId = s.spec.database?.primary;
   return (
     <div class="grid gap-6 lg:grid-cols-3">
       <div class="min-w-0 space-y-6 lg:col-span-2">
@@ -198,6 +204,7 @@ function Overview({ c }: { c: Ctx }) {
         <LastDeploy c={c} />
       </div>
       <div class="min-w-0 space-y-6">
+        {primaryId && <ReplicaOf c={c} primaryId={primaryId} />}
         <Card title="Source">
           <p class="break-all font-mono text-[13px]">{sourceLabel(src, s.kind)}</p>
           {src.type === "git" && (
@@ -653,7 +660,11 @@ function Danger({ c }: { c: Ctx }) {
   const s = c.d.service;
   const [name, setName] = useState("");
   const [volumes, setVolumes] = useState(false);
-  const allowed = atLeast(c.d.role, "admin") && hasGrant(me, "destroy");
+  // A primary database with read replicas can go only after they are promoted or deleted.
+  const replicas = useApi<{ replicas: { name: string }[] }>(s.kind === "database" && !s.spec.database?.primary ? `/services/${s.id}/replicas` : null);
+  const followers = replicas.data?.replicas.map((x) => x.name) ?? [];
+  const canDestroy = atLeast(c.d.role, "admin") && hasGrant(me, "destroy");
+  const allowed = canDestroy && followers.length === 0;
   const sub = useSubmit(async () => {
     await del(`/services/${s.id}${volumes ? "?volumes=true" : ""}`);
     toast(`Deleted ${s.name}.`);
@@ -665,7 +676,12 @@ function Danger({ c }: { c: Ctx }) {
         <p class="text-dim">
           Deleting stops and removes every container of {s.name}, together with its domains, environment, files and deploy history. This cannot be undone.
         </p>
-        {!allowed && <Note tone="warn">Deleting needs the admin role on this project and the destroy grant.</Note>}
+        {followers.length > 0 && (
+          <Note tone="warn">
+            {followers.join(", ")} {followers.length === 1 ? "follows" : "follow"} {s.name}, so {s.name} can be deleted only after each read replica is promoted or deleted.
+          </Note>
+        )}
+        {!canDestroy && <Note tone="warn">Deleting needs the admin role on this project and the destroy grant.</Note>}
         <Check
           checked={volumes}
           onChange={setVolumes}

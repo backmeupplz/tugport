@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { atLeast, patch, useApi, type Spec } from "../api";
+import { atLeast, patch, useApi, type Node, type Spec } from "../api";
 import { Card, Check, ErrorBox, Field, Note, Select, toast, useSubmit } from "../ui";
 import { joinArgs, labelsText, lines, matchServers, mergePatch, num, parseLabels, pinReasons, splitArgs } from "../util";
 import { BUILDS, PROVIDER_KINDS } from "./new-service";
@@ -312,7 +312,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             <p class="text-dim">Compose stacks run on the panel's server, so placement rules and the replica count do not apply to them.</p>
           </Section>
         ) : (
-          <Placement c={c} f={f} set={set} next={next} moved={"placement" in changes} labelsOk={labelsOk} />
+          <Placement c={c} f={f} set={set} next={next} moved={"placement" in changes} />
         )}
 
         <Section title="Resources">
@@ -571,13 +571,13 @@ function Section(props: { title: string; children: ComponentChildren }) {
 
 const and = (l: string[]) => new Intl.ListFormat("en", { type: "conjunction" }).format(l);
 
-/** The replica count and the rules that pick servers for the replicas. */
-function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; next: Spec; moved: boolean; labelsOk: boolean }) {
-  const { f, set } = props;
-  const kind = props.c.d.service.kind;
-  const reasons = pinReasons(kind, props.next);
-  const nodes = props.c.nodes?.nodes;
-  const matches = nodes && props.labelsOk ? matchServers(nodes, props.next.placement) : null;
+type Rules = { node: string; region: string; labels: string };
+
+/** Server, region and label rules, and the servers they match right now. `children` come first in the grid. */
+export function PlacementFields(props: { nodes: Node[] | undefined; rules: Rules; set: (p: Partial<Rules>) => void; children?: ComponentChildren }) {
+  const { nodes, rules: f, set } = props;
+  const labels = parseLabels(f.labels);
+  const matches = nodes && labels ? matchServers(nodes, { node: f.node.trim() || null, region: f.region.trim() || null, labels }) : null;
   // A placement may name a server by id or by name; keep whichever the spec uses.
   const options: [string, string][] = (nodes ?? []).map((n) => [
     f.node === n.name ? n.name : n.id,
@@ -586,21 +586,10 @@ function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; ne
   if (f.node && !options.some(([v]) => v === f.node)) options.push([f.node, `${f.node} (not a server of this panel)`]);
   const regions = [...new Set((nodes ?? []).map((n) => n.region).filter((r): r is string => !!r))];
   return (
-    <Section title="Placement and replicas">
+    <>
       <div class="grid gap-4 sm:grid-cols-2">
-        <Field
-          label="Replicas"
-          hint={
-            kind === "database"
-              ? "Databases run one primary."
-              : reasons.length
-                ? "Every replica runs on the same server."
-                : "Replicas spread over the matching servers, and each one gets traffic once it is healthy."
-          }
-        >
-          <input class="input" type="number" min={0} max={100} disabled={kind === "database"} value={f.replicas} onInput={(e) => set({ replicas: e.currentTarget.value })} />
-        </Field>
-        <Field label="Server" hint={nodes ? "Pin the service to one server, or let Tugport choose among the matching ones." : "Write a server's name to pin the service to it, or leave this empty."}>
+        {props.children}
+        <Field label="Server" hint={nodes ? "Pin it to one server, or let Tugport choose among the matching ones." : "Write a server's name to pin it there, or leave this empty."}>
           {nodes ? (
             <Select value={f.node} onChange={(node) => set({ node })} options={[["", "Any server that matches"], ...options]} />
           ) : (
@@ -619,13 +608,38 @@ function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; ne
           <textarea class="input h-16" spellcheck={false} placeholder="disk=ssd" value={f.labels} onInput={(e) => set({ labels: e.currentTarget.value })} />
         </Field>
       </div>
-      {!props.labelsOk && <p class="text-sm text-bad">Write each label as key=value, separated by commas or new lines.</p>}
+      {!labels && <p class="text-sm text-bad">Write each label as key=value, separated by commas or new lines.</p>}
       {matches &&
         (matches.length ? (
           <p class="text-dim">Servers that match right now: {and(matches.map((n) => n.name))}.</p>
         ) : (
-          <Note tone="bad">No online server matches these rules right now, so the next deploy would fail.</Note>
+          <Note tone="bad">No online server matches these rules right now, so a deploy would fail.</Note>
         ))}
+    </>
+  );
+}
+
+/** The replica count and the rules that pick servers for the replicas. */
+function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; next: Spec; moved: boolean }) {
+  const { f, set } = props;
+  const kind = props.c.d.service.kind;
+  const reasons = pinReasons(kind, props.next);
+  return (
+    <Section title="Placement and replicas">
+      <PlacementFields nodes={props.c.nodes?.nodes} rules={f} set={set}>
+        <Field
+          label="Replicas"
+          hint={
+            kind === "database"
+              ? "Databases run one primary, and read replicas have a tab of their own."
+              : reasons.length
+                ? "Every replica runs on the same server."
+                : "Replicas spread over the matching servers, and each one gets traffic once it is healthy."
+          }
+        >
+          <input class="input" type="number" min={0} max={100} disabled={kind === "database"} value={f.replicas} onInput={(e) => set({ replicas: e.currentTarget.value })} />
+        </Field>
+      </PlacementFields>
       {reasons.length > 0 && props.moved && (
         <Note tone="warn">
           Its data stays on the server it runs on now. If that server stops matching these rules, the next deploy starts the service on another server with empty volumes.

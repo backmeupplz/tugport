@@ -241,7 +241,7 @@ async fn serve() -> Result<()> {
     if let Err(e) = mesh::install_boot_hook() {
         tracing::warn!("making Docker wait for the mesh at boot: {e:#}");
     }
-    if let Err(e) = nodes::restore_mesh(&app) {
+    if let Err(e) = nodes::restore_mesh(&app).await {
         tracing::error!("bringing up the server mesh: {e:#}");
     }
     install_init_binary(&app)?;

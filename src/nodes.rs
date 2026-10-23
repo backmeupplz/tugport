@@ -197,20 +197,31 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// After a reboot: the mesh interface and its peers come back before anything uses them.
-pub fn restore_mesh(app: &App) -> Result<()> {
+/// After a reboot: the mesh interface and its peers come back before anything uses them,
+/// then the registry, which Docker may have restarted without its ports.
+pub async fn restore_mesh(app: &App) -> Result<()> {
     if !mesh_enabled(app) {
         return Ok(());
     }
     mesh::guard()?;
     mesh::up(&app.paths.etc.join("wg.key"), mesh::PANEL_IP)?;
-    set_peers(app)
+    set_peers(app)?;
+    ensure_registry().await
 }
 
 /// A private registry on the mesh so servers pull only the image layers they lack.
 async fn ensure_registry() -> Result<()> {
+    // A running container is not enough: after a Docker restart it can run with no published
+    // ports (both are published together, so localhost tells). One that just started gets a
+    // few seconds to answer before it is replaced.
     if sh("docker inspect -f '{{.State.Running}}' tugport-registry").await.map(|s| s.trim() == "true").unwrap_or(false) {
-        return Ok(());
+        for _ in 0..5 {
+            if runtime::http_ok("127.0.0.1", REGISTRY_PORT, "/v2/", false).await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        tracing::warn!("the image registry runs but does not answer on port {REGISTRY_PORT}; starting it again");
     }
     let _ = sh("docker rm -f tugport-registry").await;
     sh(&format!(

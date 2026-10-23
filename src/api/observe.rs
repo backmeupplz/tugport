@@ -102,9 +102,10 @@ pub async fn metrics_now(State(app): State<AppState>, a: Auth, Query(q): Query<N
         None => crate::util::lock(&app.metrics.latest).clone(),
     };
     if !a.0.is_owner && a.0.all_projects_role.is_none() {
-        // Per-service numbers only for services the caller can see.
+        // Project members see their services' numbers, not the servers'.
         let visible: Vec<String> = crate::store::services(&app, None)?.into_iter().filter(|s| a.0.can(&s.project_id, Role::Viewer)).map(|s| s.id).collect();
         snap.services.retain(|s| visible.contains(&s.id));
+        return Ok(Json(json!({ "at": snap.at, "services": snap.services })));
     }
     Ok(Json(serde_json::to_value(snap)?))
 }
@@ -137,11 +138,12 @@ pub async fn metrics_query(State(app): State<AppState>, a: Auth, Query(q): Query
     Ok(Json(json!({ "step": step, "series": series })))
 }
 
-pub async fn docker_usage(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+pub async fn docker_usage(State(app): State<AppState>, a: Auth, Query(q): Query<NodeQuery>) -> ApiResult<Json<Value>> {
     if !a.0.is_owner && a.0.all_projects_role.is_none() {
         return Err(ApiError::forbidden("needs the owner or a role on all projects"));
     }
-    let df = app.docker.df(None::<bollard::query_parameters::DataUsageOptions>).await.map_err(anyhow::Error::from)?;
+    let docker = app.docker_on(q.node.as_deref().unwrap_or("local")).map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    let df = docker.df(None::<bollard::query_parameters::DataUsageOptions>).await.map_err(anyhow::Error::from)?;
     let images: i64 = df.images.iter().flatten().map(|i| i.size).sum();
     let build: i64 = df.build_cache.iter().flatten().filter_map(|b| b.size).sum();
     let volumes: i64 = df.volumes.iter().flatten().filter_map(|v| v.usage_data.as_ref().map(|u| u.size)).sum();

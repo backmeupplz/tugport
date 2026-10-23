@@ -377,7 +377,7 @@ export function Toasts() {
       ref={ref}
       popover="manual"
       aria-live="polite"
-      class="pointer-events-none fixed top-auto right-4 bottom-4 left-4 z-50 m-0 flex flex-col items-end gap-2 overflow-visible border-0 bg-transparent p-0"
+      class="pointer-events-none fixed top-auto right-4 bottom-4 left-4 z-50 m-0 flex h-auto w-auto flex-col items-end gap-2 overflow-visible border-0 bg-transparent p-0"
     >
       {list.map((t) => (
         <div

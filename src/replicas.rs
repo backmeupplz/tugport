@@ -177,6 +177,14 @@ pub async fn add(app: &AppState, primary: &Service, placement: Placement) -> Res
         bail!("the replica's name {name} is too long; give the database a shorter name");
     }
 
+    // Unless told otherwise, a replica goes to a different server than its primary.
+    let placement = if placement == Placement::default() {
+        let home = crate::nodes::home(app, &primary)?.id.clone();
+        let other = crate::nodes::eligible(app, &Placement::default()).into_iter().find(|n| n.id != home);
+        other.map(|n| Placement { node: Some(n.id.clone()), ..Default::default() }).unwrap_or(placement)
+    } else {
+        placement
+    };
     let mut spec = primary.spec.clone();
     spec.placement = placement;
     spec.aliases.clear();

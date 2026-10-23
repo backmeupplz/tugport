@@ -63,6 +63,8 @@ pub async fn join(State(app): State<AppState>, Json(req): Json<nodes::JoinReques
 #[derive(Deserialize)]
 pub struct UpdateBody {
     name: Option<String>,
+    /// null or "" clears it.
+    #[serde(default, deserialize_with = "super::present")]
     region: Option<Option<String>>,
     labels: Option<BTreeMap<String, String>>,
 }
@@ -79,6 +81,7 @@ pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>
         app.db.conn().execute("UPDATE nodes SET name = ?1 WHERE id = ?2", params![name, id])?;
     }
     if let Some(region) = &b.region {
+        let region = region.as_deref().map(str::trim).filter(|r| !r.is_empty());
         app.db.conn().execute("UPDATE nodes SET region = ?1 WHERE id = ?2", params![region, id])?;
     }
     if let Some(labels) = &b.labels {
@@ -102,7 +105,11 @@ pub struct RemoveQuery {
 /// in a cloud account is deleted there as well.
 pub async fn remove(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Json<Value>> {
     a.require_owner()?;
-    let name = app.node(&id).map(|n| n.name.clone()).ok_or_else(|| ApiError::not_found("server not found"))?;
+    let node = app.node(&id).ok_or_else(|| ApiError::not_found("server not found"))?;
+    if node.local {
+        return Err(ApiError::bad_request("the panel's own server cannot be removed"));
+    }
+    let name = node.name.clone();
     let keeping: Vec<String> = crate::store::services(&app, None)?
         .into_iter()
         .filter(|s| app.db.get_state(&format!("pin:{}", s.id)).ok().flatten().as_deref() == Some(id.as_str()))

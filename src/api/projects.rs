@@ -609,7 +609,7 @@ pub async fn get_hook(State(app): State<AppState>, a: Auth, headers: HeaderMap, 
         return Err(ApiError::forbidden("the webhook URL is a secret; it needs the secrets:read grant"));
     }
     let key = format!("hook:{}", s.id);
-    let sealed = app.db.get_state(&key)?.ok_or_else(|| ApiError::not_found("this webhook was made before URLs were kept; rotate it to get a new one"))?;
+    let sealed = app.db.get_state(&key)?.ok_or_else(|| ApiError::not_found("no webhook URL is kept for this service; rotate it to make one"))?;
     let token = app.keys.open_str(&key, &crate::crypto::unb64(&sealed)?)?;
     Ok(Json(json!({ "url": format!("{}/api/hooks/deploy/{}", base_url(&headers), token.as_str()) })))
 }

@@ -80,7 +80,8 @@ pub async fn options(acc: &Account) -> Result<Value> {
                 .flatten()
                 .filter(|t| t["deprecation"].is_null() && !t["deprecated"].as_bool().unwrap_or(false))
                 .map(|t| {
-                    let prices: Vec<Value> = t["prices"].as_array().into_iter().flatten().map(|p| json!({ "region": p["location"], "hourly": p["price_hourly"]["gross"] })).collect();
+                    let hourly = |p: &Value| p["price_hourly"]["gross"].as_str().and_then(|v| v.parse::<f64>().ok());
+                    let prices: Vec<Value> = t["prices"].as_array().into_iter().flatten().map(|p| json!({ "region": p["location"], "hourly": hourly(p), "currency": "EUR" })).collect();
                     json!({ "id": t["name"], "cpus": t["cores"], "memory_gb": t["memory"], "disk_gb": t["disk"], "arch": t["architecture"], "prices": prices })
                 })
                 .collect();
@@ -167,6 +168,7 @@ pub async fn create_server(app: &AppState, account_id: &str, region: &str, size:
         }
         Err(e) => {
             app.db.conn().execute("UPDATE cloud_servers SET status = 'failed', error = ?1 WHERE id = ?2", params![format!("{e:#}"), id])?;
+            app.emit("nodes", None, None, json!({ "failed": name }));
             Err(e)
         }
     }
@@ -235,6 +237,7 @@ async fn tick(app: &AppState) -> Result<()> {
         if let Err(e) = destroy(app, &id).await {
             app.db.conn().execute("UPDATE cloud_servers SET status = 'failed', error = ?1 WHERE id = ?2", params![format!("{e:#}"), id])?;
         }
+        app.emit("nodes", None, None, json!({ "deleted": name }));
     }
     for pool in pools(app)? {
         if let Err(e) = keep_pool(app, &pool).await {

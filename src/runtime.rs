@@ -50,6 +50,8 @@ pub struct Replica {
     pub image: String,
     pub created: i64,
     pub node: String,
+    /// The server's name, for people who may not list servers.
+    pub node_name: String,
     /// Compose service name for containers of Compose stacks.
     pub compose_service: Option<String>,
 }
@@ -86,6 +88,7 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
         async move { (node, docker.list_containers(Some(opts)).await) }
     }))
     .await;
+    let names: HashMap<String, String> = app.all_nodes().into_iter().map(|n| (n.id.clone(), n.name.clone())).collect();
     let mut out = vec![];
     for (node, list) in lists {
         let list = match list {
@@ -118,6 +121,7 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
                 image: c.image.unwrap_or_default(),
                 created: c.created.unwrap_or_default(),
                 node: node.clone(),
+                node_name: names.get(&node).cloned().unwrap_or_else(|| node.clone()),
                 compose_service: labels.get("com.docker.compose.service").cloned(),
             }));
         }

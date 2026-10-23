@@ -350,8 +350,7 @@ pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinEnvelope> {
         };
         let index = (2..60000).find(|i| !used.contains(&mesh::mesh_ip(*i))).ok_or_else(|| anyhow!("the mesh is full"))?;
         let mesh_ip = mesh::mesh_ip(index);
-        let clean: String = req.name.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.').take(40).collect();
-        let mut name = if clean.is_empty() { format!("server-{index}") } else { clean };
+        let mut name = server_name(&req.name).unwrap_or_else(|| format!("server-{index}"));
         let taken: bool = conn.query_row("SELECT COUNT(*) > 0 FROM nodes WHERE name = ?1", [&name], |r| r.get(0))?;
         if taken {
             name = format!("{name}-{index}");
@@ -391,6 +390,23 @@ pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinEnvelope> {
 #[derive(Serialize, Deserialize)]
 pub struct JoinEnvelope {
     pub sealed: String,
+}
+
+/// A hostname as a server name (lowercase letters, digits and dashes, starting with a letter).
+fn server_name(host: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in host.trim().to_ascii_lowercase().chars() {
+        let c = if c.is_ascii_alphanumeric() { c } else { '-' };
+        if !(c == '-' && (out.is_empty() || out.ends_with('-'))) {
+            out.push(c);
+        }
+    }
+    let out = out.trim_end_matches('-').chars().take(30).collect::<String>().trim_end_matches('-').to_string();
+    match out.chars().next() {
+        Some(c) if c.is_ascii_lowercase() => Some(out),
+        Some(_) => Some(format!("server-{out}")),
+        None => None,
+    }
 }
 
 /// Call a node agent over the mesh.
@@ -632,6 +648,7 @@ pub async fn health_loop(app: AppState) {
                     let dropped = app.db.conn().execute("UPDATE nodes SET status = 'unreachable' WHERE id = ?1 AND status = 'online'", [&n.id]).unwrap_or(0);
                     if dropped > 0 {
                         tracing::info!("server {} stopped answering: {e:#}", n.name);
+                        app.emit("nodes", None, None, json!({ "unreachable": n.name }));
                         crate::proxy::reload(&app);
                     }
                     // A server that just joined counts from when it joined.
@@ -890,6 +907,15 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
 mod tests {
     use super::join_secret;
     use crate::model::Placement;
+
+    #[test]
+    fn hostnames_become_server_names() {
+        use super::server_name;
+        assert_eq!(server_name("Web-01.Example.com").as_deref(), Some("web-01-example-com"));
+        assert_eq!(server_name("1box").as_deref(), Some("server-1box"));
+        assert_eq!(server_name("--").as_deref(), None);
+        assert!(server_name("Web-01.Example.com").is_some_and(|n| crate::util::valid_name(&n)));
+    }
 
     #[test]
     fn joins_never_reveal_the_token() {

@@ -3,31 +3,31 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tugport — deploy your apps and watch your server from one binary</title>
-<meta name="description" content="Tugport is a self-hosted deploy platform in one Rust binary. It builds every push from GitHub or Forgejo, keeps the logs of every service, charts your server and gives AI agents API keys with exactly the permissions you choose.">
+<title>Tugport — deploy your apps to servers you own</title>
+<meta name="description" content="Tugport is a self-hosted deploy platform in one Rust binary. It builds every push, switches traffic once the new version is healthy, serves it over HTTPS, and comes with logs, charts, backups, many-server networking and scoped API keys for AI agents.">
 <link rel="canonical" href="https://tugport.com/">
 
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Tugport">
 <meta property="og:url" content="https://tugport.com/">
-<meta property="og:title" content="Tugport — deploy your apps and watch your server from one binary">
-<meta property="og:description" content="Tugport builds every push from GitHub or Forgejo, keeps the logs of every service, charts your server and gives AI agents scoped API keys, all from one small Rust binary.">
+<meta property="og:title" content="Tugport deploys your apps to servers you own">
+<meta property="og:description" content="One Rust binary next to Docker that builds every push, rolls it out without downtime and serves it over HTTPS, with logs, charts, backups and scoped keys for AI agents built in.">
 <meta property="og:image" content="https://tugport.com/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Tugport logo with the line: deploy your apps and watch your server from one small binary.">
+<meta property="og:image:alt" content="Tugport: deploy your apps to servers you own, from one Rust binary. Beside the text, the Tugport panel shows a service with two live replicas.">
 
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Tugport — deploy your apps and watch your server from one binary">
-<meta name="twitter:description" content="Tugport builds every push from GitHub or Forgejo, keeps the logs of every service, charts your server and gives AI agents scoped API keys, all from one small Rust binary.">
+<meta name="twitter:title" content="Tugport deploys your apps to servers you own">
+<meta name="twitter:description" content="One Rust binary next to Docker that builds every push, rolls it out without downtime and serves it over HTTPS, with logs, charts, backups and scoped keys for AI agents built in.">
 <meta name="twitter:image" content="https://tugport.com/og.png">
-<meta name="twitter:image:alt" content="Tugport logo with the line: deploy your apps and watch your server from one small binary.">
+<meta name="twitter:image:alt" content="Tugport: deploy your apps to servers you own, from one Rust binary. Beside the text, the Tugport panel shows a service with two live replicas.">
 
 <link rel="icon" href="/logo.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-<meta name="theme-color" content="#0B1018" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#F6F3EE" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0A0E14" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F7F5F1" media="(prefers-color-scheme: light)">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -36,373 +36,624 @@
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg: #0B1018;
-    --bg-band: #0E141E;
-    --surface: #121A26;
-    --line: #213045;
-    --text: #E9EEF5;
-    --dim: #A3AFC0;
-    --muted: #6B788C;
+    --bg: #0A0E14;
+    --band: #0D121A;
+    --surface: #111823;
+    --line: #1C2735;
+    --line-strong: #2A394D;
+    --text: #E8EDF4;
+    --dim: #A2AEBE;
+    --muted: #7D8A9E;
     --accent: #FF6A3D;
-    --accent-soft: rgba(255, 106, 61, 0.12);
-    --on-accent: #0B1018;
-    --shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+    --accent-text: #FF8A64;
+    --ink: #0A0E14;
+    --code: #0C1119;
+    --code-line: #1C2735;
+    --shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 40px 90px -30px rgba(0, 0, 0, 0.7);
     color-scheme: dark;
   }
 
   @media (prefers-color-scheme: light) {
     :root {
-      --bg: #F6F3EE;
-      --bg-band: #EFE9E0;
+      --bg: #F7F5F1;
+      --band: #F0ECE5;
       --surface: #FFFFFF;
-      --line: #E1D9CC;
+      --line: #E4DDD2;
+      --line-strong: #D3C9BA;
       --text: #121A26;
-      --dim: #465264;
-      --muted: #7A8494;
-      --accent: #E4532A;
-      --accent-soft: rgba(228, 83, 42, 0.10);
-      --on-accent: #FFFFFF;
-      --shadow: 0 30px 70px rgba(18, 26, 38, 0.18);
+      --dim: #455163;
+      --muted: #5C6574;
+      --accent: #FF6A3D;
+      --accent-text: #C2410C;
+      --ink: #121A26;
+      --code: #121A26;
+      --code-line: #243042;
+      --shadow: 0 40px 80px -36px rgba(18, 26, 38, 0.35);
       color-scheme: light;
     }
   }
 
-  html { scroll-behavior: smooth; }
+  html { scroll-behavior: smooth; scroll-padding-top: 80px; }
 
   body {
     background: var(--bg);
     color: var(--text);
     font: 400 17px/1.65 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
     -webkit-font-smoothing: antialiased;
-    overflow-x: hidden;
+    text-rendering: optimizeLegibility;
   }
 
   a { color: inherit; }
+  img { display: block; max-width: 100%; height: auto; }
+  code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, monospace; }
 
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
 
-  h1, h2, h3 { font-family: "Space Grotesk", Inter, system-ui, sans-serif; letter-spacing: -0.02em; }
+  h1, h2, h3 { font-family: "Space Grotesk", Inter, system-ui, sans-serif; letter-spacing: -0.025em; font-weight: 600; }
 
-  .sr-only {
-    position: absolute; width: 1px; height: 1px; overflow: hidden;
-    clip: rect(0 0 0 0); white-space: nowrap;
+  /* Navigation */
+  .top {
+    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: saturate(1.4) blur(14px);
+    -webkit-backdrop-filter: saturate(1.4) blur(14px);
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.2s;
   }
-
-  /* Nav */
-  nav { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; }
-  .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
-  .brand img { width: 36px; height: 36px; }
-  .brand span { font: 700 22px/1 "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
-  .nav-links { display: flex; gap: 28px; font-size: 15px; color: var(--dim); }
-  .nav-links a { text-decoration: none; }
-  .nav-links a:hover { color: var(--text); }
+  .top.scrolled { border-bottom-color: var(--line); }
+  nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+  .brand img { width: 30px; height: 30px; }
+  .brand span { font: 700 20px/1 "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
+  .links { display: flex; align-items: center; gap: 26px; font-size: 15px; color: var(--dim); }
+  .links a { text-decoration: none; }
+  .links a:hover { color: var(--text); }
+  .links .gh { display: inline-flex; align-items: center; gap: 8px; color: var(--text); padding: 7px 12px; border: 1px solid var(--line-strong); border-radius: 9px; }
+  .links .gh svg { width: 16px; height: 16px; }
 
   /* Hero */
-  .hero {
-    display: grid;
-    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
-    gap: 64px;
-    align-items: center;
-    padding: 72px 0 104px;
-  }
-  .status {
-    display: inline-flex; align-items: center; gap: 10px;
-    padding: 7px 14px 7px 12px;
-    border: 1px solid var(--line); border-radius: 14px;
-    font: 500 13px/1.4 "JetBrains Mono", monospace; color: var(--dim);
-    margin-bottom: 28px;
-  }
-  .status::before {
-    content: ""; width: 8px; height: 8px; border-radius: 50%;
-    background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft);
-  }
-  .hero h1 { font-size: clamp(38px, 5.2vw, 60px); line-height: 1.04; font-weight: 700; margin-bottom: 24px; }
+  .hero { padding: 88px 0 0; }
+  .hero h1 { font-size: clamp(42px, 6.4vw, 76px); line-height: 1.03; letter-spacing: -0.028em; max-width: 13.5em; }
   .hero h1 em { font-style: normal; color: var(--accent); }
-  .lead { font-size: 19px; color: var(--dim); max-width: 34em; margin-bottom: 36px; }
-  .actions { display: flex; flex-wrap: wrap; gap: 14px; }
-  .btn {
-    display: inline-flex; align-items: center; gap: 10px;
-    padding: 14px 22px; border-radius: 12px;
-    font: 600 16px/1 Inter, sans-serif; text-decoration: none;
-    transition: transform 0.15s ease, background 0.15s ease;
-  }
-  .btn:hover { transform: translateY(-1px); }
-  .btn-primary { background: var(--accent); color: var(--on-accent); }
-  .btn-ghost { border: 1px solid var(--line); color: var(--text); }
-  .btn-ghost:hover { background: var(--surface); }
-  .btn svg { width: 18px; height: 18px; }
+  .lead { margin-top: 26px; font-size: 20px; line-height: 1.6; color: var(--dim); max-width: 40em; }
 
-  /* Service card sketch: always dark, like a terminal */
-  .sketch {
-    position: relative;
-    background: #0F1621;
-    border: 1px solid #243246;
-    border-radius: 20px;
-    box-shadow: var(--shadow);
-    color: #E9EEF5;
-    padding: 22px;
-    font-size: 14px;
+  .install { margin-top: 38px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px 18px; }
+  .cmd {
+    display: flex; align-items: center; gap: 14px;
+    background: var(--code); color: #E8EDF4;
+    border: 1px solid var(--code-line); border-radius: 12px;
+    padding: 8px 8px 8px 18px; max-width: 100%;
   }
-  .sketch .tag {
-    position: absolute; top: -11px; right: 18px;
-    padding: 3px 10px; border-radius: 999px;
-    background: #1A2433; border: 1px solid #2B3A50;
-    font: 500 11px/1.4 "JetBrains Mono", monospace; color: #9AA7B8; letter-spacing: 0.04em;
+  .cmd code { font-size: 15px; white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .cmd code::-webkit-scrollbar { display: none; }
+  .cmd code b { color: #FF8A64; font-weight: 500; user-select: none; }
+  .copy {
+    flex: none; font: 600 14px/1 Inter, sans-serif; cursor: pointer;
+    background: var(--accent); color: #0A0E14; border: 0; border-radius: 8px; padding: 10px 14px;
   }
-  .svc-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .svc-name { display: flex; align-items: center; gap: 10px; font: 600 17px/1.2 "Space Grotesk", sans-serif; }
-  .svc-name i { width: 9px; height: 9px; border-radius: 50%; background: #4ADE80; box-shadow: 0 0 0 4px rgba(74, 222, 128, 0.15); }
-  .svc-name b { color: #7D8BA0; font-weight: 500; }
-  .live { font: 500 12px/1 "JetBrains Mono", monospace; color: #4ADE80; border: 1px solid rgba(74, 222, 128, 0.35); padding: 5px 9px; border-radius: 8px; }
-  .svc-meta { margin: 8px 0 18px; font: 400 12.5px/1.5 "JetBrains Mono", monospace; color: #8C99AC; }
-  .svc-meta em { font-style: normal; color: #FF8A64; }
-  .steps { list-style: none; border-top: 1px solid #223044; border-bottom: 1px solid #223044; padding: 14px 0; display: grid; gap: 9px; }
-  .steps li { display: flex; gap: 10px; align-items: baseline; color: #C9D2DE; }
-  .steps li::before { content: "✓"; color: #4ADE80; font-weight: 600; }
-  .charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 16px 0; border-bottom: 1px solid #223044; }
-  .chart { background: #131C29; border: 1px solid #202D40; border-radius: 12px; padding: 10px 12px 8px; }
-  .chart span { display: flex; justify-content: space-between; font: 500 11.5px/1.3 "JetBrains Mono", monospace; color: #8C99AC; }
-  .chart span b { color: #E9EEF5; font-weight: 500; }
-  .chart svg { display: block; width: 100%; height: 34px; margin-top: 6px; }
-  .logs { padding-top: 14px; font: 400 12.5px/1.75 "JetBrains Mono", monospace; color: #B7C2D1; }
-  .logs div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .logs span { color: #5F6E84; margin-right: 10px; }
+  .copy:hover { filter: brightness(1.06); }
+  .copy:focus-visible, .btn:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+    font: 600 15px/1 Inter, sans-serif; padding: 13px 16px; border-radius: 11px;
+    border: 1px solid var(--line-strong); color: var(--text);
+  }
+  .btn:hover { background: var(--surface); }
+  .note { margin-top: 16px; font-size: 14.5px; color: var(--muted); max-width: 46em; }
+
+  /* Screenshots */
+  .shot { margin-top: 56px; }
+  .frame {
+    border: 1px solid var(--line-strong); border-radius: 14px; overflow: hidden;
+    background: var(--surface); box-shadow: var(--shadow);
+  }
+  .bar {
+    display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 14px;
+    border-bottom: 1px solid var(--line); background: var(--band);
+    font: 500 12.5px/1 "JetBrains Mono", monospace; color: var(--muted);
+  }
+  .bar svg { width: 13px; height: 13px; flex: none; }
+  .shot figcaption { margin-top: 14px; font-size: 14.5px; color: var(--muted); max-width: 52em; }
+  .hero .shot { margin-top: 64px; }
 
   /* Sections */
-  section { padding: 96px 0; }
-  .band { background: var(--bg-band); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .section-head { max-width: 46em; margin-bottom: 52px; }
-  .section-head h2 { font-size: clamp(30px, 3.6vw, 42px); line-height: 1.12; font-weight: 700; margin-bottom: 16px; }
-  .section-head p { color: var(--dim); font-size: 18px; }
-
-  .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
-  .card {
-    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
-    padding: 28px 26px 30px;
+  section { padding: 120px 0; border-top: 1px solid var(--line); }
+  section.band { background: var(--band); }
+  .head { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 32px 72px; align-items: start; }
+  .label { font: 500 13px/1 "JetBrains Mono", monospace; color: var(--accent-text); letter-spacing: 0.02em; margin-bottom: 18px; }
+  h2 { font-size: clamp(30px, 3.6vw, 44px); line-height: 1.08; }
+  .body > p { color: var(--dim); font-size: 18px; }
+  .body > p + p { margin-top: 14px; }
+  .points { list-style: none; margin-top: 22px; display: grid; gap: 12px; }
+  .points li { position: relative; padding-left: 26px; color: var(--dim); font-size: 16px; }
+  .points li::before {
+    content: ""; position: absolute; left: 2px; top: 0.62em; width: 12px; height: 2px;
+    background: var(--accent); border-radius: 2px;
   }
-  .card svg { width: 30px; height: 30px; color: var(--accent); margin-bottom: 18px; }
-  .card h3 { font-size: 20px; line-height: 1.25; font-weight: 600; margin-bottom: 10px; }
-  .card p { color: var(--dim); font-size: 15.5px; }
 
-  .binary { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 64px; align-items: center; }
-  .binary p { color: var(--dim); font-size: 18px; margin-bottom: 18px; }
-  .binary p:last-child { margin-bottom: 0; }
+  /* Terminal blocks */
+  .term {
+    background: var(--code); color: #D4DCE7; border: 1px solid var(--code-line); border-radius: 12px;
+    font: 400 13.5px/1.7 "JetBrains Mono", monospace; overflow-x: auto;
+  }
+  .term + .term { margin-top: 14px; }
+  .term .t { display: flex; justify-content: space-between; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--code-line); color: #7C899C; font-size: 12px; }
+  .term pre { padding: 14px 16px; white-space: pre; }
+  .term .p { color: #FF8A64; user-select: none; }
+  @media (min-width: 981px) { .term pre.wrap { white-space: pre-wrap; } }
+  .term .c { color: #6E7B8F; }
+  .term .ok { color: #4ADE80; }
+  .term .warn { color: #FBBF24; }
+  .term .k { color: #93C5FD; }
+  .term-copy { background: none; border: 1px solid #2A394D; color: #C9D2DE; border-radius: 6px; padding: 4px 8px; font: 500 11.5px/1 Inter, sans-serif; cursor: pointer; }
+  .term-copy:hover { border-color: #3A4C66; color: #FFFFFF; }
+
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; margin-top: 56px; }
+  .split .shot { margin-top: 0; }
+  .agents { display: grid; grid-template-columns: 390px minmax(0, 1fr); gap: 72px; align-items: center; }
+  .agents .shot { margin-top: 0; }
+  .agents .body { margin-top: 24px; }
+  .agents .term { margin-top: 28px; }
+  .agents .term + .term { margin-top: 14px; }
+
+  /* Secrets */
+  .facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin-top: 56px; border-top: 1px solid var(--line); }
+  .facts div { padding: 26px 28px 28px 0; border-bottom: 1px solid var(--line); }
+  .facts div:not(:nth-child(3n + 1)) { padding-left: 28px; border-left: 1px solid var(--line); }
+  .facts h3 { font-size: 18px; line-height: 1.35; margin-bottom: 8px; letter-spacing: -0.01em; }
+  .facts p { color: var(--dim); font-size: 15.5px; }
+
+  /* One binary */
   .stacks { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: end; }
-  .stack h4 { font: 500 12.5px/1.4 "JetBrains Mono", monospace; color: var(--muted); margin-bottom: 12px; letter-spacing: 0.02em; }
+  .stack h3 { font: 500 12.5px/1.4 "JetBrains Mono", monospace; color: var(--muted); margin-bottom: 12px; letter-spacing: 0.02em; }
   .stack ul { list-style: none; display: grid; gap: 8px; }
   .stack li {
     border: 1px solid var(--line); background: var(--surface); border-radius: 10px;
     padding: 11px 14px; font: 500 14px/1.3 "JetBrains Mono", monospace; color: var(--dim);
   }
   .stack.tug li.one {
-    background: var(--accent); border-color: var(--accent); color: var(--on-accent);
-    padding: 22px 14px; font-weight: 600; display: flex; align-items: center; gap: 10px;
+    background: var(--accent); border-color: var(--accent); color: #0A0E14;
+    padding: 26px 14px; font-weight: 600; display: flex; align-items: center; gap: 10px;
   }
-  .stack.tug li.one img { width: 26px; height: 26px; border-radius: 7px; box-shadow: 0 0 0 2px rgba(11, 16, 24, 0.25); }
+  .stack.tug li.one img { width: 26px; height: 26px; border-radius: 7px; box-shadow: 0 0 0 2px rgba(10, 14, 20, 0.25); }
+  .stack.tug li.one span { font-weight: 400; opacity: 0.75; margin-left: auto; font-size: 12.5px; }
 
-  .cta { text-align: center; }
-  .cta .section-head { margin: 0 auto 34px; }
-  .cta .actions { justify-content: center; }
+  /* Install */
+  .steps { list-style: none; counter-reset: s; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; margin-top: 52px; }
+  .steps li { counter-increment: s; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 24px; }
+  .steps li::before {
+    content: counter(s); display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px;
+    background: var(--accent); color: #0A0E14; font: 700 15px/1 "Space Grotesk", sans-serif; margin-bottom: 16px;
+  }
+  .steps h3 { font-size: 19px; line-height: 1.3; margin-bottom: 8px; letter-spacing: -0.01em; }
+  .steps p { color: var(--dim); font-size: 15.5px; }
+  .steps code { font-size: 13px; background: var(--band); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+  .more { margin-top: 36px; display: flex; flex-wrap: wrap; gap: 12px; }
 
-  footer { border-top: 1px solid var(--line); padding: 30px 0 40px; color: var(--muted); font-size: 14px; }
-  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  footer { border-top: 1px solid var(--line); padding: 36px 0 48px; color: var(--muted); font-size: 14px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px 28px; flex-wrap: wrap; }
+  footer nav { height: auto; gap: 22px; flex-wrap: wrap; justify-content: flex-start; }
   footer a { text-decoration: none; color: var(--dim); }
   footer a:hover { color: var(--text); }
 
   @media (max-width: 980px) {
-    .hero { grid-template-columns: 1fr; gap: 56px; padding: 40px 0 80px; }
-    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .binary { grid-template-columns: 1fr; gap: 40px; }
+    .head { grid-template-columns: 1fr; }
+    .agents { grid-template-columns: minmax(0, 1fr); gap: 48px; }
+    .agents .shot { order: 2; max-width: 420px; }
+    .split { grid-template-columns: 1fr; }
+    .facts { grid-template-columns: 1fr 1fr; }
+    .facts div, .facts div:not(:nth-child(3n + 1)) { padding: 24px 24px 26px 0; border-left: 0; }
+    .facts div:nth-child(2n) { padding-left: 24px; border-left: 1px solid var(--line); }
+    .stacks { margin-top: 36px; }
+    .steps { grid-template-columns: 1fr; }
+    section { padding: 96px 0; }
   }
 
   @media (max-width: 640px) {
     .wrap { padding: 0 16px; }
     body { font-size: 16px; }
-    .nav-links { gap: 18px; }
-    .nav-links .hide-sm { display: none; }
-    .lead { font-size: 17px; }
+    .links { gap: 16px; }
+    .links .hide-sm { display: none; }
+    .hero { padding-top: 48px; }
+    .lead { font-size: 17.5px; }
+    .cmd { width: 100%; flex-direction: column; align-items: stretch; gap: 12px; padding: 14px; }
+    .cmd code { font-size: 13.5px; line-height: 1.6; white-space: normal; overflow-wrap: anywhere; }
+    .copy { padding: 12px; }
+    .install .btn { flex: 1; justify-content: center; }
+    .shot, .hero .shot, .split { margin-top: 40px; }
+    .bar { display: none; }
+    .frame { border-radius: 16px; max-width: 420px; margin: 0 auto; }
+    .shot figcaption { text-align: center; margin-left: auto; margin-right: auto; }
     section { padding: 72px 0; }
-    .grid { grid-template-columns: 1fr; }
-    .charts { grid-template-columns: 1fr 1fr; }
-    .charts .chart:last-child { display: none; }
-    .sketch { padding: 18px; }
+    .body > p { font-size: 16.5px; }
+    .facts { grid-template-columns: 1fr; }
+    .facts div, .facts div:nth-child(2n) { padding: 22px 0; border-left: 0; }
     .stacks { grid-template-columns: 1fr; }
-    .btn { width: 100%; justify-content: center; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
   }
 </style>
 </head>
 <body>
 
-<div class="wrap">
-  <nav>
-    <a class="brand" href="/" aria-label="Tugport home">
-      <img src="/logo.svg" alt="">
-      <span>Tugport</span>
-    </a>
-    <div class="nav-links">
-      <a class="hide-sm" href="#features">What it does</a>
-      <a class="hide-sm" href="#binary">Why one binary</a>
-      <a href="https://github.com/backmeupplz/tugport">GitHub</a>
-    </div>
-  </nav>
-
-  <header class="hero">
-    <div>
-      <p class="status">Tugport is in early development.</p>
-      <h1>Tugport deploys your apps and watches your server from <em>one small binary.</em></h1>
-      <p class="lead">Push to GitHub or Forgejo and Tugport builds the commit, rolls it out without downtime and serves it over HTTPS, on one server or across many. The same binary keeps the logs of every service, charts the CPU, memory, disk and GPU of your machine, and gives your AI agents API keys that can do exactly what you allow.</p>
-      <div class="actions">
-        <a class="btn btn-primary" href="https://github.com/backmeupplz/tugport">
+<header class="top" id="top">
+  <div class="wrap">
+    <nav aria-label="Main">
+      <a class="brand" href="/" aria-label="Tugport home">
+        <img src="/logo.svg" alt="" width="30" height="30">
+        <span>Tugport</span>
+      </a>
+      <div class="links">
+        <a class="hide-sm" href="#deploys">Features</a>
+        <a class="hide-sm" href="#install">Install</a>
+        <a class="hide-sm" href="https://github.com/backmeupplz/tugport/tree/main/docs">Docs</a>
+        <a class="gh" href="https://github.com/backmeupplz/tugport">
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.56-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.25 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
-          Follow the build on GitHub
+          GitHub
         </a>
-        <a class="btn btn-ghost" href="#features">See what it will do</a>
       </div>
-    </div>
+    </nav>
+  </div>
+</header>
 
-    <figure class="sketch" aria-hidden="true">
-      <span class="tag">concept</span>
-      <div class="svc-head">
-        <div class="svc-name"><i></i>shop <b>/</b> api</div>
-        <span class="live">live</span>
-      </div>
-      <p class="svc-meta">main · 4f2c9e1 · deployed by agent <em>codex</em></p>
-      <ul class="steps">
-        <li>Built with Nixpacks in 41 seconds</li>
-        <li>Both replicas passed the health check</li>
-        <li>Traffic switched over with zero downtime</li>
-      </ul>
-      <div class="charts">
-        <div class="chart">
-          <span>CPU <b>12%</b></span>
-          <svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline fill="none" stroke="#4FD1C5" stroke-width="2" vector-effect="non-scaling-stroke" points="0,28 10,26 20,27 30,20 40,22 50,12 60,18 70,16 80,22 90,19 100,21"/></svg>
+<main>
+  <div class="hero">
+    <div class="wrap">
+      <h1>Tugport deploys your apps to <em>servers you own.</em></h1>
+      <p class="lead">It is one Rust binary that runs next to Docker. Push a commit and Tugport builds it, switches traffic once the new version is healthy and serves it over HTTPS, with logs, charts, backups and scoped API keys for your AI agents built in.</p>
+      <div class="install">
+        <div class="cmd">
+          <code id="install-cmd"><b>$ </b>curl -fsSL https://tugport.com/install | sh</code>
+          <button class="copy" type="button" data-copy="install-cmd">Copy</button>
         </div>
-        <div class="chart">
-          <span>Memory <b>318 MB</b></span>
-          <svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline fill="none" stroke="#FF8A64" stroke-width="2" vector-effect="non-scaling-stroke" points="0,20 10,19 20,19 30,18 40,18 50,17 60,17 70,16 80,16 90,15 100,15"/></svg>
-        </div>
-        <div class="chart">
-          <span>GPU <b>4%</b></span>
-          <svg viewBox="0 0 100 34" preserveAspectRatio="none"><polyline fill="none" stroke="#A78BFA" stroke-width="2" vector-effect="non-scaling-stroke" points="0,30 10,30 20,29 30,30 40,24 50,30 60,30 70,29 80,30 90,27 100,30"/></svg>
-        </div>
+        <a class="btn" href="https://github.com/backmeupplz/tugport">View the source</a>
       </div>
-      <div class="logs">
-        <div><span>14:02:11</span>server listening on :3000</div>
-        <div><span>14:02:12</span>GET /health 200 in 2 ms</div>
-        <div><span>14:02:14</span>POST /orders 201 in 18 ms</div>
-      </div>
-      <figcaption class="sr-only">A sketch of a service page in Tugport showing a live deploy made by an agent, usage charts and recent logs.</figcaption>
-    </figure>
-  </header>
-</div>
+      <p class="note">It runs on Linux with systemd, on x86_64 or arm64. The installer sets up Docker if it is missing and prints a one-time link for creating your account. Tugport is free and MIT licensed.</p>
 
-<section id="features" class="band">
-  <div class="wrap">
-    <div class="section-head">
-      <h2>Tugport does a few things, and it does them properly.</h2>
-      <p>There is no app store and no wall of options. You get what you need to run your own software on your own servers, and each piece is built to keep working when something next to it breaks.</p>
-    </div>
-    <div class="grid">
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-        <h3>Projects keep your services together.</h3>
-        <p>Group apps and databases into projects, give each service its own domains with automatic HTTPS, and keep its environment, volumes and resource limits in one place. Services in the same project reach each other by name on a private network.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7M8.3 7.2l7.4 3.6"/></svg>
-        <h3>Every push can ship itself.</h3>
-        <p>Connect a repository on GitHub or Forgejo, pick a branch, and each push is built from your Dockerfile or with Nixpacks. The new version has to pass its health check before it gets any traffic, and a bad release goes back with one click.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 10h11M4 14h16M4 18h8"/></svg>
-        <h3>Logs stay where you can read them.</h3>
-        <p>Follow any service live, search across all of its replicas, and scroll back through history that survives restarts and redeploys, right next to the build log of every deploy.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 20h18"/><path d="M4 16l4.5-5 3.5 3 4.5-6 3.5 4"/></svg>
-        <h3>Your server is always on a chart.</h3>
-        <p>CPU, memory, disk, network and GPU usage are charted for the whole machine and for each service, from the last minute back to the last month, and Tugport tells you on Telegram when something runs hot or falls over.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3M14 9l2 2"/></svg>
-        <h3>Agents get their own keys and limits.</h3>
-        <p>Create an agent user and its API key in one step, choose which projects it can see and whether it may deploy, change settings or read secrets, and read back everything it did in the audit log. The same rules apply to the API, the CLI and the MCP endpoint.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V5.5"/><path d="M4.5 12v6.5c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V12"/></svg>
-        <h3>Databases come with backups and replicas.</h3>
-        <p>Run Postgres, MySQL, MariaDB, MongoDB or Redis next to your apps, back them up on a schedule to any S3-compatible storage, and add read replicas on other servers that you can promote if the primary is lost.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
-        <h3>More servers join with one command.</h3>
-        <p>Run the command the panel shows on a new machine, or let Tugport create one at Hetzner or AWS, and it joins an encrypted WireGuard network. Replicas spread across your servers, and when one of them goes away its services start on the others.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
-        <h3>The number of copies follows the traffic.</h3>
-        <p>A service can add replicas when its CPU or request rate climbs and drop them again when things are quiet, a pool of cloud servers can grow and shrink the same way, and a site nobody visits can sleep until the next request wakes it.</p>
-      </article>
-      <article class="card">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12h14M13 6l6 6-6 6"/></svg>
-        <h3>Easypanel and Coolify move over.</h3>
-        <p>The installer notices an existing Easypanel or Coolify, shows what it will move, and brings over your projects, domains, certificates, environment, volumes and webhooks while the apps keep running, with a rollback if you change your mind.</p>
-      </article>
+      <figure class="shot">
+        <div class="frame">
+          <div class="bar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>panel.example.com/projects/storefront/web</div>
+          <picture>
+            <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/service-light-phone.webp" width="780" height="1560">
+            <source media="(max-width: 640px)" srcset="/shots/service-dark-phone.webp" width="780" height="1560">
+            <source media="(prefers-color-scheme: light)" srcset="/shots/service-light.webp" width="2560" height="1820">
+            <img src="/shots/service-dark.webp" width="2560" height="1820" alt="The Tugport panel showing the web service of a storefront project: two replicas running on two servers, the last deploy made by an AI agent, and its source repository and deploy webhook." fetchpriority="high">
+          </picture>
+        </div>
+      </figure>
     </div>
   </div>
-</section>
 
-<section id="binary">
-  <div class="wrap binary">
-    <div>
-      <div class="section-head" style="margin-bottom: 24px">
-        <h2>It is one binary, not a stack of services.</h2>
+  <section id="deploys">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Deploys</p>
+          <h2>A push becomes a release, and a broken release never gets traffic.</h2>
+        </div>
+        <div class="body">
+          <p>Connect GitHub, Forgejo, Gitea, GitLab or any Git server with a deploy key. Tugport builds every push with your Dockerfile, Railpack, Nixpacks or buildpacks on a warm BuildKit cache, starts the new version next to the old one, and moves traffic only after its health check passes.</p>
+          <ul class="points">
+            <li>Rolling back to any of the last few images takes one click.</li>
+            <li>In a monorepo, watch paths redeploy only the services whose folders changed.</li>
+            <li>The outcome goes back to the commit on GitHub or Forgejo, and to Telegram, email or a webhook if you want it there too.</li>
+          </ul>
+        </div>
       </div>
-      <p>A typical self-hosted panel arrives as a web app with a reverse proxy, a database, a cache, a metrics server and a log shipper beside it, and every one of them needs its own updates and can fail on its own. Tugport keeps the proxy, the certificates, the deploy queue, the metrics and the logs inside one Rust binary, stores its state in a single SQLite file and lets Docker run your containers.</p>
-      <p>That also means a failed build stays a failed build. It never restarts the panel, and it never takes other deploys down with it.</p>
+      <figure class="shot">
+        <div class="frame">
+          <div class="bar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>panel.example.com/projects/storefront/web/deploys</div>
+          <picture>
+            <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/deploys-light-phone.webp" width="780" height="1560">
+            <source media="(max-width: 640px)" srcset="/shots/deploys-dark-phone.webp" width="780" height="1560">
+            <source media="(prefers-color-scheme: light)" srcset="/shots/deploys-light.webp" width="2560" height="1320">
+            <img src="/shots/deploys-dark.webp" width="2560" height="1320" alt="The deploy history of the web service: releases made by agents and people, and a release that failed its health check while the previous version kept serving." loading="lazy" decoding="async">
+          </picture>
+        </div>
+        <figcaption>The autumn-sale release crashed on start, so it never received a request. The previous version kept serving until the fix went live.</figcaption>
+      </figure>
     </div>
-    <div class="stacks" aria-label="A typical panel runs seven separate pieces, while Tugport runs as one binary next to Docker.">
-      <div class="stack">
-        <h4>a typical panel</h4>
-        <ul>
-          <li>panel web app</li>
-          <li>reverse proxy</li>
-          <li>database</li>
-          <li>cache and queue</li>
-          <li>metrics server</li>
-          <li>log shipper</li>
-          <li>docker</li>
-        </ul>
-      </div>
-      <div class="stack tug">
-        <h4>tugport</h4>
-        <ul>
-          <li class="one"><img src="/logo.svg" alt="">tugport</li>
-          <li>docker</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-</section>
+  </section>
 
-<section class="band cta">
-  <div class="wrap">
-    <div class="section-head">
-      <h2>Tugport is being built in the open.</h2>
-      <p>Star the repository to follow along, or open an issue if there is something you need it to do on your server.</p>
+  <section id="agents" class="band">
+    <div class="wrap agents">
+      <figure class="shot phone">
+        <div class="frame">
+          <picture>
+            <source media="(prefers-color-scheme: light)" srcset="/shots/access-light-phone.webp" width="780" height="2620">
+            <img src="/shots/access-dark-phone.webp" width="780" height="2620" alt="The page of the agent named claude on a phone: operator on the storefront project and no access to the others, no extra grants, and one API key with its expiry and the time and address it was last used from." loading="lazy" decoding="async">
+          </picture>
+        </div>
+      </figure>
+      <div>
+        <p class="label">Agents</p>
+        <h2>AI agents get their own users, keys and limits.</h2>
+        <div class="body">
+          <p>An agent is a user without a password. Give it a role on the projects it needs, and Tugport hands you its key along with setup lines for Claude Code, Codex, the CLI and curl. The MCP endpoint, the CLI and the API all check the same permissions.</p>
+          <ul class="points">
+            <li>Roles go from viewer to deployer, operator and admin. Deleting things and reading secrets need separate grants that no role includes.</li>
+            <li>Keys can expire, can be limited to IP ranges, and show when and where they were last used.</li>
+            <li>Every action lands in the audit log with the person or agent and the key behind it.</li>
+          </ul>
+        </div>
+        <div class="term">
+          <div class="t"><span>Connect Claude Code</span><button class="term-copy" type="button" data-copy="mcp-cmd">Copy</button></div>
+          <pre id="mcp-cmd"><span class="p">$ </span>claude mcp add --transport http tugport \
+    https://panel.example.com/mcp \
+    --header "Authorization: Bearer $TUGPORT_TOKEN"</pre>
+        </div>
+        <div class="term">
+          <div class="t"><span>Or deploy from the CLI</span></div>
+          <pre id="cli-demo"><span class="p">$ </span>export TUGPORT_URL=https://panel.example.com TUGPORT_TOKEN=tpk_…
+<span class="p">$ </span>tugport deploy storefront.api
+<span class="c">04:52:19</span> Fetching main from git@git.example.com:acme/storefront.git
+<span class="c">04:52:19</span> Checked out 5a24391 Cache the product list for a minute
+<span class="c">04:52:19</span> Planning the build with Railpack
+<span class="c">         …</span>
+<span class="c">04:52:21</span> Built tp-storefront-api:z2ukkvwlcfw0 in 1.3s
+<span class="c">04:52:21</span> Running on app-1, app-2
+<span class="c">04:52:21</span> Sending the image to app-2
+<span class="c">04:52:22</span> Started 2 containers; checking health
+<span class="c">04:52:22</span> Traffic switched; letting the old version finish requests for 10s
+<span class="c">04:52:33</span> <span class="ok">Live after 13.5s.</span>
+Deploy z2ukkvwlcfw0: <span class="ok">live</span></pre>
+        </div>
+      </div>
     </div>
-    <div class="actions">
-      <a class="btn btn-primary" href="https://github.com/backmeupplz/tugport">Watch the repository on GitHub</a>
+  </section>
+
+  <section id="observe">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Logs and charts</p>
+          <h2>Logs and charts are built in for every server and service.</h2>
+        </div>
+        <div class="body">
+          <p>Follow the logs of every replica live, search them, and scroll back past restarts and redeploys. Each server's CPU, memory, disk, network and GPU use and each service's CPU, memory and network are charted from the last hour back to the last 30 days, without a metrics stack to run beside it.</p>
+          <ul class="points">
+            <li>Alerts for high CPU, memory or disk use, crash loops, out-of-memory kills, failed deploys, failed backups and offline servers go to Telegram, email or a webhook.</li>
+            <li>Secret values are masked in logs before anyone, or anything, reads them.</li>
+          </ul>
+        </div>
+      </div>
+      <figure class="shot">
+        <div class="frame">
+          <div class="bar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>panel.example.com/projects/storefront/api/logs</div>
+          <picture>
+            <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/logs-light-phone.webp" width="780" height="1560">
+            <source media="(max-width: 640px)" srcset="/shots/logs-dark-phone.webp" width="780" height="1560">
+            <source media="(prefers-color-scheme: light)" srcset="/shots/logs-light.webp" width="2560" height="1580">
+            <img src="/shots/logs-dark.webp" width="2560" height="1580" alt="Live logs of the storefront API, interleaving requests served by its two replicas on two servers." loading="lazy" decoding="async">
+          </picture>
+        </div>
+      </figure>
+      <figure class="shot">
+        <div class="frame">
+          <div class="bar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>panel.example.com/projects/storefront/web/metrics</div>
+          <picture>
+            <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/metrics-light-phone.webp" width="780" height="1560">
+            <source media="(max-width: 640px)" srcset="/shots/metrics-dark-phone.webp" width="780" height="1560">
+            <source media="(prefers-color-scheme: light)" srcset="/shots/metrics-light.webp" width="2560" height="1580">
+            <img src="/shots/metrics-dark.webp" width="2560" height="1580" alt="The metrics of the web service over the last hour: CPU, memory, network traffic, and a spike of crashes from the release that failed its health check." loading="lazy" decoding="async">
+          </picture>
+        </div>
+      </figure>
     </div>
-  </div>
-</section>
+  </section>
+
+  <section id="servers" class="band">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Servers</p>
+          <h2>More servers join with one command, or Tugport creates them for you.</h2>
+        </div>
+        <div class="body">
+          <p>A new server joins an encrypted WireGuard network by running the command the panel shows. Replicas spread across servers, services find each other by name wherever they run, and when a server goes away, its services start on the others.</p>
+          <ul class="points">
+            <li>Connect a Hetzner or AWS account, and Tugport creates servers in any region and adds or removes them as a pool's load changes.</li>
+            <li>Replicas follow CPU or request rate, and a site nobody visits sleeps until the next request wakes it.</li>
+            <li>A service can be pinned to a server, a label or a region.</li>
+          </ul>
+        </div>
+      </div>
+      <figure class="shot">
+        <div class="frame">
+          <div class="bar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>panel.example.com/servers</div>
+          <picture>
+            <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/servers-light-phone.webp" width="780" height="1560">
+            <source media="(max-width: 640px)" srcset="/shots/servers-dark-phone.webp" width="780" height="1560">
+            <source media="(prefers-color-scheme: light)" srcset="/shots/servers-light.webp" width="2560" height="1180">
+            <img src="/shots/servers-dark.webp" width="2560" height="1180" alt="Three servers in three regions on one private network, each online, with its role label and resources." loading="lazy" decoding="async">
+          </picture>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section id="databases">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Databases</p>
+          <h2>Databases come with backups, test restores and replicas.</h2>
+        </div>
+        <div class="body">
+          <p>Run Postgres, MySQL, MariaDB, MongoDB or Redis next to your apps, with generated credentials and a connection string that every service in the project can use. Back them up on a schedule to S3-compatible storage or a disk, and check a backup by restoring it into a throwaway copy.</p>
+          <ul class="points">
+            <li>Read replicas run on other servers or in other regions, with read-only connection strings and a promote button.</li>
+            <li>Volumes can be backed up and restored the same way.</li>
+          </ul>
+        </div>
+      </div>
+      <figure class="shot">
+        <div class="frame">
+          <div class="bar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>panel.example.com/projects/storefront</div>
+          <picture>
+            <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/database-light-phone.webp" width="780" height="1560">
+            <source media="(max-width: 640px)" srcset="/shots/database-dark-phone.webp" width="780" height="1560">
+            <source media="(prefers-color-scheme: light)" srcset="/shots/database-light.webp" width="2560" height="1208">
+            <img src="/shots/database-dark.webp" width="2560" height="1208" alt="The storefront project: apps built from Git, its Postgres database with a read replica on another server, and Redis, all running." loading="lazy" decoding="async">
+          </picture>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section id="secrets" class="band">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Secrets</p>
+          <h2>Secrets only reach the containers that use them.</h2>
+        </div>
+        <div class="body">
+          <p>Every environment value is stored encrypted, and the key that opens them is sealed to the server's TPM when it has one. The rest of the design assumes that one of your services will be compromised someday, and keeps that from becoming a problem for the others.</p>
+        </div>
+      </div>
+      <div class="facts">
+        <div><h3>They live in memory inside the container.</h3><p>Secrets are written to memory-only storage and loaded by Tugport's init, so they never show up in <code>docker inspect</code>, on disk or in image layers.</p></div>
+        <div><h3>Projects can't reach each other.</h3><p>Each project sits on a network of its own, so a service can't reach another project's databases, and no container can open connections into the encrypted network between your servers.</p></div>
+        <div><h3>Dangerous switches need a grant.</h3><p>Privileged mode, the Docker socket, host networking and bind mounts stay off unless an admin with the destroy grant turns them on.</p></div>
+        <div><h3>Agents can write secrets without reading them.</h3><p>Reading a value takes the secrets grant. Without it, an agent sees only names, and values are masked in its output.</p></div>
+        <div><h3>Two-factor sign-in is built in.</h3><p>People add a TOTP code to their password from the sidebar. Agents have no password at all, only keys that you can revoke instantly.</p></div>
+        <div><h3>Nothing phones home.</h3><p>Tugport sends no telemetry, and its own outbound requests never carry your environment values.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="migrate">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Migration</p>
+          <h2>Moving from Easypanel or Coolify is one command.</h2>
+        </div>
+        <div class="body">
+          <p>The installer notices an existing Easypanel or Coolify and offers to move it. Tugport reads the old panel's state, shows you the plan, and brings over projects, domains, certificates, environment, volumes and deploy webhooks while your apps keep running.</p>
+          <ul class="points">
+            <li>Data stays where it is: databases and volumes keep their directories, so nothing is copied.</li>
+            <li>The old panel is only stopped at the end, and <code>tugport migrate rollback</code> starts it again.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="term" style="margin-top: 56px">
+        <div class="t"><span>A dry run on a server running Easypanel</span></div>
+<pre id="migrate-demo" class="wrap"><span class="p">$ </span>tugport migrate easypanel --dry-run
+easypanel 2.38.0 -&gt; Tugport: 2 projects, 6 services
+
+<span class="k">blog</span>
+  mongo                  mongo     mongo:8.0                          stop old, then start   2 env, also on tp-shop
+  stack                  compose   compose                            stop old, then start   stack.test, 1 env
+<span class="k">shop</span>
+  api                    app       busybox:1.37                       next to the old copy   api.test, 5 env
+  bot-worker             app       busybox:1.37                       stop old, then start   was bot_worker
+  db                     postgres  postgres:16                        stop old, then start   4 env
+  web                    app       nginx:1.29-alpine                  next to the old copy   web.test, 1 env
+
+Certificates: 1 imported, so nothing is re-issued
+Deploy webhooks: 4 old URLs keep working (Tugport answers on 0.0.0.0:3000 after the switch)
+Cutover: databases move first (2), then apps start next to their old copies (2), then services that must not run twice move (2). Each moved database and service is down for a few seconds; everything else only while the proxy switches (about a second).</pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="binary" class="band">
+    <div class="wrap head">
+      <div>
+        <p class="label">One binary</p>
+        <h2>Tugport is one binary, not a stack of services.</h2>
+        <div class="body" style="margin-top: 24px">
+          <p>A typical self-hosted panel is a web app with a reverse proxy, a database, a cache, a queue, a metrics server and a log shipper next to it, and every one of them needs updates and can fail on its own. Tugport keeps the proxy, certificates, builds, logs and metrics in one Rust binary, stores its state in a single SQLite file, and lets Docker run your containers.</p>
+          <p>Updating it is a button in the panel, and the proxy keeps serving while the new version takes over. There is no app store, no one-click templates and no teams or organizations, on purpose.</p>
+        </div>
+      </div>
+      <div class="stacks" role="img" aria-label="A typical panel runs seven separate pieces, while Tugport runs as one binary next to Docker.">
+        <div class="stack">
+          <h3>a typical panel</h3>
+          <ul>
+            <li>panel web app</li>
+            <li>reverse proxy</li>
+            <li>database</li>
+            <li>cache and queue</li>
+            <li>metrics server</li>
+            <li>log shipper</li>
+            <li>docker</li>
+          </ul>
+        </div>
+        <div class="stack tug">
+          <h3>tugport</h3>
+          <ul>
+            <li class="one"><img src="/logo.svg" alt="">tugport<span>~20 MB</span></li>
+            <li>docker</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="wrap">
+      <div class="head">
+        <div>
+          <p class="label">Install</p>
+          <h2>You can try it on a fresh server in a few minutes.</h2>
+        </div>
+        <div class="body">
+          <p>Any Linux server with systemd works, from a small cloud machine to the box under your desk. Tugport needs ports 80 and 443 for your sites and 8484 for the panel until you give the panel a domain of its own.</p>
+        </div>
+      </div>
+      <ol class="steps">
+        <li><h3>Run the installer as root.</h3><p>It checks the download against its published checksum, installs Docker if needed and starts Tugport as a system service.</p></li>
+        <li><h3>Open the link it prints.</h3><p>Create the owner account there, then turn on two-factor sign-in from the sidebar.</p></li>
+        <li><h3>Connect a repository.</h3><p>Create a project, add an app from Git, point a domain at the server, and push.</p></li>
+      </ol>
+      <div class="install" style="margin-top: 36px">
+        <div class="cmd">
+          <code id="install-cmd-2"><b>$ </b>curl -fsSL https://tugport.com/install | sh</code>
+          <button class="copy" type="button" data-copy="install-cmd-2">Copy</button>
+        </div>
+      </div>
+      <div class="more">
+        <a class="btn" href="https://github.com/backmeupplz/tugport/blob/main/docs/API.md">Read the API reference</a>
+        <a class="btn" href="https://github.com/backmeupplz/tugport/blob/main/docs/MIGRATION.md">Read the migration guide</a>
+        <a class="btn" href="https://github.com/backmeupplz/tugport/blob/main/ROADMAP.md">See the roadmap</a>
+      </div>
+    </div>
+  </section>
+</main>
 
 <footer>
   <div class="wrap">
     <span>Tugport is MIT licensed. © 2026 Nikita Kolmogorov.</span>
-    <a href="https://github.com/backmeupplz/tugport">github.com/backmeupplz/tugport</a>
+    <nav aria-label="Footer">
+      <a href="https://github.com/backmeupplz/tugport">Source code</a>
+      <a href="https://github.com/backmeupplz/tugport/releases">Releases</a>
+      <a href="https://github.com/backmeupplz/tugport/blob/main/docs/API.md">API</a>
+      <a href="https://github.com/backmeupplz/tugport/issues">Issues</a>
+    </nav>
   </div>
 </footer>
 
+<script>
+  for (const b of document.querySelectorAll("[data-copy]")) {
+    b.addEventListener("click", async () => {
+      const text = document.getElementById(b.dataset.copy).textContent.replace(/^\$ /gm, "").trim();
+      try {
+        await navigator.clipboard.writeText(text);
+        b.textContent = "Copied";
+      } catch {
+        b.textContent = "Press Ctrl+C";
+        getSelection().selectAllChildren(document.getElementById(b.dataset.copy));
+      }
+      setTimeout(() => (b.textContent = "Copy"), 1800);
+    });
+  }
+  const header = document.getElementById("top");
+  addEventListener("scroll", () => header.classList.toggle("scrolled", scrollY > 8), { passive: true });
+</script>
 </body>
 </html>

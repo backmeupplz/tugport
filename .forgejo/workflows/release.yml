@@ -1,0 +1,93 @@
+name: Release
+
+# Pushing a v* tag to git.borodutch.com (the push mirror carries it to GitHub) builds the static binaries on the
+# Forgejo runners and publishes them, with SHA256SUMS, as the GitHub Release (website/install and the self-updater
+# download from there) and as the same release on git.borodutch.com.
+# Running it by hand (workflow_dispatch) on a branch only builds, to check the release build without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Only the job that publishes may write; the build runs npm and cargo build scripts.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    # Both cross-compile on x86_64 Linux with cargo-zigbuild (ring and the bundled SQLite need a musl C toolchain,
+    # which Ubuntu only has for the native arch); there are no arm64 runners here.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: The tag matches the crate version
+        if: github.ref_type == 'tag'
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $v in Cargo.toml"; exit 1; }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+      - name: Build the web panel
+        run: |
+          if [ -f web/package.json ]; then cd web && npm ci && npm run build; else mkdir -p web/dist && echo '<!doctype html><title>Tugport</title>' > web/dist/index.html; fi
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.arch }}-unknown-linux-musl
+      - run: pip install --break-system-packages cargo-zigbuild==0.23.4 ziglang==0.16.0
+      - name: Build a static binary
+        env:
+          TUGPORT_COMMIT: ${{ github.sha }}
+        run: |
+          cargo zigbuild --locked --release --target ${{ matrix.arch }}-unknown-linux-musl
+          cp target/${{ matrix.arch }}-unknown-linux-musl/release/tugport tugport-linux-${{ matrix.arch }}
+          run=; if [ ${{ matrix.arch }} = aarch64 ]; then
+            sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qemu-user && run=qemu-aarch64
+          fi
+          $run ./tugport-linux-${{ matrix.arch }} version
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
+        with:
+          name: tugport-linux-${{ matrix.arch }}
+          path: tugport-linux-${{ matrix.arch }}
+
+  # One job publishes everything at once, so releases/latest/download/* never 404s mid-release.
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: GitHub and Forgejo releases
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ secrets.GH_MIRROR_TOKEN }}
+          FJ_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum tugport-linux-* > SHA256SUMS && cat SHA256SUMS
+          # The tag reaches the GitHub mirror within seconds; wait for it rather than letting GitHub create one
+          for i in $(seq 30); do gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1 && break; sleep 10; done
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$REPO" --clobber *
+          else
+            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --generate-notes *
+          fi
+          API="${{ github.server_url }}/api/v1/repos/$REPO/releases"
+          ID=$(curl -sS -H "Authorization: token $FJ_TOKEN" "$API/tags/$TAG" | jq -r '.id // empty')
+          if [ -z "$ID" ]; then
+            ID=$(jq -n --arg t "$TAG" '{tag_name: $t, name: $t}' |
+              curl -fsS -H "Authorization: token $FJ_TOKEN" -H "Content-Type: application/json" -d @- "$API" | jq -er .id)
+          fi
+          for f in *; do
+            curl -fsS -o /dev/null -H "Authorization: token $FJ_TOKEN" -F "attachment=@$f" "$API/$ID/assets?name=$f"
+          done

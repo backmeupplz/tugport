@@ -159,6 +159,84 @@ pub fn install_boot_hook() -> Result<()> {
     Ok(())
 }
 
+/// Containers must not reach the panel through the host's own addresses (its LAN or public
+/// IP, a bridge gateway) either. Such connections arrive on INPUT from a container bridge,
+/// while the proxy's come over loopback and everyone else's over a real interface. Agents
+/// listen on the mesh address only, which `guard` already covers.
+///
+/// `host_ifaces` (from `interfaces`) must be read before `docker_bridges` (the interfaces of
+/// Docker's bridge networks), so a network created in between is never taken for a host
+/// bridge. Networks created later are covered anyway: Docker names them `br-<id>`, and `br-+`
+/// matches them.
+pub fn guard_panel(port: Option<u16>, host_ifaces: &[String], docker_bridges: &[String]) -> Result<()> {
+    let rules = panel_rules(port, docker_bridges, host_ifaces);
+    let v4 = guard_panel_with("iptables", &rules);
+    // Only containers on IPv6-enabled networks reach a panel listening on `[::]`.
+    let v6 = if Command::new("ip6tables").args(["-w", "10", "-n", "-L", "INPUT"]).output().map(|o| o.status.success()).unwrap_or(false) {
+        guard_panel_with("ip6tables", &rules)
+    } else {
+        Ok(())
+    };
+    v4.and(v6)
+}
+
+/// This server's network interfaces.
+pub fn interfaces() -> Vec<String> {
+    std::fs::read_dir("/sys/class/net").map(|d| d.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect()).unwrap_or_default()
+}
+
+const PANEL_CHAIN: &str = "TUGPORT-PANEL";
+
+/// Docker's own name for a bridge network's interface: `br-` and 12 hex digits of its id.
+fn docker_named(iface: &str) -> bool {
+    iface.strip_prefix("br-").is_some_and(|id| id.len() == 12 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The chain's rules. Host bridges that happen to be called `br-something` (netplan's
+/// `br-wan`, OpenStack's `br-ex`) carry real clients and are let through first; bridges that
+/// Docker was told to name otherwise are added to the defaults. Containers get a reset rather
+/// than silence, so a webhook aimed at the wrong address fails at once.
+fn panel_rules(port: Option<u16>, docker_bridges: &[String], host_ifaces: &[String]) -> Vec<Vec<String>> {
+    let Some(port) = port else { return vec![] };
+    let mut rules: Vec<Vec<String>> = host_ifaces
+        .iter()
+        .filter(|i| i.starts_with("br-") && !docker_named(i) && !docker_bridges.contains(i))
+        .map(|i| vec!["-i".into(), i.clone(), "-j".into(), "RETURN".into()])
+        .collect();
+    let mut bridges: Vec<&str> = vec!["docker0", "docker_gwbridge", "br-+"];
+    bridges.extend(docker_bridges.iter().map(String::as_str).filter(|b| !b.starts_with("br-") && !bridges.contains(b)).collect::<Vec<_>>());
+    for b in bridges {
+        rules.push(["-i", b, "-p", "tcp", "--dport", &port.to_string(), "-m", "conntrack", "--ctstate", "NEW", "-j", "REJECT", "--reject-with", "tcp-reset"]
+            .map(String::from)
+            .to_vec());
+    }
+    rules
+}
+
+fn guard_panel_with(bin: &str, rules: &[Vec<String>]) -> Result<()> {
+    fn args<'a>(op: &'a str, chain: &'a str, rule: &'a [String]) -> Vec<&'a str> {
+        [&[op, chain][..], &rule.iter().map(String::as_str).collect::<Vec<_>>()].concat()
+    }
+    let ok = |a: &[&str]| Command::new(bin).args(["-w", "10"]).args(a).output().map(|o| o.status.success()).unwrap_or(false);
+    let iptables = |a: &[&str]| run(Command::new(bin).args(["-w", "10"]).args(a)).context("blocking containers from the panel");
+    if !ok(&["-n", "-L", PANEL_CHAIN]) {
+        iptables(&["-N", PANEL_CHAIN])?;
+    }
+    // Ports and bridges change, so rebuild the chain whenever it holds anything else.
+    let present = iptables(&["-S", PANEL_CHAIN])?.lines().filter(|l| l.starts_with("-A ")).count();
+    if present != rules.len() || !rules.iter().all(|r| ok(&args("-C", PANEL_CHAIN, r))) {
+        iptables(&["-F", PANEL_CHAIN])?;
+        for r in rules {
+            iptables(&args("-A", PANEL_CHAIN, r))?;
+        }
+    }
+    let jump = ["-p", "tcp", "-j", PANEL_CHAIN].map(String::from);
+    if !ok(&args("-C", "INPUT", &jump)) {
+        iptables(&args("-I", "INPUT", &jump))?;
+    }
+    Ok(())
+}
+
 pub fn available() -> bool {
     Command::new("wg").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
@@ -174,5 +252,31 @@ mod tests {
         assert_eq!(mesh_ip(249), "10.99.0.249");
         assert_eq!(mesh_ip(250), "10.99.1.1");
         assert_eq!(mesh_ip(251), "10.99.1.2");
+    }
+
+    #[test]
+    fn panel_rules_cover_container_bridges_only() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(super::panel_rules(None, &s(&["docker0"]), &s(&["eth0"])).is_empty());
+        let rules: Vec<String> = super::panel_rules(
+            Some(8484),
+            &s(&["docker0", "br-0123456789ab", "br-custom", "tp-custom"]),
+            &s(&["lo", "eth0", "docker0", "br-0123456789ab", "br-ffffffffffff", "br-custom", "br-ex", "br-wan"]),
+        )
+        .iter()
+        .map(|r| r.join(" "))
+        .collect();
+        let drop = |i: &str| format!("-i {i} -p tcp --dport 8484 -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset");
+        assert_eq!(
+            rules,
+            vec![
+                "-i br-ex -j RETURN".to_string(),
+                "-i br-wan -j RETURN".to_string(),
+                drop("docker0"),
+                drop("docker_gwbridge"),
+                drop("br-+"),
+                drop("tp-custom"),
+            ]
+        );
     }
 }

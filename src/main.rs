@@ -244,6 +244,9 @@ async fn serve() -> Result<()> {
     if let Err(e) = nodes::restore_mesh(&app).await {
         tracing::error!("bringing up the server mesh: {e:#}");
     }
+    if let Err(e) = nodes::guard_panel(&app).await {
+        tracing::error!("{e:#}");
+    }
     install_init_binary(&app)?;
     deploy::recover_interrupted(&app)?;
     backup::recover_interrupted(&app)?;

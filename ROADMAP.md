@@ -138,7 +138,7 @@ Even on a single server, the panel drives Docker through the same node interface
 - **A compromised service cannot steal other services' secrets:**
   - Each container only ever sees its own secrets, delivered as a memory-only file mounted into that container alone.
   - Services cannot mount the Docker socket, Tugport's data or another service's secrets unless an admin explicitly allows it.
-  - Containers cannot reach the panel or Tugport's internal endpoints, and there is no metadata endpoint to query.
+  - Containers cannot reach the panel's port through their own server's addresses, nor the server mesh or Tugport's internal endpoints, and there is no metadata endpoint to query. A container on another server reaches the panel's port like any other machine on the network that port listens on, and the panel domain answers every container the way it answers anyone on the internet, always behind the same sign-in or webhook token. A service on the panel's own server, such as a self-hosted Git server, therefore sends deploy webhooks through the panel domain or the webhook-only port. Services that an admin puts on the host network are not containers in this sense.
   - Projects sit on separate networks, so a service cannot reach another project's databases.
   - Containers start with `no-new-privileges` and are never privileged unless an admin allows it.
 - **No telemetry:** Tugport sends none, and its own outbound calls never carry environment values.

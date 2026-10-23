@@ -135,6 +135,13 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// The raw panel port, if it listens. The legacy port serves token-checked webhooks only.
+    pub fn panel_port(&self) -> Option<u16> {
+        self.panel_listen.rsplit_once(':')?.1.parse().ok()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct DockerCleanup {
@@ -208,5 +215,17 @@ pub struct UpdateSettings {
 impl Default for UpdateSettings {
     fn default() -> Self {
         UpdateSettings { auto: false, channel: "stable".into() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_port_follows_the_listen_setting() {
+        assert_eq!(Settings::default().panel_port(), Some(8484));
+        assert_eq!(Settings { panel_listen: "[::]:9000".into(), ..Default::default() }.panel_port(), Some(9000));
+        assert_eq!(Settings { panel_listen: String::new(), legacy_listen: Some("0.0.0.0:3000".into()), ..Default::default() }.panel_port(), None);
     }
 }

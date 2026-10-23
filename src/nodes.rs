@@ -693,19 +693,35 @@ pub async fn host_info(app: &App) -> Value {
     })
 }
 
+/// Keep containers on this server off the raw panel port.
+pub async fn guard_panel(app: &App) -> Result<()> {
+    let host = mesh::interfaces();
+    let bridges = runtime::bridge_interfaces(&app.docker).await.context("blocking containers from the panel")?;
+    mesh::guard_panel(app.settings().panel_port(), &host, &bridges)
+}
+
 /// Check every agent, collect its metrics, and keep routes, peers and certificates fresh.
 pub async fn health_loop(app: AppState) {
     let mut ticks: u64 = 0;
+    let mut panel_guard_error = String::new();
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
         ticks += 1;
         let own = host_info(&app).await;
         let _ = app.db.conn().execute("UPDATE nodes SET info = ?1, last_seen_at = ?2 WHERE id = 'local'", params![own.to_string(), util::now()]);
-        if ticks.is_multiple_of(6)
-            && mesh_enabled(&app)
-            && let Err(e) = mesh::guard()
-        {
-            tracing::error!("{e:#}");
+        // Docker restarts and firewall reloads drop iptables rules.
+        if ticks.is_multiple_of(6) {
+            // A server without a usable iptables would repeat the same error every minute.
+            let error = guard_panel(&app).await.err().map(|e| format!("{e:#}")).unwrap_or_default();
+            if !error.is_empty() && error != panel_guard_error {
+                tracing::error!("{error}");
+            }
+            panel_guard_error = error;
+            if mesh_enabled(&app)
+                && let Err(e) = mesh::guard()
+            {
+                tracing::error!("{e:#}");
+            }
         }
         for n in remote(&app) {
             let now = util::now();

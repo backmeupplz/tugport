@@ -6,7 +6,7 @@ set -eu
 if [ "$(id -u)" != 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     echo "The installer needs root; asking sudo."
-    exec sudo sh -c "curl -fsSL https://tugport.com/install | sh -s -- $*"
+    exec sudo sh -c "curl -fsSL --retry 5 https://tugport.com/install | sh -s -- $*"
   fi
   echo "Run the installer as root." >&2
   exit 1
@@ -22,8 +22,8 @@ base="https://github.com/backmeupplz/tugport/releases/latest/download"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 echo "Downloading Tugport for $arch."
-curl -fsSL "$base/tugport-linux-$arch" -o "$tmp/tugport-linux-$arch"
-curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
+curl -fsSL --retry 5 "$base/tugport-linux-$arch" -o "$tmp/tugport-linux-$arch"
+curl -fsSL --retry 5 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
 (cd "$tmp" && grep " tugport-linux-$arch\$" SHA256SUMS | sha256sum -c - >/dev/null) || {
   echo "The download does not match its checksum; nothing was installed." >&2
   exit 1

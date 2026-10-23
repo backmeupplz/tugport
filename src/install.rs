@@ -83,7 +83,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
         if !ask(args.yes, "Docker is not installed. Install it now with the official script from get.docker.com?") {
             bail!("Tugport needs Docker");
         }
-        run(Command::new("sh").args(["-c", "curl -fsSL https://get.docker.com | sh"]))?;
+        run(Command::new("sh").args(["-c", "curl -fsSL --retry 5 https://get.docker.com | sh"]))?;
         let _ = ok(Command::new("systemctl").args(["enable", "--now", "docker"]));
     }
     let mut missing = vec![];

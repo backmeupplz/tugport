@@ -146,7 +146,11 @@ pub async fn create_server(app: &AppState, account_id: &str, region: &str, size:
     )?;
     let created = async {
         let join = crate::nodes::join_token_for(app, panel_url, Some(&id)).await?;
-        let script = format!("#!/bin/sh\n{}\n", join.command);
+        // Boot-time downloads can meet a passing 5xx; a machine that never joins only costs money.
+        let script = format!(
+            "#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8 9 10; do curl -fsSL --retry 5 https://tugport.com/install -o /tmp/tugport-install && break; sleep 15; done\nsh /tmp/tugport-install --join {panel_url} --token {}\n",
+            join.token
+        );
         match &acc.creds {
             Credentials::Hetzner { token } => {
                 let body = json!({

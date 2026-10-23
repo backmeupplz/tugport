@@ -100,6 +100,15 @@ pub async fn run() -> Result<()> {
     let ctx: Shared = Arc::new(Ctx { app: app.clone(), config: tokio::sync::Mutex::new(config), secret: secret.clone(), started: std::time::Instant::now() });
 
     tokio::spawn(crate::metrics::sample_loop(app.clone(), false));
+    // Docker restarts and firewall reloads drop iptables rules; keep containers off the mesh.
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if let Err(e) = mesh::guard() {
+                tracing::error!("{e:#}");
+            }
+        }
+    });
     tokio::spawn(docker_proxy(mesh_ip.clone(), secret));
     {
         let app = app.clone();
@@ -307,9 +316,18 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
     let endpoint = crate::public_ip().map(|ip| format!("{ip}:{}", mesh::PORT));
     let hostname = std::fs::read_to_string("/etc/hostname").map(|h| h.trim().to_string()).unwrap_or_default();
     let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
+    // The token never leaves this server; see nodes::join_secret.
+    let req = crate::nodes::JoinRequest {
+        token_id: hex::encode(crate::nodes::join_secret(token, "id")?),
+        proof: hex::encode(crate::nodes::join_secret(token, &format!("proof:{public}"))?),
+        name: hostname,
+        wg_public_key: public,
+        endpoint,
+        info: json!({ "arch": std::env::consts::ARCH }),
+    };
     let resp = client
         .post(format!("{}/api/nodes/join", panel_url.trim_end_matches('/')))
-        .json(&json!({ "token": token, "name": hostname, "wg_public_key": public, "endpoint": endpoint, "info": { "arch": std::env::consts::ARCH } }))
+        .json(&req)
         .send()
         .await
         .with_context(|| format!("reaching the panel at {panel_url}"))?;
@@ -318,7 +336,11 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
     if !status.is_success() {
         bail!("the panel refused to add this server: {}", v["error"].as_str().unwrap_or(status.as_str()));
     }
-    let r: crate::nodes::JoinResponse = serde_json::from_value(v)?;
+    let envelope: crate::nodes::JoinEnvelope = serde_json::from_value(v)?;
+    let opened = crate::crypto::Keyring::new(&crate::nodes::join_secret(token, "response")?)
+        .open_str("join", &crate::crypto::unb64(&envelope.sealed)?)
+        .context("the panel's answer did not open with this token")?;
+    let r: crate::nodes::JoinResponse = serde_json::from_str(&opened)?;
     mesh::guard()?;
     mesh::up(&paths.etc.join("wg.key"), &r.mesh_ip)?;
     mesh::set_peers(&r.peers)?;

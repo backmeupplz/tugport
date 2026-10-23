@@ -94,6 +94,8 @@ pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>
 pub struct RemoveQuery {
     /// Keep the cloud machine running (Tugport created it, so by default it is deleted too).
     keep_machine: bool,
+    /// Remove it even though services keep data there (that data stays on the machine).
+    force: bool,
 }
 
 /// Remove a server. Movable services go to other servers first; a machine Tugport created
@@ -101,6 +103,14 @@ pub struct RemoveQuery {
 pub async fn remove(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Json<Value>> {
     a.require_owner()?;
     let name = app.node(&id).map(|n| n.name.clone()).ok_or_else(|| ApiError::not_found("server not found"))?;
+    let keeping: Vec<String> = crate::store::services(&app, None)?
+        .into_iter()
+        .filter(|s| app.db.get_state(&format!("pin:{}", s.id)).ok().flatten().as_deref() == Some(id.as_str()))
+        .map(|s| format!("{}/{}", s.project, s.name))
+        .collect();
+    if !keeping.is_empty() && !q.force {
+        return Err(ApiError::conflict(format!("{name} keeps the data of {}; move or delete them first (or remove with force)", keeping.join(", "))));
+    }
     let machine = crate::cloud::machine_of(&app, &id);
     // Finishes even if the caller goes away: a half-drained server would take no new work.
     let (app2, id2, m2) = (app.clone(), id.clone(), machine.clone());

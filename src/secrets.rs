@@ -38,8 +38,9 @@ pub fn materialize_files(app: &App, container: &str, files: &[(String, Zeroizing
     if files.is_empty() {
         return Ok(vec![]);
     }
-    let dir = app.paths.run.join("files").join(container);
+    let dir = app.paths.files().join(container);
     std::fs::create_dir_all(&dir)?;
+    crate::paths::restrict(&dir, 0o700)?;
     files
         .iter()
         .map(|(target, content)| {
@@ -52,7 +53,7 @@ pub fn materialize_files(app: &App, container: &str, files: &[(String, Zeroizing
 
 pub fn forget(app: &App, container: &str) {
     let _ = std::fs::remove_file(app.paths.secrets().join(format!("{container}.json")));
-    let _ = std::fs::remove_dir_all(app.paths.run.join("files").join(container));
+    let _ = std::fs::remove_dir_all(app.paths.files().join(container));
 }
 
 /// /run is wiped on reboot: write every managed container's files again before

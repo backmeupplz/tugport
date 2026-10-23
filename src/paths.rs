@@ -39,6 +39,10 @@ impl Paths {
     pub fn secrets(&self) -> PathBuf {
         self.run.join("secrets")
     }
+    /// Secret files mounted into containers, one directory per container.
+    pub fn files(&self) -> PathBuf {
+        self.run.join("files")
+    }
     /// Static copy of this binary that containers mount as their init.
     pub fn init_binary(&self) -> PathBuf {
         self.data.join("bin").join("tugport-init")
@@ -49,9 +53,12 @@ impl Paths {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::create_dir_all(self.secrets())?;
+        std::fs::create_dir_all(self.files())?;
         restrict(&self.etc, 0o700)?;
         restrict(&self.run, 0o711)?;
-        restrict(&self.secrets(), 0o711)?;
+        // Only root may walk to delivered secrets; containers reach theirs through bind mounts.
+        restrict(&self.secrets(), 0o700)?;
+        restrict(&self.files(), 0o700)?;
         Ok(())
     }
 }

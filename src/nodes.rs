@@ -270,12 +270,24 @@ pub async fn join_token(app: &App, panel_url: &str) -> Result<JoinToken> {
     join_token_for(app, panel_url, None).await
 }
 
+/// Keys a join derives from its one-time token. The token itself never crosses the
+/// network: a new server sends `id`, proves it holds the token with `proof` (bound to its
+/// WireGuard key), and the panel's answer is sealed with `response`. Plain HTTP is safe.
+pub fn join_secret(token: &str, label: &str) -> Result<[u8; 32]> {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(token.trim().as_bytes()).map_err(|e| anyhow!("{e}"))?;
+    mac.update(label.as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
 /// A one-hour join command; `cloud` ties it to a machine Tugport is creating.
 pub async fn join_token_for(app: &App, panel_url: &str, cloud: Option<&str>) -> Result<JoinToken> {
     ensure_mesh(app).await?;
     let token = util::token(40);
     let expires_at = util::now() + 3600;
-    app.db.set_state(&format!("jointoken:{}", util::sha256_hex(&token)), &json!({ "expires_at": expires_at, "cloud": cloud }).to_string())?;
+    let key = format!("jointoken:{}", hex::encode(join_secret(&token, "id")?));
+    let sealed = crate::crypto::b64(&app.keys.seal_str(&key, &token)?);
+    app.db.set_state(&key, &json!({ "expires_at": expires_at, "cloud": cloud, "token": sealed }).to_string())?;
     Ok(JoinToken {
         command: format!("curl -fsSL https://tugport.com/install | sh -s -- --join {panel_url} --token {token}"),
         token,
@@ -283,9 +295,12 @@ pub async fn join_token_for(app: &App, panel_url: &str, cloud: Option<&str>) -> 
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct JoinRequest {
-    pub token: String,
+    /// `join_secret(token, "id")`, hex: finds the token without revealing it.
+    pub token_id: String,
+    /// `join_secret(token, "proof:<wg_public_key>")`, hex.
+    pub proof: String,
     pub name: String,
     pub wg_public_key: String,
     /// `ip:port` other servers can reach this one on (None behind NAT).
@@ -304,37 +319,49 @@ pub struct JoinResponse {
     pub registry: String,
 }
 
-pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinResponse> {
-    let key = format!("jointoken:{}", util::sha256_hex(req.token.trim()));
-    let stored: Value = app.db.get_state(&key)?.and_then(|v| serde_json::from_str(&v).ok()).ok_or_else(|| anyhow!("this join command is not valid; make a new one in the panel"))?;
-    let expires = stored["expires_at"].as_i64().unwrap_or(0);
-    let cloud = stored["cloud"].as_str().map(String::from);
+pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinEnvelope> {
+    let invalid = || anyhow!("this join command is not valid; make a new one in the panel");
+    if req.token_id.len() != 64 || !req.token_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let key = format!("jointoken:{}", req.token_id);
+    let stored: Value = app.db.get_state(&key)?.and_then(|v| serde_json::from_str(&v).ok()).ok_or_else(invalid)?;
+    let token = app.keys.open_str(&key, &crate::crypto::unb64(stored["token"].as_str().unwrap_or_default())?).map_err(|_| invalid())?;
+    let proof = hex::encode(join_secret(&token, &format!("proof:{}", req.wg_public_key))?);
+    if !util::ct_eq(&proof, req.proof.trim()) {
+        return Err(invalid());
+    }
     app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&key])?;
-    if expires < util::now() {
+    if stored["expires_at"].as_i64().unwrap_or(0) < util::now() {
         bail!("this join command expired; make a new one in the panel");
     }
+    let cloud = stored["cloud"].as_str().map(String::from);
     if crate::crypto::unb64(&req.wg_public_key).map(|k| k.len()).unwrap_or(0) != 32 {
         bail!("invalid WireGuard key");
     }
-    let used: Vec<String> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT mesh_ip FROM nodes WHERE mesh_ip IS NOT NULL")?;
-        stmt.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
-    };
-    let index = (2..60000).find(|i| !used.contains(&mesh::mesh_ip(*i))).ok_or_else(|| anyhow!("the mesh is full"))?;
-    let mesh_ip = mesh::mesh_ip(index);
     let node_id = util::id();
     let secret = util::token(40);
-    let clean: String = req.name.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.').take(40).collect();
-    let mut name = if clean.is_empty() { format!("server-{index}") } else { clean };
-    let taken: bool = app.db.conn().query_row("SELECT COUNT(*) > 0 FROM nodes WHERE name = ?1", [&name], |r| r.get(0))?;
-    if taken {
-        name = format!("{name}-{index}");
-    }
-    app.db.conn().execute(
-        "INSERT INTO nodes (id, name, is_local, address, mesh_ip, wg_public_key, status, info, created_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'joining', ?6, ?7)",
-        params![node_id, name, req.endpoint, mesh_ip, req.wg_public_key, req.info.to_string(), util::now()],
-    )?;
+    // One lock for picking the address and taking it, so simultaneous joins never share one.
+    let (mesh_ip, name) = {
+        let conn = app.db.conn();
+        let used: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT mesh_ip FROM nodes WHERE mesh_ip IS NOT NULL")?;
+            stmt.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
+        };
+        let index = (2..60000).find(|i| !used.contains(&mesh::mesh_ip(*i))).ok_or_else(|| anyhow!("the mesh is full"))?;
+        let mesh_ip = mesh::mesh_ip(index);
+        let clean: String = req.name.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.').take(40).collect();
+        let mut name = if clean.is_empty() { format!("server-{index}") } else { clean };
+        let taken: bool = conn.query_row("SELECT COUNT(*) > 0 FROM nodes WHERE name = ?1", [&name], |r| r.get(0))?;
+        if taken {
+            name = format!("{name}-{index}");
+        }
+        conn.execute(
+            "INSERT INTO nodes (id, name, is_local, address, mesh_ip, wg_public_key, status, info, created_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'joining', ?6, ?7)",
+            params![node_id, name, req.endpoint, mesh_ip, req.wg_public_key, req.info.to_string(), util::now()],
+        )?;
+        (mesh_ip, name)
+    };
     let sealed = app.keys.seal_str(&format!("nodekey:{node_id}"), &secret)?;
     app.db.set_state(&format!("nodekey:{node_id}"), &crate::crypto::b64(&sealed))?;
     if let Some(machine) = &cloud {
@@ -355,7 +382,15 @@ pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinResponse> {
     push_peers(app);
     app.audit(None, "node.join", None, None, Some(&name), Some(&mesh_ip));
     app.emit("nodes", None, None, json!({ "joined": name }));
-    Ok(JoinResponse { node_id, mesh_ip, secret, peers, swarm_token, registry: format!("{}:{REGISTRY_PORT}", mesh::PANEL_IP) })
+    let response = JoinResponse { node_id, mesh_ip, secret, peers, swarm_token, registry: format!("{}:{REGISTRY_PORT}", mesh::PANEL_IP) };
+    let sealed = crate::crypto::Keyring::new(&join_secret(&token, "response")?).seal_str("join", &serde_json::to_string(&response)?)?;
+    Ok(JoinEnvelope { sealed: crate::crypto::b64(&sealed) })
+}
+
+/// The join answer, readable only by whoever holds the token.
+#[derive(Serialize, Deserialize)]
+pub struct JoinEnvelope {
+    pub sealed: String,
 }
 
 /// Call a node agent over the mesh.
@@ -853,7 +888,23 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
 
 #[cfg(test)]
 mod tests {
+    use super::join_secret;
     use crate::model::Placement;
+
+    #[test]
+    fn joins_never_reveal_the_token() {
+        let token = "secret-token";
+        let id = hex::encode(join_secret(token, "id").unwrap());
+        assert!(!id.contains(token) && id.len() == 64);
+        // A proof only fits the WireGuard key it was made for.
+        let proof = join_secret(token, "proof:KEY-A").unwrap();
+        assert_ne!(proof, join_secret(token, "proof:KEY-B").unwrap());
+        assert_ne!(proof, join_secret("other-token", "proof:KEY-A").unwrap());
+        // Only the token holder opens the panel's answer.
+        let sealed = crate::crypto::Keyring::new(&join_secret(token, "response").unwrap()).seal_str("join", "{}").unwrap();
+        assert!(crate::crypto::Keyring::new(&join_secret(token, "response").unwrap()).open_str("join", &sealed).is_ok());
+        assert!(crate::crypto::Keyring::new(&join_secret("other-token", "response").unwrap()).open_str("join", &sealed).is_err());
+    }
 
     #[test]
     fn placement_rules_match() {

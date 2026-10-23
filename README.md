@@ -3,11 +3,11 @@
 </p>
 
 <h3 align="center">Tugport</h3>
-<p align="center">Deploy your apps and watch your server from one small Rust binary.</p>
+<p align="center">Deploy your apps to servers you own, from one small Rust binary.</p>
 
 ---
 
-Tugport is a self-hosted deploy platform in the spirit of Coolify and Easypanel, built as a single Rust binary that runs next to Docker. It is in early development: everything below is built and tested on development servers, and the first release is not out yet.
+Tugport is a self-hosted deploy platform in the spirit of Coolify and Easypanel, built as a single Rust binary that runs next to Docker. Install it on a Linux server with `curl -fsSL https://tugport.com/install | sh`. It is young (0.1.x): everything below is built, and the installer, certificates, the GitHub App, cloud servers and Cloudflare Tunnel have been tested on real servers, so expect rough edges rather than missing pieces.
 
 ## What it does
 

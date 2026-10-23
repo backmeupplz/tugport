@@ -6,7 +6,7 @@ Even on a single server, the panel drives Docker through the same node interface
 
 ## Milestone 1: one server, complete
 
-**Status:** built and tested on development servers. On AWS (2026-10-23), the one-line installer set up a fresh Ubuntu 24.04 server and Let's Encrypt issued a real certificate. The GitHub App flow and the Cloudflare Tunnel still need a run on a real server.
+**Status:** built and tested on development servers. On AWS (2026-10-23), the one-line installer set up a fresh Ubuntu 24.04 server and Let's Encrypt issued a real certificate. On Hetzner, the GitHub App flow built and deployed a push and posted the commit status. Cloudflare Tunnel served sites through Cloudflare and removed its tunnel and DNS records again on disconnect.
 
 ### Install and migrate
 - **One command:** `curl -fsSL https://tugport.com/install | sh`.
@@ -162,7 +162,7 @@ Even on a single server, the panel drives Docker through the same node interface
 
 ## Milestone 3: cloud and data
 
-**Status:** built. Scale to zero, replica autoscaling and database replicas (all five engines, with promote) are tested with two development servers. On AWS (2026-10-23), a panel created an EC2 machine that joined over the mesh within minutes, served a two-replica app over HTTPS from both servers, and was terminated again when removed. Server pools and Hetzner are tested against the real APIs without creating machines.
+**Status:** built. Scale to zero, replica autoscaling and database replicas (all five engines, with promote) are tested with two development servers. On AWS (2026-10-23), a panel created an EC2 machine that joined over the mesh within minutes, served a two-replica app over HTTPS from both servers, and was terminated again when removed. A Hetzner server pool grew by a real machine that joined in about three minutes, and shrank again.
 - **Cloud servers:** connect an AWS or Hetzner account to create servers in any region. They join the mesh automatically.
 - **Autoscaling:** add and remove replicas by CPU or request rate, then add and remove whole servers.
 - **Scale to zero:** idle services stop and start again on the first request.

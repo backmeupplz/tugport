@@ -129,7 +129,7 @@ Every field has a default. See `src/model.rs`.
 | POST | `/api/services/{id}/promote` | On a replica, `admin`: makes it a primary. Returns `{variable, message}`. |
 | POST | `/api/services/{id}/deploy-key` | `{public_key}`: an SSH key to add to the repository. |
 
-`status` looks like `{state, running, desired, live_deploy, replicas: [{id, name, deploy, replica, state, health, ip, image, created, node}]}`. `node` is the id of the server the container runs on (`local` is the panel's own). `state` is one of:
+`status` looks like `{state, running, desired, live_deploy, replicas: [{id, name, deploy, replica, state, health, ip, image, created, node, node_name}]}`. `node` is the id of the server the container runs on (`local` is the panel's own) and `node_name` its name. `state` is one of:
 - `running`
 - `degraded`
 - `unhealthy`
@@ -241,9 +241,9 @@ The settings fields are:
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/metrics/now?node=<id>` | A server's current snapshot (the panel's own by default), see below. |
+| GET | `/api/metrics/now?node=<id>` | A server's current snapshot (the panel's own by default), see below. Callers without a role on all projects only get `{at, services}` for their own services. |
 | GET | `/api/metrics?scope=host\|service:<id>\|gpu:<n>&names=cpu,memory&range=1h\|6h\|24h\|7d\|30d&node=<id>` | `{step, series: {name: [[ts, value]]}}`. `node` picks the server for host and GPU scopes; service scopes add up every server. |
-| GET | `/api/docker/usage` | `{images, build_cache, volumes, containers}` (bytes) |
+| GET | `/api/docker/usage?node=<id>` | `{images, build_cache, volumes, containers}` (bytes) on a server |
 
 `GET /api/metrics/now` returns `{cpu, cores: [..], load: [1,5,15], memory: {used, total}, swap: {used, total}, disks: [{mount, used, total}], net: {rx, tx}, gpus: [{name, util, mem_used, mem_total, temp, power}], services: [{id, cpu, memory, net_rx, net_tx, restarts}]}`.
 
@@ -313,8 +313,10 @@ Servers join over an encrypted WireGuard mesh (10.99.0.0/16, UDP 51820). Contain
 |---|---|---|
 | GET | `/api/nodes` | `{mesh, nodes: [{id, name, local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at}]}`. Needs the owner or a role on all projects. |
 | POST | `/api/nodes/join-token` | Owner. `{panel_url?}` returns `{token, command, expires_at}`: a one-hour command to run as root on the new server. The first call turns on the mesh. |
-| PATCH | `/api/nodes/{id}` | Owner. `{name?, region?, labels?}` |
-| DELETE | `/api/nodes/{id}?keep_machine=true` | Owner. Moves the server's services elsewhere, removes it from the mesh and, if Tugport created it in a cloud account, deletes the machine unless `keep_machine`. Returns `{ok, machine_deleted}`. |
+| PATCH | `/api/nodes/{id}` | Owner. `{name?, region?, labels?}`; `region: null` or `""` clears it. |
+| DELETE | `/api/nodes/{id}?keep_machine=true&force=true` | Owner. Moves the server's services elsewhere, removes it from the mesh and, if Tugport created it in a cloud account, deletes the machine unless `keep_machine`. Refused (409) while services keep their data there, unless `force`. Returns `{ok, machine_deleted}`. |
+
+Joining never sends the one-time token: the new server sends an id derived from it and an HMAC that binds the token to its WireGuard key, and the panel's answer (the node key and swarm token) is sealed with a key derived from the token. A join over plain HTTP leaks nothing usable.
 
 `status` is `online`, `unreachable` (a health check failed; already out of routing and placement), `offline` (30 seconds without answers), or `joining`. `info` has `{version, docker, cpus, memory_total, arch, nvidia, dri, swarm_node, boot_id, uptime_s}`.
 
@@ -340,7 +342,7 @@ AWS machines use the default VPC and a `tugport` security group that opens UDP 5
 
 ## Database replicas
 
-A replica is a database service of its own, `<db>-replica-N`, placed like any service (another server or region). It follows its primary over the project network and refuses writes.
+A replica is a database service of its own, `<db>-replica-N`, placed like any service (another server or region; without a placement it goes to a different server than its primary). It follows its primary over the project network and refuses writes.
 
 | Engine | How |
 |---|---|

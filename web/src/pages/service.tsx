@@ -1,11 +1,12 @@
 import type { ComponentChildren } from "preact";
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { route } from "preact-router";
-import { FINAL, atLeast, del, get, hasGrant, post, put, useApi, useMe, type Deploy, type Replica, type ServiceDetail } from "../api";
+import { FINAL, atLeast, del, get, hasGrant, nodeName, post, put, useApi, useEvent, useMe, useNodes, type Deploy, type Node, type Replica, type ServiceDetail } from "../api";
 import { EnvEditor } from "../env-editor";
-import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, toast, useSubmit } from "../ui";
+import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, errText, toast, useSubmit } from "../ui";
 import { fmt } from "../charts";
-import { ago, bytes, clock, duration } from "../util";
+import { ago, bytes, clock, duration, qs, sumUsage, varName } from "../util";
+import { ReadReplicas, ReplicaOf } from "./database";
 import { Domains } from "./domains";
 import { DeployKey } from "./new-service";
 import { Console, Logs, ServiceMetrics, type Now } from "./observe";
@@ -17,6 +18,7 @@ const TABS: [string, string][] = [
   ["deploys", "Deploys"],
   ["logs", "Logs"],
   ["metrics", "Metrics"],
+  ["replicas", "Read replicas"],
   ["domains", "Domains"],
   ["env", "Environment"],
   ["files", "Files"],
@@ -30,7 +32,12 @@ export interface Ctx {
   d: ServiceDetail;
   reload: () => Promise<void>;
   openLog: (deployId: string) => void;
+  /** The servers, when the signed-in user may list them. */
+  nodes: { mesh: boolean; nodes: Node[] } | null;
 }
+
+/** Which server runs a replica matters once there is more than one. */
+const multiServer = (c: Ctx) => (c.nodes?.nodes.length ?? 0) > 1 || c.d.status.replicas.some((r) => r.node !== "local");
 
 /** Starts a deploy and opens its live log. */
 export async function deploy(c: Ctx) {
@@ -55,8 +62,10 @@ export function RedeployNote(props: { c: Ctx; children: ComponentChildren }) {
 export function ServicePage(props: { project?: string; service?: string; tab?: string; path?: string }) {
   const me = useMe();
   const sid = useRef("");
-  const r = useApi<ServiceDetail>(`/services/${props.project}.${props.service}`, (e) => e.service_id === sid.current && LIVE.has(e.kind));
+  // Replicas on a server that drops out vanish from the status without a container event.
+  const r = useApi<ServiceDetail>(`/services/${props.project}.${props.service}`, (e) => (e.service_id === sid.current && LIVE.has(e.kind)) || e.kind === "nodes");
   sid.current = r.data?.service.id ?? "";
+  const nodes = useNodes();
   const [logId, setLogId] = useState<string | null>(null);
   const d = r.data;
   if (!d) {
@@ -67,9 +76,12 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
     );
   }
   const s = d.service;
-  const tab = TABS.some(([id]) => id === props.tab) ? (props.tab as string) : "overview";
+  // Read replicas belong to primary databases; a replica follows one instead.
+  const tabs = TABS.filter(([id]) => id !== "replicas" || (s.kind === "database" && !s.spec.database?.primary));
+  const tab = tabs.some(([id]) => id === props.tab) ? (props.tab as string) : "overview";
   const base = `/projects/${s.project}/${s.name}`;
-  const c: Ctx = { d, reload: r.reload, openLog: setLogId };
+  const c: Ctx = { d, reload: r.reload, openLog: setLogId, nodes };
+  const label = (x: Replica) => (x.compose_service ?? x.name) + (multiServer(c) ? ` on ${nodeName(nodes, x.node)}` : "");
   const site = d.domains[0];
   return (
     <Page
@@ -104,16 +116,17 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
         )
       }
     >
-      <Tabs label="Service sections" current={tab} items={TABS.map(([id, label]) => [id, label, id === "overview" ? base : `${base}/${id}`])} />
+      <Tabs label="Service sections" current={tab} items={tabs.map(([id, label]) => [id, label, id === "overview" ? base : `${base}/${id}`])} />
       {tab === "overview" && <Overview c={c} />}
       {tab === "deploys" && <Deploys c={c} />}
-      {tab === "logs" && <Logs service={s} replicas={d.status.replicas} />}
+      {tab === "replicas" && <ReadReplicas c={c} />}
+      {tab === "logs" && <Logs service={s} replicas={d.status.replicas} label={label} />}
       {tab === "metrics" && <ServiceMetrics service={s} />}
       {tab === "domains" && <Domains c={c} />}
       {tab === "env" && <Env c={c} />}
       {tab === "files" && <Files c={c} />}
       {tab === "settings" && <ServiceSettings c={c} />}
-      {tab === "console" && <Console service={s} replicas={d.status.replicas} canUse={atLeast(d.role, "operator") && hasGrant(me, "secrets:read")} />}
+      {tab === "console" && <Console service={s} replicas={d.status.replicas} label={label} canUse={atLeast(d.role, "operator") && hasGrant(me, "secrets:read")} />}
       {tab === "danger" && <Danger c={c} />}
       <DeployLog id={logId} onClose={() => setLogId(null)} />
     </Page>
@@ -127,7 +140,8 @@ function Overview({ c }: { c: Ctx }) {
   const canDeploy = atLeast(d.role, "deployer");
   const id = s.id;
   const src = s.spec.source;
-  const envName = `${s.name.toUpperCase().replace(/-/g, "_")}_URL`;
+  const envName = varName(s.name, "URL");
+  const primaryId = s.spec.database?.primary;
   return (
     <div class="grid gap-6 lg:grid-cols-3">
       <div class="min-w-0 space-y-6 lg:col-span-2">
@@ -174,9 +188,9 @@ function Overview({ c }: { c: Ctx }) {
           {st.replicas.length === 0 ? (
             <p class="text-muted">There are no containers yet, so deploy the service to start it.</p>
           ) : (
-            <Replicas list={st.replicas} live={st.live_deploy} />
+            <Replicas c={c} />
           )}
-          {st.running > 0 && <Usage id={id} />}
+          {st.running > 0 && <Usage id={id} nodes={st.replicas.filter((x) => x.state === "running").map((x) => x.node)} />}
           <p class="mt-4 text-xs text-muted">
             Other services in this project reach it by the host name <code>{s.name}</code>
             {s.kind === "database" && (
@@ -190,6 +204,7 @@ function Overview({ c }: { c: Ctx }) {
         <LastDeploy c={c} />
       </div>
       <div class="min-w-0 space-y-6">
+        {primaryId && <ReplicaOf c={c} primaryId={primaryId} />}
         <Card title="Source">
           <p class="break-all font-mono text-[13px]">{sourceLabel(src, s.kind)}</p>
           {src.type === "git" && (
@@ -219,35 +234,58 @@ function Overview({ c }: { c: Ctx }) {
   );
 }
 
-/** Current CPU and memory from the server's latest metrics sample. */
-function Usage(props: { id: string }) {
-  const r = useApi<Now>("/metrics/now", (e) => e.kind === "metrics");
-  const u = r.data?.services?.find((x) => x.id === props.id);
+/**
+ * Current CPU and memory, added up over the servers its replicas run on. The panel's own sample
+ * always joins in, because it counts the crashes on every server.
+ */
+function Usage(props: { id: string; nodes: string[] }) {
+  const servers = [...new Set(props.nodes)];
+  const key = [...new Set(["local", ...servers])].sort().join(",");
+  const [u, setU] = useState<ReturnType<typeof sumUsage>>(null);
+  const load = useCallback(async () => {
+    const samples = await Promise.all(key.split(",").map((n) => get<Now>(`/metrics/now${qs({ node: n === "local" ? null : n })}`).catch(() => null)));
+    setU(sumUsage(samples, props.id));
+  }, [key, props.id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  // Only the owner gets "metrics" events; everyone else sees the numbers from when the page opened.
+  useEvent((e) => (e.kind === "metrics" || e.kind === "resync") && load());
   if (!u) return null;
   // Docker reports 0 B where the memory controller is unavailable; leave it out rather than mislead.
   const memory = u.memory > 0 ? ` and ${bytes(u.memory)} of memory` : "";
+  const across = servers.length > 1 ? ` across ${servers.length} servers` : "";
   const restarts = u.restarts ? `, after ${u.restarts} ${u.restarts === 1 ? "restart" : "restarts"}` : "";
   return (
     <p class="mt-3 text-dim">
       Using {fmt.pct(u.cpu)} of a core{memory}
+      {across}
       {restarts}.
     </p>
   );
 }
 
-function Replicas(props: { list: Replica[]; live: string | null }) {
+function Replicas({ c }: { c: Ctx }) {
+  const st = c.d.status;
+  const multi = multiServer(c);
   return (
     <ul class="divide-y divide-line rounded-md border border-line">
-      {props.list.map((r) => (
+      {st.replicas.map((r) => (
         <li key={r.id} class="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2">
           <span class="min-w-0 flex-1 truncate font-mono text-[13px]" title={r.name}>
             {r.compose_service ?? r.name}
           </span>
+          {multi &&
+            (c.nodes ? (
+              <a class="chip hover:text-text" href={`/servers/${r.node}`} title="The server this replica runs on">
+                on {nodeName(c.nodes, r.node)}
+              </a>
+            ) : (
+              <span class="chip">on {nodeName(null, r.node)}</span>
+            ))}
           <Pill state={r.health && r.state === "running" ? r.health : r.state} />
-          {props.live && r.deploy !== props.live && <span class="chip">previous deploy</span>}
-          <span class="w-full truncate text-xs text-muted sm:w-auto">
-            {[r.ip, r.image, r.created ? `started ${ago(r.created)}` : "", r.node !== "local" ? r.node : ""].filter(Boolean).join(" · ")}
-          </span>
+          {st.live_deploy && r.deploy !== st.live_deploy && <span class="chip">previous deploy</span>}
+          <span class="w-full truncate text-xs text-muted">{[r.ip, r.image, r.created ? `started ${ago(r.created)}` : ""].filter(Boolean).join(" · ")}</span>
         </li>
       ))}
     </ul>
@@ -317,24 +355,33 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
 }
 
 function Webhook({ c }: { c: Ctx }) {
-  const [url, setUrl] = useState("");
+  const me = useMe();
   const canOperate = atLeast(c.d.role, "operator");
+  // The URL deploys the service, so reading it back needs secrets:read; rotating shows a new one to any operator.
+  const canRead = canOperate && hasGrant(me, "secrets:read");
+  const hook = useApi<{ url: string }>(canRead ? `/services/${c.d.service.id}/hook` : null);
+  const url = hook.data?.url;
   return (
     <Card title="Deploy webhook">
-      <p class="text-dim">CI can deploy this service with a POST or GET to its webhook URL. The URL is shown only when it is created, so rotate it whenever you need it again.</p>
+      <p class="text-dim">CI can deploy this service with a POST or GET to its webhook URL. Anyone who has the URL can deploy, so keep it secret.</p>
       {url && (
         <div class="mt-3 space-y-2">
           <CodeBlock label="Webhook URL" text={url} />
           <CodeBlock label="From CI" text={`curl -fsS -X POST "${url}"`} />
         </div>
       )}
+      {hook.error && (hook.error.status === 404 ? <Note class="mt-3">{errText(hook.error)}</Note> : <div class="mt-3"><ErrorBox error={hook.error} /></div>)}
+      {canOperate && !canRead && !url && (
+        <p class="mt-3 text-xs text-muted">Seeing the current URL needs the secrets:read grant. Rotating it shows you a new URL once.</p>
+      )}
       {canOperate && (
         <div class="mt-3">
           <Action
             confirm="Rotate the webhook URL? The current URL stops working right away."
-            run={async () => setUrl((await post<{ url: string }>(`/services/${c.d.service.id}/hook`)).url)}
+            run={async () => hook.set(await post<{ url: string }>(`/services/${c.d.service.id}/hook`))}
+            done="The webhook has a new URL."
           >
-            {url ? "Rotate again" : "Rotate URL"}
+            Rotate URL
           </Action>
         </div>
       )}
@@ -613,7 +660,11 @@ function Danger({ c }: { c: Ctx }) {
   const s = c.d.service;
   const [name, setName] = useState("");
   const [volumes, setVolumes] = useState(false);
-  const allowed = atLeast(c.d.role, "admin") && hasGrant(me, "destroy");
+  // A primary database with read replicas can go only after they are promoted or deleted.
+  const replicas = useApi<{ replicas: { name: string }[] }>(s.kind === "database" && !s.spec.database?.primary ? `/services/${s.id}/replicas` : null);
+  const followers = replicas.data?.replicas.map((x) => x.name) ?? [];
+  const canDestroy = atLeast(c.d.role, "admin") && hasGrant(me, "destroy");
+  const allowed = canDestroy && followers.length === 0;
   const sub = useSubmit(async () => {
     await del(`/services/${s.id}${volumes ? "?volumes=true" : ""}`);
     toast(`Deleted ${s.name}.`);
@@ -625,7 +676,12 @@ function Danger({ c }: { c: Ctx }) {
         <p class="text-dim">
           Deleting stops and removes every container of {s.name}, together with its domains, environment, files and deploy history. This cannot be undone.
         </p>
-        {!allowed && <Note tone="warn">Deleting needs the admin role on this project and the destroy grant.</Note>}
+        {followers.length > 0 && (
+          <Note tone="warn">
+            {followers.join(", ")} {followers.length === 1 ? "follows" : "follow"} {s.name}, so {s.name} can be deleted only after each read replica is promoted or deleted.
+          </Note>
+        )}
+        {!canDestroy && <Note tone="warn">Deleting needs the admin role on this project and the destroy grant.</Note>}
         <Check
           checked={volumes}
           onChange={setVolumes}

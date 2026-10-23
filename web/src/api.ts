@@ -34,8 +34,7 @@ export async function api<T = any>(method: string, path: string, body?: unknown)
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    // Axum's body rejections (400/415/422) arrive as plain text rather than {"error": ...}.
-    data = { error: text.trim() };
+    // Every API answer is JSON; anything else (a proxy's error page) gets its status line below.
   }
   if (!res.ok) {
     const message = typeof data?.error === "string" && data.error ? data.error : `${res.status} ${res.statusText}`;
@@ -95,6 +94,8 @@ export interface Project {
   name: string;
   description: string | null;
   services: number;
+  /** How many of its services are in each state, like {running: 2, stopped: 1}. */
+  states?: Record<string, number>;
   role: Role | null;
   created_at: number;
 }
@@ -167,6 +168,8 @@ export interface ServiceDetail {
   env: string[];
   files: string[];
   last_deploy: Deploy | null;
+  /** Ports the image declares with EXPOSE, as of its last deploy. */
+  exposed_ports?: number[];
   role: Role | null;
 }
 export interface User {
@@ -195,6 +198,39 @@ export interface Key {
   revoked_at: number | null;
 }
 export type Snippets = Record<"env" | "cli" | "claude_code" | "codex" | "curl", string>;
+export interface Node {
+  id: string;
+  name: string;
+  local: boolean;
+  mesh_ip: string | null;
+  region: string | null;
+  labels: Record<string, string>;
+  status: "online" | "unreachable" | "offline" | "joining";
+  last_seen_at: number | null;
+  created_at: number;
+  info: {
+    version?: string;
+    docker?: string | null;
+    cpus?: number;
+    memory_total?: number;
+    arch?: string;
+    nvidia?: boolean;
+    dri?: boolean;
+  };
+}
+
+/** Listing servers needs the owner or a role on all projects. */
+export const canSeeServers = (me: Me) => me.principal.is_owner || !!me.principal.all_projects_role;
+
+/** Every server, for people allowed to list them; null for everyone else. */
+export function useNodes() {
+  const r = useApi<{ mesh: boolean; nodes: Node[] }>(canSeeServers(useMe()) ? "/nodes" : null, (e) => e.kind === "nodes");
+  return r.data ?? null;
+}
+
+/** A server's name for display. Without the server list only the panel's own server is known. */
+export const nodeName = (nodes: { nodes: Node[] } | null, id: string) =>
+  nodes?.nodes.find((n) => n.id === id)?.name ?? (id === "local" ? "the panel's server" : "another server");
 
 export const FINAL = new Set(["live", "failed", "cancelled", "superseded"]);
 
@@ -207,16 +243,22 @@ export interface Event {
   data: any;
   at: number;
 }
-const KINDS = ["deploy", "deploy.log", "service.status", "service.updated", "audit", "certificate", "settings", "metrics", "warning"];
+const KINDS = ["deploy", "deploy.log", "service.status", "service.updated", "audit", "certificate", "settings", "metrics", "warning", "nodes"];
 const listeners = new Set<(e: Event) => void>();
 let source: EventSource | null = null;
 let wanted = false;
+/** The stream was open before, so a later open (a reconnect, a tab shown again) may have missed events. */
+let wasOpen = false;
 
 export function startEvents() {
   wanted = true;
   if (source) return;
   const s = new EventSource("/api/events");
   source = s;
+  s.onopen = () => {
+    if (wasOpen) listeners.forEach((f) => f({ kind: "resync", data: {}, at: Date.now() }));
+    wasOpen = true;
+  };
   const fire = (m: MessageEvent) => {
     let e: Event;
     try {
@@ -237,6 +279,7 @@ export function startEvents() {
 
 export function stopEvents() {
   wanted = false;
+  wasOpen = false;
   source?.close();
   source = null;
 }
@@ -250,8 +293,6 @@ document.addEventListener("visibilitychange", () => {
     source = null;
   } else if (!source) {
     startEvents();
-    const resync: Event = { kind: "resync", data: {}, at: Date.now() };
-    listeners.forEach((f) => f(resync));
   }
 });
 
@@ -268,10 +309,11 @@ export function useEvent(fn: (e: Event) => void) {
 }
 
 /**
- * GET `path` (null = skip). With `live`, matching events refetch the data, and a slow poll
- * covers status changes the event stream does not announce (like a crashing container).
+ * GET `path` (null = skip). With `live`, matching events refetch the data. With `poll` (ms), it
+ * also refetches after that long without a refetch, for data the stream does not bring to
+ * everyone: "metrics" and "nodes" events reach only the owner.
  */
-export function useApi<T = any>(path: string | null, live?: (e: Event) => boolean) {
+export function useApi<T = any>(path: string | null, live?: (e: Event) => boolean, poll?: number) {
   const [state, setState] = useState<{ path?: string | null; data?: T; error?: ApiError }>({});
   const latest = useRef(path);
   latest.current = path;
@@ -297,15 +339,14 @@ export function useApi<T = any>(path: string | null, live?: (e: Event) => boolea
     clearTimeout(timer.current);
     timer.current = setTimeout(reload, 300);
   });
-  const isLive = !!live;
+  useEffect(() => () => clearTimeout(timer.current), []);
+  // Every refetch re-arms the timer, so events that keep the data fresh leave nothing to poll.
+  // A hidden tab lets it lapse and catches up through the "resync" event.
   useEffect(() => {
-    if (!isLive) return;
-    const t = setInterval(() => document.visibilityState === "visible" && reload(), 15000);
-    return () => {
-      clearInterval(t);
-      clearTimeout(timer.current);
-    };
-  }, [reload, isLive]);
+    if (!poll || !path) return;
+    const t = setTimeout(() => document.visibilityState === "visible" && reload(), poll);
+    return () => clearTimeout(t);
+  }, [state, poll, reload]);
 
   const mine = state.path === path;
   return {

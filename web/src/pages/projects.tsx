@@ -44,9 +44,17 @@ export function sourceLabel(src: Source, kind?: string): string {
   }
 }
 
+/** Problems first, so they stand out on the project cards; unknown states go last. */
+const STATE_ORDER = ["crashing", "unhealthy", "degraded", "stopped", "asleep", "not deployed", "running"];
+const rank = (s: string) => (STATE_ORDER.includes(s) ? STATE_ORDER.indexOf(s) : STATE_ORDER.length);
+const byState = ([a]: [string, number], [b]: [string, number]) => rank(a) - rank(b);
+
 export function Projects(_: { path?: string }) {
   const me = useMe();
-  const r = useApi<{ projects: Project[] }>("/projects", (e) => e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? ""));
+  const r = useApi<{ projects: Project[] }>(
+    "/projects",
+    (e) => e.kind === "service.status" || (e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? "")),
+  );
   const [open, setOpen] = useState(false);
   const canCreate = me.principal.is_owner || atLeast(me.principal.all_projects_role, "operator");
   return (
@@ -77,9 +85,16 @@ export function Projects(_: { path?: string }) {
                     {p.role && <span class="chip">{p.role}</span>}
                   </div>
                   <p class="mt-1 line-clamp-2 min-h-10 text-dim">{p.description || "This project has no description yet."}</p>
-                  <p class="mt-3 text-xs text-muted">
-                    {p.services} {p.services === 1 ? "service" : "services"}
-                  </p>
+                  <div class="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-muted">
+                    <span class="mr-1">
+                      {p.services} {p.services === 1 ? "service" : "services"}
+                    </span>
+                    {Object.entries(p.states ?? {})
+                      .sort(byState)
+                      .map(([state, n]) => (
+                        <Pill key={state} state={state} label={`${n} ${state}`} />
+                      ))}
+                  </div>
                 </a>
               ))}
             </div>
@@ -125,7 +140,8 @@ function NewProject(props: { open: boolean; onClose: () => void }) {
 export function ProjectPage(props: { project?: string; path?: string }) {
   const me = useMe();
   const pid = useRef("");
-  const r = useApi<ProjectDetail>(`/projects/${props.project ?? ""}`, (e) => e.project_id === pid.current && LIVE.has(e.kind));
+  // Replicas on a server that drops out vanish from the status without a container event.
+  const r = useApi<ProjectDetail>(`/projects/${props.project ?? ""}`, (e) => (e.project_id === pid.current && LIVE.has(e.kind)) || e.kind === "nodes");
   pid.current = r.data?.project.id ?? "";
   const [wizard, setWizard] = useState(false);
   const d = r.data;

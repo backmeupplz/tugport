@@ -1,8 +1,8 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { atLeast, patch, useApi, type Spec } from "../api";
+import { atLeast, patch, useApi, type Node, type Spec } from "../api";
 import { Card, Check, ErrorBox, Field, Note, Select, toast, useSubmit } from "../ui";
-import { joinArgs, lines, mergePatch, num, splitArgs } from "../util";
+import { joinArgs, labelsText, lines, matchServers, mergePatch, num, parseLabels, pinReasons, splitArgs } from "../util";
 import { BUILDS, PROVIDER_KINDS } from "./new-service";
 import { RedeployNote, type Ctx } from "./service";
 
@@ -35,6 +35,9 @@ function toForm(spec: Spec) {
     workdir: spec.working_dir ?? "",
     user: spec.user ?? "",
     replicas: str(spec.replicas),
+    node: spec.placement?.node ?? "",
+    region: spec.placement?.region ?? "",
+    labels: labelsText(spec.placement?.labels),
     cpus: str(spec.resources?.cpus),
     memory: str(spec.resources?.memory_mb),
     reservation: str(spec.resources?.memory_reservation_mb),
@@ -91,6 +94,8 @@ function toSpec(spec: Spec, f: Form, kind: string): Spec {
   next.working_dir = f.workdir.trim() || null;
   next.user = f.user.trim() || null;
   next.replicas = num(f.replicas) ?? 1;
+  // Labels that do not parse keep their saved value; the form says what is wrong with them.
+  next.placement = { node: f.node.trim() || null, region: f.region.trim() || null, labels: parseLabels(f.labels) ?? spec.placement?.labels ?? {} };
   next.resources = { cpus: num(f.cpus), memory_mb: num(f.memory), memory_reservation_mb: num(f.reservation) };
   next.health = {
     kind: f.hKind,
@@ -158,9 +163,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
   const set = (p: Partial<Form>) => setF((x) => ({ ...x, ...p }));
   const text = (k: keyof Form) => ({ value: f[k] as string, onInput: (e: { currentTarget: { value: string } }) => set({ [k]: e.currentTarget.value }) });
   const providers = useApi<{ providers: { id: string; kind: string; name: string }[] }>(f.srcType === "git" ? "/git/providers" : null);
-  const changes = mergePatch(s.spec, toSpec(s.spec, f, s.kind));
+  const next = toSpec(s.spec, f, s.kind);
+  const changes = mergePatch(s.spec, next);
   const dirty = Object.keys(changes).length > 0;
+  const labelsOk = parseLabels(f.labels) !== null;
   const sub = useSubmit(async () => {
+    if (!labelsOk) throw new Error("Write each placement label as key=value, separated by commas or new lines.");
     await patch(`/services/${s.id}`, { spec: changes });
     toast("Settings saved.");
     onSaved();
@@ -296,11 +304,16 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             <Field label="User">
               <input class="input font-mono" spellcheck={false} placeholder="1000:1000" {...text("user")} />
             </Field>
-            <Field label="Replicas" hint={isDb ? "Databases run one primary." : "Each replica gets traffic once it is healthy."}>
-              <input class="input" type="number" min={0} max={100} disabled={isDb} {...text("replicas")} />
-            </Field>
           </div>
         </Section>
+
+        {isCompose ? (
+          <Section title="Placement">
+            <p class="text-dim">Compose stacks run on the panel's server, so placement rules and the replica count do not apply to them.</p>
+          </Section>
+        ) : (
+          <Placement c={c} f={f} set={set} next={next} moved={"placement" in changes} />
+        )}
 
         <Section title="Resources">
           <div class="grid gap-4 sm:grid-cols-3">
@@ -553,6 +566,91 @@ function Section(props: { title: string; children: ComponentChildren }) {
     <Card title={props.title}>
       <div class="space-y-4">{props.children}</div>
     </Card>
+  );
+}
+
+const and = (l: string[]) => new Intl.ListFormat("en", { type: "conjunction" }).format(l);
+
+type Rules = { node: string; region: string; labels: string };
+
+/** Server, region and label rules, and the servers they match right now. `children` come first in the grid. */
+export function PlacementFields(props: { nodes: Node[] | undefined; rules: Rules; set: (p: Partial<Rules>) => void; children?: ComponentChildren }) {
+  const { nodes, rules: f, set } = props;
+  const labels = parseLabels(f.labels);
+  const matches = nodes && labels ? matchServers(nodes, { node: f.node.trim() || null, region: f.region.trim() || null, labels }) : null;
+  // A placement may name a server by id or by name; keep whichever the spec uses.
+  const options: [string, string][] = (nodes ?? []).map((n) => [
+    f.node === n.name ? n.name : n.id,
+    n.local ? `${n.name} (runs the panel)` : n.status === "online" ? n.name : `${n.name} (${n.status})`,
+  ]);
+  if (f.node && !options.some(([v]) => v === f.node)) options.push([f.node, `${f.node} (not a server of this panel)`]);
+  const regions = [...new Set((nodes ?? []).map((n) => n.region).filter((r): r is string => !!r))];
+  return (
+    <>
+      <div class="grid gap-4 sm:grid-cols-2">
+        {props.children}
+        <Field label="Server" hint={nodes ? "Pin it to one server, or let Tugport choose among the matching ones." : "Write a server's name to pin it there, or leave this empty."}>
+          {nodes ? (
+            <Select value={f.node} onChange={(node) => set({ node })} options={[["", "Any server that matches"], ...options]} />
+          ) : (
+            <input class="input font-mono" spellcheck={false} placeholder="Any server" value={f.node} onInput={(e) => set({ node: e.currentTarget.value })} />
+          )}
+        </Field>
+        <Field label="Region" hint="Leave this empty to allow every region.">
+          <input class="input font-mono" spellcheck={false} list="tp-regions" placeholder="Any region" value={f.region} onInput={(e) => set({ region: e.currentTarget.value })} />
+          <datalist id="tp-regions">
+            {regions.map((r) => (
+              <option key={r} value={r} />
+            ))}
+          </datalist>
+        </Field>
+        <Field label="Labels" hint="Write key=value pairs, separated by commas or new lines. Only servers with every one of these labels qualify.">
+          <textarea class="input h-16" spellcheck={false} placeholder="disk=ssd" value={f.labels} onInput={(e) => set({ labels: e.currentTarget.value })} />
+        </Field>
+      </div>
+      {!labels && <p class="text-sm text-bad">Write each label as key=value, separated by commas or new lines.</p>}
+      {matches &&
+        (matches.length ? (
+          <p class="text-dim">Servers that match right now: {and(matches.map((n) => n.name))}.</p>
+        ) : (
+          <Note tone="bad">No online server matches these rules right now, so a deploy would fail.</Note>
+        ))}
+    </>
+  );
+}
+
+/** The replica count and the rules that pick servers for the replicas. */
+function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; next: Spec; moved: boolean }) {
+  const { f, set } = props;
+  const kind = props.c.d.service.kind;
+  const reasons = pinReasons(kind, props.next);
+  return (
+    <Section title="Placement and replicas">
+      <PlacementFields nodes={props.c.nodes?.nodes} rules={f} set={set}>
+        <Field
+          label="Replicas"
+          hint={
+            kind === "database"
+              ? "Databases run one primary, and read replicas have a tab of their own."
+              : reasons.length
+                ? "Every replica runs on the same server."
+                : "Replicas spread over the matching servers, and each one gets traffic once it is healthy."
+          }
+        >
+          <input class="input" type="number" min={0} max={100} disabled={kind === "database"} value={f.replicas} onInput={(e) => set({ replicas: e.currentTarget.value })} />
+        </Field>
+      </PlacementFields>
+      {reasons.length > 0 && props.moved && (
+        <Note tone="warn">
+          Its data stays on the server it runs on now. If that server stops matching these rules, the next deploy starts the service on another server with empty volumes.
+        </Note>
+      )}
+      <p class="text-xs text-muted">
+        {reasons.length > 0 && `This service stays on one server because ${and(reasons)}. `}
+        Databases and services with volumes, bind mounts, published ports, host networking or the Docker socket stay on one server, because their data or ports live there.
+        Other services spread their replicas over every online server that matches.
+      </p>
+    </Section>
   );
 }
 

@@ -1,10 +1,9 @@
 import type { ComponentChildren } from "preact";
-import { useEffect, useState } from "preact/hooks";
-import { del, get, isPlanned, patch, post, put, useApi, useMe, type Project } from "../api";
+import { useState } from "preact/hooks";
+import { del, isPlanned, patch, post, put, useApi, useMe } from "../api";
 import { Action, Card, Check, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Planned, Select, Tabs, toast, useSubmit } from "../ui";
 import { ago, bytes, cidr, mergePatch, num, sentence, when, words } from "../util";
 import { PROVIDER_KINDS } from "./new-service";
-import type { ProjectDetail } from "./projects";
 
 const TABS: [string, string][] = [
   ["general", "General"],
@@ -610,7 +609,10 @@ function Backups() {
   const services = useServices();
   if (isPlanned(targets.error) || isPlanned(jobs.error)) return <Planned />;
   const targetName = (id: string) => targets.data?.targets.find((t) => t.id === id)?.name ?? id;
-  const serviceName = (id: string | null) => (id && services?.find(([sid]) => sid === id)?.[1]) || "a deleted service";
+  const serviceName = (id: string | null) => {
+    const s = services?.find((x) => x.id === id);
+    return s ? `${s.project}.${s.name}` : "a deleted service";
+  };
   const what = (j: Job) =>
     j.kind === "state" ? "Tugport's own state" : j.kind === "database" ? `Database dump of ${serviceName(j.service_id)}` : `Volume ${j.volume ?? ""} of ${serviceName(j.service_id)}`;
   return (
@@ -758,22 +760,14 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
   );
 }
 
-/** Every service as [id, "project.service"], or null while loading. */
+type ServiceRef = { id: string; name: string; project: string; kind: string };
+/** Every service the user can see, or null while loading. */
 function useServices() {
-  const projects = useApi<{ projects: Project[] }>("/projects");
-  const [services, setServices] = useState<[string, string][] | null>(null);
-  // ponytail: one request per project; a flat GET /api/services would replace this.
-  useEffect(() => {
-    if (!projects.data) return;
-    Promise.all(projects.data.projects.map((p) => get<ProjectDetail>(`/projects/${p.id}`)))
-      .then((all) => setServices(all.flatMap((d) => d.services.map((x): [string, string] => [x.id, `${d.project.name}.${x.name}`]))))
-      .catch(() => setServices([]));
-  }, [projects.data]);
-  return services;
+  const r = useApi<{ services: ServiceRef[] }>("/services");
+  return r.data?.services ?? (r.error ? [] : null);
 }
 
-function JobForm(props: { targets: Target[]; services: [string, string][] | null; onClose: () => void; onSaved: () => void }) {
-  const services = props.services;
+function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onClose: () => void; onSaved: () => void }) {
   const [f, setF] = useState({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
   const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
   const s = useSubmit(async () => {
@@ -794,7 +788,7 @@ function JobForm(props: { targets: Target[]; services: [string, string][] | null
         <Field label="What to back up">
           <Select
             value={f.kind}
-            onChange={(kind) => upd({kind })}
+            onChange={(kind) => upd({ kind, service: "" })}
             options={[
               ["database", "A database (consistent dump)"],
               ["volume", "A volume"],
@@ -804,7 +798,16 @@ function JobForm(props: { targets: Target[]; services: [string, string][] | null
         </Field>
         {f.kind !== "state" && (
           <Field label="Service">
-            <Select value={f.service} onChange={(service) => upd({service })} options={[["", services ? "Choose…" : "Loading…"], ...(services ?? [])]} />
+            <Select
+              value={f.service}
+              onChange={(service) => upd({ service })}
+              options={[
+                ["", props.services ? "Choose…" : "Loading…"],
+                ...(props.services ?? [])
+                  .filter((x) => f.kind !== "database" || x.kind === "database")
+                  .map((x): [string, string] => [x.id, `${x.project}.${x.name}`]),
+              ]}
+            />
           </Field>
         )}
         {f.kind === "volume" && (

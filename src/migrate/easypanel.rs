@@ -150,6 +150,7 @@ pub fn map(entries: Vec<(String, Value)>, ctx: &Ctx) -> Plan {
             cutover: if svc["enabled"].as_bool() == Some(false) { Cutover::Idle } else { Cutover::Parallel },
             overlays: vec![],
             notes: vec![],
+            git_secret: None,
         };
         if !known.contains(p) {
             n.cutover = Cutover::Unsupported;

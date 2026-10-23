@@ -149,9 +149,16 @@ pub async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
         .json()
         .await?;
     let inst_id = inst["id"].as_i64().ok_or_else(|| anyhow!("no installation id"))?;
+    let (token, exp) = installation_access(p, &jwt, inst_id).await?;
+    crate::util::lock(&TOKENS).get_or_insert_with(HashMap::new).insert(cache_key, (token.clone(), exp));
+    Ok(token)
+}
+
+/// A token for one installation of the GitHub App, and when it expires.
+async fn installation_access(p: &Provider, jwt: &str, inst_id: i64) -> Result<(String, i64)> {
     let tok: Value = http()?
-        .post(format!("{api}/app/installations/{inst_id}/access_tokens"))
-        .bearer_auth(&jwt)
+        .post(format!("{}/app/installations/{inst_id}/access_tokens", p.api()))
+        .bearer_auth(jwt)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?
@@ -160,8 +167,7 @@ pub async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
         .await?;
     let token = tok["token"].as_str().ok_or_else(|| anyhow!("no installation token"))?.to_string();
     let exp = chrono::DateTime::parse_from_rfc3339(tok["expires_at"].as_str().unwrap_or("")).map(|d| d.timestamp()).unwrap_or(util::now() + 3000);
-    crate::util::lock(&TOKENS).get_or_insert_with(HashMap::new).insert(cache_key, (token.clone(), exp));
-    Ok(token)
+    Ok((token, exp))
 }
 
 /// HTTP Basic credentials for cloning, passed per command so they never land in .git/config.
@@ -482,9 +488,8 @@ pub async fn repos(p: &Provider) -> Result<Vec<String>> {
             let installs: Vec<Value> = client.get(format!("{}/app/installations", p.api())).bearer_auth(&jwt).send().await?.error_for_status()?.json().await?;
             let mut out = vec![];
             for i in installs {
-                let Some(account) = i["account"]["login"].as_str() else { continue };
-                let token = installation_token(p, &format!("{account}/x")).await;
-                let Ok(token) = token else { continue };
+                let Some(inst_id) = i["id"].as_i64() else { continue };
+                let Ok((token, _)) = installation_access(p, &jwt, inst_id).await else { continue };
                 let v: Value = client
                     .get(format!("{}/installation/repositories?per_page=100", p.api()))
                     .bearer_auth(token)

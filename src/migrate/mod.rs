@@ -139,6 +139,8 @@ pub struct NewService {
     pub overlays: Vec<(String, Vec<String>)>,
     /// What does not carry over exactly.
     pub notes: Vec<String>,
+    /// A token that was inside the old Git URL: (provider base URL, token), stored encrypted.
+    pub git_secret: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +183,44 @@ pub enum Old {
     Labeled { label: String },
     /// One container by name.
     Container { name: String },
+}
+
+/// Old panels keep Git tokens inside repository URLs (`https://user:token@host/o/r.git`).
+/// Tugport keeps them as encrypted providers instead, so no token sits in a service's
+/// settings or in a printed plan: the URL loses its credentials and points at a provider.
+pub fn lift_git_credentials(plan: &mut Plan) {
+    for s in &mut plan.services {
+        let Source::Git { provider, repo, .. } = &mut s.spec.source else { continue };
+        let Some((base, path, secret)) = credentialed_git(repo) else { continue };
+        if provider.is_none() {
+            *repo = path;
+            *provider = Some(format!("$git:{base}"));
+            s.git_secret = Some((base, secret));
+        } else {
+            *repo = redact_userinfo(repo);
+        }
+    }
+}
+
+/// `https://user:secret@host/owner/name.git` -> (`https://host`, `owner/name`, secret).
+fn credentialed_git(url: &str) -> Option<(String, String, String)> {
+    let u = reqwest::Url::parse(url).ok()?;
+    let secret = u.password().filter(|p| !p.is_empty()).map(String::from).or_else(|| (!u.username().is_empty()).then(|| u.username().to_string()))?;
+    let host = u.host_str()?;
+    let base = format!("{}://{host}{}", u.scheme(), u.port().map(|p| format!(":{p}")).unwrap_or_default());
+    let path = u.path().trim_matches('/').trim_end_matches(".git").to_string();
+    Some((base, path, secret))
+}
+
+fn redact_userinfo(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) if !u.username().is_empty() || u.password().is_some() => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string()
+        }
+        _ => url.to_string(),
+    }
 }
 
 /// Placeholder provider id in planned specs; import swaps in the GitHub provider it creates.
@@ -254,6 +294,9 @@ struct Journal {
     services: Vec<Moved>,
     certs: Vec<String>,
     provider: Option<String>,
+    /// Providers made from tokens found in Git URLs, by base URL.
+    #[serde(default)]
+    git_providers: BTreeMap<String, String>,
     registries: Vec<String>,
     settings_before: Option<Settings>,
     imported_at: i64,
@@ -322,10 +365,11 @@ fn open() -> Result<AppState> {
 
 async fn migrate(panel: &'static str, dry_run: bool, yes: bool) -> Result<()> {
     let docker = Docker::connect_with_local_defaults().context("connecting to Docker")?;
-    let plan = match panel {
+    let mut plan = match panel {
         "easypanel" => easypanel::plan(&docker).await?,
         _ => coolify::plan(&docker).await?,
     };
+    lift_git_credentials(&mut plan);
     print_plan(&plan);
     if dry_run {
         return Ok(());
@@ -421,6 +465,13 @@ fn print_plan(plan: &Plan) {
     if hooks > 0 {
         println!("Deploy webhooks: {hooks} old URLs keep working{}", plan.legacy_listen.as_ref().map(|l| format!(" (Tugport answers on {l} after the switch)")).unwrap_or_default());
     }
+    let mut tokens: BTreeMap<&str, usize> = BTreeMap::new();
+    for (base, _) in plan.services.iter().filter_map(|s| s.git_secret.as_ref()) {
+        *tokens.entry(base).or_default() += 1;
+    }
+    for (base, n) in tokens {
+        println!("Git: {n} repositories on {base} had a token in their URL; it becomes one encrypted Git provider");
+    }
     let count = |f: &dyn Fn(&&&NewService) -> bool| moved.iter().filter(f).count();
     println!(
         "Cutover: databases move first ({}), then apps start next to their old copies ({}), then services that must not run twice move ({}). \
@@ -455,6 +506,17 @@ async fn import(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
     if let (Some(token), None) = (&plan.github_token, &j.provider) {
         let config = serde_json::json!({ "token": token, "webhook_secret": util::token(40) });
         j.provider = Some(git::save_provider(app, None, git::Kind::GithubToken, &format!("GitHub (from {})", plan.panel), "https://github.com", &config)?);
+        save(app, j)?;
+    }
+    for (base, secret) in plan.services.iter().filter_map(|s| s.git_secret.as_ref()) {
+        if j.git_providers.contains_key(base) {
+            continue;
+        }
+        let kind = if base == "https://github.com" { git::Kind::GithubToken } else { git::Kind::Forgejo };
+        let config = serde_json::json!({ "token": secret, "webhook_secret": util::token(40) });
+        let name = format!("{} (from {})", base.trim_start_matches("https://").trim_start_matches("http://"), plan.panel);
+        let id = git::save_provider(app, None, kind, &name, base, &config)?;
+        j.git_providers.insert(base.clone(), id);
         save(app, j)?;
     }
     for (host, user, password) in &plan.registries {
@@ -511,10 +573,12 @@ fn import_service(app: &App, s: &NewService, provider: Option<&str>, j: &mut Jou
     }
     let project = store::project(app, &s.project)?.ok_or_else(|| anyhow!("project {} is missing", s.project))?;
     let mut spec = s.spec.clone();
-    if let Source::Git { provider: p, .. } = &mut spec.source
-        && p.as_deref() == Some(GITHUB)
-    {
-        *p = provider.map(String::from);
+    if let Source::Git { provider: p, .. } = &mut spec.source {
+        if p.as_deref() == Some(GITHUB) {
+            *p = provider.map(String::from);
+        } else if let Some(base) = p.as_deref().and_then(|v| v.strip_prefix("$git:")) {
+            *p = Some(j.git_providers.get(base).cloned().ok_or_else(|| anyhow!("no provider was made for {base}"))?);
+        }
     }
     let id = util::id();
     let now = util::now();
@@ -1000,7 +1064,7 @@ async fn rollback(app: &AppState, yes: bool) -> Result<()> {
     for host in &j.certs {
         app.db.conn().execute("DELETE FROM certificates WHERE host = ?1 AND source = 'imported'", [host])?;
     }
-    if let Some(p) = &j.provider {
+    for p in j.provider.iter().chain(j.git_providers.values()) {
         app.db.conn().execute("DELETE FROM git_providers WHERE id = ?1", [p])?;
     }
     for host in &j.registries {
@@ -1020,6 +1084,22 @@ async fn rollback(app: &AppState, yes: bool) -> Result<()> {
     }
     println!("Rolled back. The old panel runs again{}.", if restart_systemd { "; Tugport is back to waiting for ports 80/443" } else { "" });
     Ok(())
+}
+
+#[cfg(test)]
+mod git_url_tests {
+    use super::*;
+
+    #[test]
+    fn tokens_leave_git_urls() {
+        assert_eq!(
+            credentialed_git("https://easypanel:abc123token@git.example.com/owner/repo.git"),
+            Some(("https://git.example.com".into(), "owner/repo".into(), "abc123token".into()))
+        );
+        assert_eq!(credentialed_git("https://ghp_x@github.com/o/r").map(|c| c.2), Some("ghp_x".into()));
+        assert_eq!(credentialed_git("https://github.com/o/r.git"), None);
+        assert_eq!(redact_userinfo("https://u:p@h.example/o/r"), "https://h.example/o/r");
+    }
 }
 
 #[cfg(test)]

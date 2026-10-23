@@ -518,6 +518,7 @@ fn base(project: &str, name: &str, uuid: &str) -> NewService {
         cutover: Cutover::Parallel,
         overlays: vec![],
         notes: vec![],
+        git_secret: None,
     }
 }
 

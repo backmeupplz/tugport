@@ -38,7 +38,6 @@ pub async fn clean(app: &App) -> Result<String> {
             Err(e) => tracing::warn!("docker cleanup on {node}: {e:#}"),
         }
     }
-    crate::nodes::reset_registry(app).await;
     // Builds only run here.
     let cap = format!("{}gb", app.settings().docker_cleanup.build_cache_gb);
     let mut cmd = tokio::process::Command::new("docker");

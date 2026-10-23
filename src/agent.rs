@@ -6,7 +6,7 @@ use crate::app::{App, AppState};
 use crate::mesh::{self, Peer};
 use crate::nodes::{AGENT_PORT, DOCKER_PORT};
 use crate::{logs, paths, proxy, secrets, util};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -366,8 +366,6 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
     mesh::guard()?;
     mesh::up(&paths.etc.join("wg.key"), &r.mesh_ip)?;
     mesh::set_peers(&r.peers)?;
-    // Built images come from the panel's registry over the mesh.
-    allow_registry(&r.registry)?;
     let state = std::process::Command::new("docker").args(["info", "--format", "{{.Swarm.LocalNodeState}}"]).output()?;
     if String::from_utf8_lossy(&state.stdout).trim() != "active" {
         // The first packets may wait for the WireGuard handshake.
@@ -390,29 +388,6 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
     let config = AgentConfig { node_id: r.node_id, panel_url: panel_url.to_string(), mesh_ip: r.mesh_ip, secret: r.secret, peers: r.peers };
     save_config(&paths, &config)?;
     Ok(config)
-}
-
-/// Trust the panel's registry: plain HTTP, but only reachable inside the encrypted mesh.
-fn allow_registry(registry: &str) -> Result<()> {
-    let path = std::path::Path::new("/etc/docker/daemon.json");
-    let mut cfg: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| json!({}));
-    let mut list = cfg["insecure-registries"].as_array().cloned().unwrap_or_default();
-    if list.iter().any(|v| v.as_str() == Some(registry)) {
-        return Ok(());
-    }
-    list.push(Value::String(registry.to_string()));
-    cfg["insecure-registries"] = Value::Array(list);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(&cfg)?)?;
-    // dockerd re-reads insecure-registries on SIGHUP; running containers are untouched.
-    let pid = std::fs::read_to_string("/var/run/docker.pid").ok().and_then(|p| p.trim().parse::<i32>().ok()).ok_or_else(|| anyhow!("dockerd is not running"))?;
-    // SAFETY: kill(2) with a valid signal has no memory-safety preconditions.
-    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
-        bail!("could not ask Docker to reload its settings");
-    }
-    Ok(())
 }
 
 #[cfg(test)]

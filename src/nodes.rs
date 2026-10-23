@@ -18,7 +18,6 @@ use std::time::Duration;
 
 pub const AGENT_PORT: u16 = 7948;
 pub const DOCKER_PORT: u16 = 7947;
-pub const REGISTRY_PORT: u16 = 5000;
 /// A server unreachable this long has its movable services started elsewhere.
 const RESCHEDULE_AFTER_S: i64 = 120;
 
@@ -27,6 +26,9 @@ pub struct NodeHandle {
     pub name: String,
     pub mesh_ip: Option<String>,
     pub local: bool,
+    /// May terminate public traffic, so it gets TLS keys, auth config and the full route table.
+    /// The panel is always ingress.
+    pub ingress: bool,
     pub docker: bollard::Docker,
     secret: Option<String>,
     pub region: Option<String>,
@@ -113,13 +115,13 @@ pub fn load(app: &App) -> Result<()> {
         "INSERT OR IGNORE INTO nodes (id, name, is_local, status, created_at) VALUES ('local', ?1, 1, 'online', ?2)",
         params![hostname(), util::now()],
     )?;
-    let rows: Vec<(String, String, bool, Option<String>, Option<String>, String)> = {
+    let rows: Vec<(String, String, bool, Option<String>, Option<String>, String, bool)> = {
         let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT id, name, is_local, mesh_ip, region, labels FROM nodes")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<rusqlite::Result<_>>()?
+        let mut stmt = conn.prepare("SELECT id, name, is_local, mesh_ip, region, labels, ingress FROM nodes")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?
     };
     let mut map = HashMap::new();
-    for (id, name, local, mesh_ip, region, labels) in rows {
+    for (id, name, local, mesh_ip, region, labels, ingress) in rows {
         let (docker, secret) = if local {
             (app.docker.clone(), None)
         } else {
@@ -136,7 +138,7 @@ pub fn load(app: &App) -> Result<()> {
             }
         };
         let labels = serde_json::from_str(&labels).unwrap_or_default();
-        map.insert(id.clone(), Arc::new(NodeHandle { id, name, mesh_ip, local, docker, secret, region, labels }));
+        map.insert(id.clone(), Arc::new(NodeHandle { id, name, mesh_ip, local, ingress: local || ingress, docker, secret, region, labels }));
     }
     *util::write(&app.nodes.0) = map;
     Ok(())
@@ -182,7 +184,9 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
             .await
             .context("starting swarm mode for overlay networks")?;
     }
-    ensure_registry().await?;
+    // Earlier versions ran a shared image registry on the mesh; images now travel panel -> node
+    // directly, so remove any leftover container and its cache.
+    let _ = sh("docker rm -f tugport-registry; docker volume rm tugport-registry").await;
     let first = !mesh_enabled(app);
     let sealed = app.keys.seal_str("mesh", &serde_json::to_string(&state)?)?;
     app.db.set_state("mesh", &crate::crypto::b64(&sealed))?;
@@ -197,63 +201,14 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// After a reboot: the mesh interface and its peers come back before anything uses them,
-/// then the registry, which Docker may have restarted without its ports.
+/// After a reboot: the mesh interface and its peers come back before anything uses them.
 pub async fn restore_mesh(app: &App) -> Result<()> {
     if !mesh_enabled(app) {
         return Ok(());
     }
     mesh::guard()?;
     mesh::up(&app.paths.etc.join("wg.key"), mesh::PANEL_IP)?;
-    set_peers(app)?;
-    ensure_registry().await
-}
-
-/// The registry itself answers on localhost (not just anything that holds the port).
-async fn registry_answers() -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(1)).no_proxy().build() else {
-        return false;
-    };
-    client.get(format!("http://127.0.0.1:{REGISTRY_PORT}/v2/")).send().await.is_ok_and(|r| r.headers().contains_key("docker-distribution-api-version"))
-}
-
-/// A private registry on the mesh so servers pull only the image layers they lack.
-async fn ensure_registry() -> Result<()> {
-    // A running container is not enough: after a Docker restart it can run with no published
-    // ports (both are published together, so localhost tells). One that just started gets a
-    // few seconds to answer before it is replaced.
-    if sh("docker inspect -f '{{.State.Running}}' tugport-registry").await.map(|s| s.trim() == "true").unwrap_or(false) {
-        for _ in 0..5 {
-            if registry_answers().await {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        tracing::warn!("the image registry runs but does not answer on port {REGISTRY_PORT}; starting it again");
-    }
-    let _ = sh("docker rm -f tugport-registry").await;
-    sh(&format!(
-        "docker run -d --name tugport-registry --restart unless-stopped --label tugport.system=registry \
-         -e REGISTRY_STORAGE_DELETE_ENABLED=true \
-         -p {ip}:{port}:5000 -p 127.0.0.1:{port}:5000 -v tugport-registry:/var/lib/registry registry:2",
-        ip = mesh::PANEL_IP,
-        port = REGISTRY_PORT
-    ))
-    .await
-    .context("starting the image registry")?;
-    Ok(())
-}
-
-/// The registry only carries images between servers; start it over empty now and then.
-// ponytail: wipes the whole transfer cache; delete unused tags instead if re-sending layers gets slow.
-pub async fn reset_registry(app: &App) {
-    if !mesh_enabled(app) || !app.deployer.idle() {
-        return;
-    }
-    let _ = sh("docker rm -f tugport-registry && docker volume rm tugport-registry").await;
-    if let Err(e) = ensure_registry().await {
-        tracing::warn!("restarting the image registry: {e:#}");
-    }
+    set_peers(app)
 }
 
 /// `tugport mesh-up` on the panel's server (false when the mesh is off). Docker runs it before
@@ -354,7 +309,6 @@ pub struct JoinResponse {
     pub secret: String,
     pub peers: Vec<Peer>,
     pub swarm_token: String,
-    pub registry: String,
 }
 
 /// Addresses only reachable inside one network (private, shared, link-local, loopback).
@@ -441,7 +395,7 @@ pub async fn join(app: &AppState, req: JoinRequest, panel_ip: Option<std::net::I
     push_peers(app);
     app.audit(None, "node.join", None, None, Some(&name), Some(&mesh_ip));
     app.emit("nodes", None, None, json!({ "joined": name }));
-    let response = JoinResponse { node_id, mesh_ip, secret, peers, swarm_token, registry: format!("{}:{REGISTRY_PORT}", mesh::PANEL_IP) };
+    let response = JoinResponse { node_id, mesh_ip, secret, peers, swarm_token };
     let sealed = crate::crypto::Keyring::new(&join_secret(&token, "response")?).seal_str("join", &serde_json::to_string(&response)?)?;
     Ok(JoinEnvelope { sealed: crate::crypto::b64(&sealed) })
 }
@@ -515,11 +469,19 @@ fn remote(app: &App) -> Vec<Arc<NodeHandle>> {
     app.all_nodes().into_iter().filter(|n| !n.local).collect()
 }
 
+/// The table a server gets: the full one for ingress servers, a reduced one (its own routes,
+/// without other projects' secrets or other servers' addresses) for the rest.
+fn table_for(table: &crate::proxy::Table, n: &NodeHandle) -> Value {
+    let reduced;
+    let t = if n.ingress { table } else { reduced = crate::proxy::reduce_for_worker(table, &n.id); &reduced };
+    serde_json::to_value(t).unwrap_or_default()
+}
+
 /// Send the routing table to every server and wait until they have it.
 pub async fn push_routes_now(app: &App) {
-    let body = serde_json::to_value(&*app.proxy.table()).unwrap_or_default();
+    let table = app.proxy.table();
     let pushes = remote(app).into_iter().map(|n| {
-        let body = body.clone();
+        let body = table_for(&table, &n);
         async move {
             if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/routes", Some(body)).await {
                 tracing::debug!("pushing routes to {}: {e:#}", n.name);
@@ -532,7 +494,7 @@ pub async fn push_routes_now(app: &App) {
 pub fn push_routes(app: &App) {
     let table = app.proxy.table();
     for n in remote(app) {
-        let body = serde_json::to_value(&*table).unwrap_or_default();
+        let body = table_for(&table, &n);
         tokio::spawn(async move {
             if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/routes", Some(body)).await {
                 tracing::debug!("pushing routes to {}: {e:#}", n.name);
@@ -553,7 +515,8 @@ pub fn push_peers(app: &AppState) {
     }
 }
 
-/// Certificates go to every server so whichever one DNS points at can serve HTTPS.
+/// Certificates go to the servers that may terminate public traffic (ingress). A plain worker
+/// only ever serves requests already forwarded from an ingress server, so it needs none.
 pub async fn push_certs(app: &App) {
     let rows: Vec<(String, String, Vec<u8>)> = {
         let conn = app.db.conn();
@@ -571,7 +534,7 @@ pub async fn push_certs(app: &App) {
             Some(json!({ "host": host, "cert": cert, "key": key.as_str() }))
         })
         .collect();
-    for n in remote(app) {
+    for n in remote(app).into_iter().filter(|n| n.ingress) {
         if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/certs", Some(Value::Array(certs.clone()))).await {
             tracing::debug!("pushing certificates to {}: {e:#}", n.name);
         }
@@ -764,12 +727,18 @@ pub async fn health_loop(app: AppState) {
                     let old_boot = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["boot_id"].as_str().map(String::from));
                     // A reboot empties the server's /run, and with it every container's secrets.
                     let rebooted = old_boot.is_some_and(|b| Some(b.as_str()) != h["boot_id"].as_str());
-                    if let Ok(mut t) = serde_json::from_value::<HashMap<String, crate::proxy::Traffic>>(h["traffic"].clone()) {
-                        // Any server's proxy serves any domain, so only the ids and times are checked.
+                    // Only ingress servers terminate public traffic, so only their counts are
+                    // trusted; a worker's reported traffic (it should report none) is ignored, so
+                    // it cannot drive autoscaling or keep a sleeping service awake.
+                    if n.ingress
+                        && let Ok(mut t) = serde_json::from_value::<HashMap<String, crate::proxy::Traffic>>(h["traffic"].clone())
+                    {
                         let known: std::collections::HashSet<String> = store::services(&app, None).map(|l| l.into_iter().map(|s| s.id).collect()).unwrap_or_default();
                         t.retain(|sid, _| known.contains(sid));
                         t.values_mut().for_each(|x| x.last_at = x.last_at.min(now));
                         util::lock(&app.proxy.remote_traffic).insert(n.id.clone(), t);
+                    } else {
+                        util::lock(&app.proxy.remote_traffic).remove(&n.id);
                     }
                     let mut h = h;
                     if let Some(o) = h.as_object_mut() {
@@ -1045,35 +1014,48 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
         return runtime::pull_on(app, &node.docker, image, log).await;
     }
     log(&format!("Sending the image to {}", node.name));
-    let local = format!("localhost:{REGISTRY_PORT}/{image}");
-    let mut tag = tokio::process::Command::new("docker");
-    tag.args(["tag", image, &local]);
-    crate::proc::output(tag).await?;
-    let mut push = tokio::process::Command::new("docker");
-    push.args(["push", "--quiet", &local]);
-    let pushed = crate::proc::output(push).await;
-    // Every server's host can write to the registry, so pull exactly what was pushed: by digest.
-    let digest = app.docker.inspect_image(&local).await.ok().and_then(|i| i.repo_digests).unwrap_or_default().into_iter().find_map(|d| {
-        let (repo, digest) = d.split_once('@')?;
-        (repo == runtime::split_image(&local).0).then(|| digest.to_string())
+    // Built images travel panel -> node as a streamed save/load over the mesh Docker channel,
+    // which the panel's IP and the agent key already gate. There is no shared registry for a
+    // compromised server to enumerate or pull other projects' images from. The tar carries the
+    // repo:tag, so the node ends up with the same image name, ready to run.
+    use futures_util::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+    let (panel, image_name) = (app.docker.clone(), image.to_string());
+    let feeder = tokio::spawn(async move {
+        let mut export = panel.export_image(&image_name);
+        while let Some(chunk) = export.next().await {
+            // An error (or a dropped receiver) stops the feed; the half-written tar then makes
+            // `load` on the node fail, rather than loading a truncated image.
+            match chunk {
+                Ok(b) => {
+                    if tx.send(b).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(e) => return Err(anyhow::Error::from(e)),
+            }
+        }
+        Ok(())
     });
-    let mut untag = tokio::process::Command::new("docker");
-    untag.args(["rmi", &local]);
-    let _ = crate::proc::output(untag).await;
-    pushed.context("sending the image to the mesh registry")?;
-    let digest = digest.ok_or_else(|| anyhow!("the registry did not report the image's digest"))?;
-    let remote = format!("{}:{REGISTRY_PORT}/{}@{digest}", mesh::PANEL_IP, runtime::split_image(image).0);
-    let pulled = runtime::pull_on(app, &node.docker, &remote, log).await;
-    // Every server can read the registry: the image stays listed only while it is shipped.
-    let manifest = format!("http://127.0.0.1:{REGISTRY_PORT}/v2/{}/manifests/{digest}", runtime::split_image(image).0);
-    let _ = reqwest::Client::new().delete(manifest).timeout(Duration::from_secs(10)).send().await;
-    pulled?;
-    let (repo, tag) = runtime::split_image(image);
-    node.docker
-        .tag_image(&remote, Some(bollard::query_parameters::TagImageOptions { repo: Some(repo.into()), tag: Some(tag.into()) }))
-        .await
-        .with_context(|| format!("tagging the image on {}", node.name))?;
-    let _ = node.docker.remove_image(&remote, None::<bollard::query_parameters::RemoveImageOptions>, None).await;
+    let body = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let mut load = node.docker.import_image_stream(bollard::query_parameters::ImportImageOptions::default(), body, None);
+    let mut load_err = None;
+    while let Some(item) = load.next().await {
+        if let Err(e) = item {
+            load_err = Some(anyhow::Error::from(e));
+        }
+    }
+    match feeder.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e.context(format!("reading {image} to send to {}", node.name))),
+        Err(e) => return Err(anyhow::Error::from(e).context("the image transfer task failed")),
+    }
+    if let Some(e) = load_err {
+        return Err(e.context(format!("loading {image} on {}", node.name)));
+    }
+    if node.docker.inspect_image(image).await.is_err() {
+        bail!("{} did not load {image}", node.name);
+    }
     Ok(())
 }
 

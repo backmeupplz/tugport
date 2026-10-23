@@ -19,17 +19,18 @@ pub async fn list(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>
     require_servers(&a)?;
     let mesh = nodes::mesh_enabled(&app);
     let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT id, name, is_local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at FROM nodes ORDER BY is_local DESC, name")?;
+    let mut stmt = conn.prepare("SELECT id, name, is_local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at, ingress FROM nodes ORDER BY is_local DESC, name")?;
     let rows: Vec<Value> = stmt
         .query_map([], |r| {
             let labels: String = r.get(6)?;
             let info: String = r.get(8)?;
+            let local: bool = r.get(2)?;
             Ok(json!({
-                "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "local": r.get::<_, bool>(2)?,
+                "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "local": local,
                 "address": r.get::<_, Option<String>>(3)?, "mesh_ip": r.get::<_, Option<String>>(4)?, "region": r.get::<_, Option<String>>(5)?,
                 "labels": serde_json::from_str::<Value>(&labels).unwrap_or_default(), "status": r.get::<_, String>(7)?,
                 "info": serde_json::from_str::<Value>(&info).unwrap_or_default(), "last_seen_at": r.get::<_, Option<i64>>(9)?,
-                "created_at": r.get::<_, i64>(10)?,
+                "created_at": r.get::<_, i64>(10)?, "ingress": local || r.get::<_, bool>(11)?,
             }))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -70,6 +71,9 @@ pub struct UpdateBody {
     #[serde(default, deserialize_with = "super::present")]
     region: Option<Option<String>>,
     labels: Option<BTreeMap<String, String>>,
+    /// Let this server terminate public traffic (point DNS at it). Off by default, so a plain
+    /// worker holds no certificates or auth config.
+    ingress: Option<bool>,
 }
 
 pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Json(b): Json<UpdateBody>) -> ApiResult<Json<Value>> {
@@ -90,7 +94,18 @@ pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>
     if let Some(labels) = &b.labels {
         app.db.conn().execute("UPDATE nodes SET labels = ?1 WHERE id = ?2", params![serde_json::to_string(labels)?, id])?;
     }
+    let ingress_changed = b.ingress.is_some();
+    if let Some(ingress) = b.ingress {
+        // The panel is always ingress; this toggles the other servers.
+        app.db.conn().execute("UPDATE nodes SET ingress = ?1 WHERE id = ?2 AND is_local = 0", params![ingress, id])?;
+    }
     nodes::load(&app)?;
+    if ingress_changed {
+        // A server turned into an ingress needs the certificates and the full table; one turned
+        // back loses them on its next pushed table (the old ones linger until it restarts).
+        nodes::push_certs(&app).await;
+        nodes::push_routes(&app);
+    }
     app.audit(Some(&a.0), "node.update", None, None, Some(&id), None);
     Ok(Json(json!({ "ok": true })))
 }

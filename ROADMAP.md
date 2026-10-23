@@ -156,7 +156,8 @@ Even on a single server, the panel drives Docker through the same node interface
 - **Replicas and placement:**
   - Replicas spread across servers, and every server's proxy balances over the healthy ones.
   - Services can be pinned to a server, a label or a region.
-- **Images:** each image is built once and shipped only to the servers that need it.
+- **Images:** each image is built once and sent, over the encrypted mesh, only to the servers that need it.
+- **Ingress:** by default only the panel faces the public internet; other servers hold no certificates or sign-in settings and serve only forwarded requests. Point DNS at another server and you mark it as an ingress.
 - **One panel for everything:** charts, logs, the console and alerts cover every server.
 - **Resilience:** apps keep running if the panel's server goes down. Changes pause until it is back.
 

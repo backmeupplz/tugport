@@ -53,8 +53,11 @@ pub async fn join_token(State(app): State<AppState>, a: Auth, headers: HeaderMap
 }
 
 /// Called by `tugport install --join` on the new server; the one-time token is the credential.
-pub async fn join(State(app): State<AppState>, Json(req): Json<nodes::JoinRequest>) -> ApiResult<Json<Value>> {
-    match nodes::join(&app, req).await {
+pub async fn join(State(app): State<AppState>, super::ClientIp(seen): super::ClientIp, headers: HeaderMap, Json(req): Json<nodes::JoinRequest>) -> ApiResult<Json<Value>> {
+    // The panel address this server reached us at, when it is a plain IP.
+    let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let panel_ip = host.parse::<std::net::SocketAddr>().map(|a| a.ip()).or_else(|_| host.trim_matches(['[', ']']).parse()).ok();
+    match nodes::join(&app, req, panel_ip, seen).await {
         Ok(r) => Ok(Json(serde_json::to_value(r)?)),
         Err(e) => Err(ApiError::bad_request(format!("{e:#}"))),
     }

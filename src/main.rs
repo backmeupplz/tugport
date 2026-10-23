@@ -132,14 +132,33 @@ pub fn setup_link(db: &db::Db) -> Result<Option<String>> {
     }
     let token = util::token(32);
     db.set_state("setup_token", &util::sha256_hex(&token))?;
-    let host = public_ip().unwrap_or_else(|| "localhost".into());
+    let host = public_address().unwrap_or_else(|| "localhost".into());
     Ok(Some(format!("http://{host}:8484/setup#{token}")))
 }
 
+/// The address this server sends from (on clouds with 1:1 NAT, like EC2, a private one).
 pub fn public_ip() -> Option<String> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("1.1.1.1:80").ok()?;
     Some(sock.local_addr().ok()?.ip().to_string())
+}
+
+/// The address the internet reaches this server at: its own when that is public,
+/// otherwise what Cloudflare's trace endpoint sees (asked once, for links and joins).
+pub fn public_address() -> Option<String> {
+    static FOUND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let own = public_ip()?;
+            let private = own.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64));
+            if !private {
+                return Some(own);
+            }
+            let out = std::process::Command::new("curl").args(["-s", "--max-time", "3", "https://1.1.1.1/cdn-cgi/trace"]).output().ok()?;
+            let seen = String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("ip=").map(|v| v.trim().to_string()));
+            seen.filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()).or(Some(own))
+        })
+        .clone()
 }
 
 /// Containers mount a static copy of this binary as their init. `TUGPORT_INIT` overrides

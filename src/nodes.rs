@@ -161,7 +161,7 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
         Some(s) => s,
         None => {
             let (private_key, public_key) = mesh::keypair()?;
-            let ip = crate::public_ip().ok_or_else(|| anyhow!("could not find this server's address"))?;
+            let ip = tokio::task::spawn_blocking(crate::public_address).await?.ok_or_else(|| anyhow!("could not find this server's address"))?;
             let swarm = sh("docker info --format '{{.Swarm.LocalNodeState}} {{.Swarm.NodeAddr}}'").await.unwrap_or_default();
             let encrypt_overlay = swarm.starts_with("active") && !swarm.contains(mesh::PANEL_IP);
             MeshState { private_key, public_key, endpoint: format!("{ip}:{}", mesh::PORT), encrypt_overlay }
@@ -254,7 +254,9 @@ fn set_peers(app: &App) -> Result<()> {
 /// The peer list each agent should have: the panel plus every other server.
 fn peers_of_agent(app: &App, node_id: &str) -> Result<Vec<Peer>> {
     let st = mesh_state(app)?.ok_or_else(|| anyhow!("the mesh is not set up"))?;
-    let mut peers = vec![Peer { public_key: st.public_key, endpoint: Some(st.endpoint), mesh_ip: mesh::PANEL_IP.into() }];
+    // The panel address this server joined through works for it; ours may be private (EC2).
+    let endpoint = app.db.get_state(&format!("panelep:{node_id}"))?.unwrap_or(st.endpoint);
+    let mut peers = vec![Peer { public_key: st.public_key, endpoint: Some(endpoint), mesh_ip: mesh::PANEL_IP.into() }];
     peers.extend(peers_for(app, Some(node_id))?);
     Ok(peers)
 }
@@ -319,7 +321,26 @@ pub struct JoinResponse {
     pub registry: String,
 }
 
-pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinEnvelope> {
+/// Addresses only reachable inside one network (private, shared, link-local, loopback).
+fn local_only(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || (v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Where other servers reach a new one: what it says, unless that is a private address
+/// and we saw it come from a public one (a cloud machine behind 1:1 NAT, like EC2).
+fn reachable_endpoint(claimed: Option<&str>, seen: Option<std::net::IpAddr>) -> Option<String> {
+    let claimed_ip = claimed.and_then(|c| c.parse::<SocketAddr>().ok()).map(|a| a.ip());
+    match (claimed_ip, seen.map(|s| s.to_canonical())) {
+        (Some(c), Some(s)) if local_only(c) && !local_only(s) => Some(SocketAddr::new(s, mesh::PORT).to_string()),
+        (None, Some(s)) if !local_only(s) => Some(SocketAddr::new(s, mesh::PORT).to_string()),
+        _ => claimed.map(String::from),
+    }
+}
+
+pub async fn join(app: &AppState, req: JoinRequest, panel_ip: Option<std::net::IpAddr>, seen: Option<std::net::IpAddr>) -> Result<JoinEnvelope> {
     let invalid = || anyhow!("this join command is not valid; make a new one in the panel");
     if req.token_id.len() != 64 || !req.token_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid());
@@ -357,12 +378,15 @@ pub async fn join(app: &AppState, req: JoinRequest) -> Result<JoinEnvelope> {
         }
         conn.execute(
             "INSERT INTO nodes (id, name, is_local, address, mesh_ip, wg_public_key, status, info, created_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'joining', ?6, ?7)",
-            params![node_id, name, req.endpoint, mesh_ip, req.wg_public_key, req.info.to_string(), util::now()],
+            params![node_id, name, reachable_endpoint(req.endpoint.as_deref(), seen), mesh_ip, req.wg_public_key, req.info.to_string(), util::now()],
         )?;
         (mesh_ip, name)
     };
     let sealed = app.keys.seal_str(&format!("nodekey:{node_id}"), &secret)?;
     app.db.set_state(&format!("nodekey:{node_id}"), &crate::crypto::b64(&sealed))?;
+    if let Some(ip) = panel_ip.filter(|ip| !ip.is_loopback()) {
+        app.db.set_state(&format!("panelep:{node_id}"), &SocketAddr::new(ip, mesh::PORT).to_string())?;
+    }
     if let Some(machine) = &cloud {
         // A machine Tugport created: it gets its region and its pool's labels.
         app.db.conn().execute(
@@ -764,8 +788,8 @@ pub async fn remove(app: &AppState, node_id: &str) -> Result<()> {
     let _ = agent(&node, reqwest::Method::POST, "/agent/leave", None).await;
     app.db.conn().execute("DELETE FROM nodes WHERE id = ?1", [node_id])?;
     app.db.conn().execute(
-        "DELETE FROM state WHERE key IN (?1, ?2, ?3)",
-        params![format!("nodekey:{node_id}"), format!("rescheduled:{node_id}"), format!("draining:{node_id}")],
+        "DELETE FROM state WHERE key IN (?1, ?2, ?3, ?4)",
+        params![format!("nodekey:{node_id}"), format!("rescheduled:{node_id}"), format!("draining:{node_id}"), format!("panelep:{node_id}")],
     )?;
     let _ = std::fs::remove_dir_all(app.paths.run.join("docker").join(node_id));
     set_peers(app)?;
@@ -907,6 +931,20 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
 mod tests {
     use super::join_secret;
     use crate::model::Placement;
+
+    #[test]
+    fn endpoints_prefer_what_can_be_reached() {
+        use super::reachable_endpoint;
+        let ip = |s: &str| Some(s.parse().unwrap());
+        // EC2: the machine only knows its private address; we saw its public one.
+        assert_eq!(reachable_endpoint(Some("172.31.5.9:51820"), ip("3.120.1.2")).as_deref(), Some("3.120.1.2:51820"));
+        // A server with a public address keeps it.
+        assert_eq!(reachable_endpoint(Some("95.216.1.2:51820"), ip("95.216.1.2")).as_deref(), Some("95.216.1.2:51820"));
+        // Both private (one LAN or one VPC): keep what it said.
+        assert_eq!(reachable_endpoint(Some("172.17.0.8:51820"), ip("172.17.0.8")).as_deref(), Some("172.17.0.8:51820"));
+        assert_eq!(reachable_endpoint(None, ip("10.0.0.2")), None);
+        assert_eq!(reachable_endpoint(None, ip("::ffff:3.120.1.2")).as_deref(), Some("3.120.1.2:51820"));
+    }
 
     #[test]
     fn hostnames_become_server_names() {

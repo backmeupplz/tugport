@@ -209,7 +209,7 @@ pub fn panel_url(app: &App) -> String {
         Some(d) => format!("https://{d}"),
         None => {
             let port = s.panel_listen.rsplit(':').next().unwrap_or("8484");
-            format!("http://{}:{port}", crate::public_ip().unwrap_or_else(|| "127.0.0.1".into()))
+            format!("http://{}:{port}", crate::public_address().unwrap_or_else(|| "127.0.0.1".into()))
         }
     }
 }

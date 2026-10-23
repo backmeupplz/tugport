@@ -162,7 +162,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
     let db = crate::db::Db::open(&paths.db())?;
     match crate::setup_link(&db)? {
         Some(link) => println!("\nTugport is running. Open {link} to create your account."),
-        None => println!("\nTugport is running and already set up; open http://{}:8484 to sign in.", crate::public_ip().unwrap_or_else(|| "this-server".into())),
+        None => println!("\nTugport is running and already set up; open http://{}:8484 to sign in.", crate::public_address().unwrap_or_else(|| "this-server".into())),
     }
     if ok(Command::new("sh").args(["-c", "ufw status | grep -q 'Status: active'"])) {
         println!("ufw is active: allow the panel and web traffic with `ufw allow 80,443,8484/tcp`.");

@@ -702,13 +702,9 @@ pub async fn guard_panel(app: &App) -> Result<()> {
     let host = mesh::interfaces();
     let mut ports: Vec<u16> = PANEL_PORT.get().copied().into_iter().chain(app.settings().panel_port()).collect();
     ports.dedup();
-    match runtime::bridge_interfaces(&app.docker).await.context("listing bridges to block containers from the panel") {
-        Ok(bridges) => mesh::guard_panel(&ports, &host, &bridges),
-        // Without Docker's list a network named `br-something` would pass for a host bridge:
-        // keep the rules in place, or start with the default bridges and `br-+`.
-        Err(e) if mesh::panel_guarded() => Err(e),
-        Err(e) => mesh::guard_panel(&ports, &[], &[]).and(Err(e)),
-    }
+    let bridges = runtime::bridge_interfaces(&app.docker).await.context("listing bridges to block containers from the panel");
+    let guarded = mesh::guard_panel(&ports, &host, bridges.as_deref().ok());
+    bridges.and(guarded)
 }
 
 /// Check every agent, collect its metrics, and keep routes, peers and certificates fresh.

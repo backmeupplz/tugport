@@ -168,12 +168,18 @@ pub fn install_boot_hook() -> Result<()> {
 /// Docker's bridge networks), so a network created in between is never taken for a host
 /// bridge. Networks created later are covered anyway: Docker names them `br-<id>`, and `br-+`
 /// matches them.
-pub fn guard_panel(ports: &[u16], host_ifaces: &[String], docker_bridges: &[String]) -> Result<()> {
-    let rules = panel_rules(ports, docker_bridges, host_ifaces);
-    let v4 = guard_panel_with("iptables", &rules);
+pub fn guard_panel(ports: &[u16], host_ifaces: &[String], docker_bridges: Option<&[String]>) -> Result<()> {
+    // Without Docker's list a network named `br-something` would pass for a host bridge, so
+    // keep the rules in place, or start with the default bridges and `br-+`.
+    let rules = match docker_bridges {
+        Some(bridges) => panel_rules(ports, bridges, host_ifaces),
+        None => panel_rules(ports, &[], &[]),
+    };
+    let keep = docker_bridges.is_none();
+    let v4 = guard_panel_with("iptables", &rules, keep);
     // Only containers on IPv6-enabled networks reach a panel listening on `[::]`.
     let v6 = if Command::new("ip6tables").args(["-w", "10", "-n", "-L", "INPUT"]).output().map(|o| o.status.success()).unwrap_or(false) {
-        guard_panel_with("ip6tables", &rules)
+        guard_panel_with("ip6tables", &rules, keep)
     } else {
         Ok(())
     };
@@ -186,14 +192,6 @@ pub fn interfaces() -> Vec<String> {
 }
 
 const PANEL_CHAIN: &str = "TUGPORT-PANEL";
-
-/// Whether the panel chain holds any rules.
-pub fn panel_guarded() -> bool {
-    Command::new("iptables")
-        .args(["-w", "10", "-S", PANEL_CHAIN])
-        .output()
-        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.starts_with("-A ")))
-}
 
 /// Docker's own name for a bridge network's interface: `br-` and 12 hex digits of its id.
 fn docker_named(iface: &str) -> bool {
@@ -225,7 +223,8 @@ fn panel_rules(ports: &[u16], docker_bridges: &[String], host_ifaces: &[String])
     rules
 }
 
-fn guard_panel_with(bin: &str, rules: &[Vec<String>]) -> Result<()> {
+/// `keep`: leave a chain that has rules alone, only making sure INPUT still jumps to it.
+fn guard_panel_with(bin: &str, rules: &[Vec<String>], keep: bool) -> Result<()> {
     fn args<'a>(op: &'a str, chain: &'a str, rule: &'a [String]) -> Vec<&'a str> {
         [&[op, chain][..], &rule.iter().map(String::as_str).collect::<Vec<_>>()].concat()
     }
@@ -236,7 +235,7 @@ fn guard_panel_with(bin: &str, rules: &[Vec<String>]) -> Result<()> {
     }
     // Ports and bridges change, so rebuild the chain whenever it holds anything else.
     let present = iptables(&["-S", PANEL_CHAIN])?.lines().filter(|l| l.starts_with("-A ")).count();
-    if present != rules.len() || !rules.iter().all(|r| ok(&args("-C", PANEL_CHAIN, r))) {
+    if !(keep && present > 0) && (present != rules.len() || !rules.iter().all(|r| ok(&args("-C", PANEL_CHAIN, r)))) {
         iptables(&["-F", PANEL_CHAIN])?;
         for r in rules {
             iptables(&args("-A", PANEL_CHAIN, r))?;

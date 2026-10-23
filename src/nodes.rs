@@ -209,6 +209,14 @@ pub async fn restore_mesh(app: &App) -> Result<()> {
     ensure_registry().await
 }
 
+/// The registry itself answers on localhost (not just anything that holds the port).
+async fn registry_answers() -> bool {
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(1)).no_proxy().build() else {
+        return false;
+    };
+    client.get(format!("http://127.0.0.1:{REGISTRY_PORT}/v2/")).send().await.is_ok_and(|r| r.headers().contains_key("docker-distribution-api-version"))
+}
+
 /// A private registry on the mesh so servers pull only the image layers they lack.
 async fn ensure_registry() -> Result<()> {
     // A running container is not enough: after a Docker restart it can run with no published
@@ -216,7 +224,7 @@ async fn ensure_registry() -> Result<()> {
     // few seconds to answer before it is replaced.
     if sh("docker inspect -f '{{.State.Running}}' tugport-registry").await.map(|s| s.trim() == "true").unwrap_or(false) {
         for _ in 0..5 {
-            if runtime::http_ok("127.0.0.1", REGISTRY_PORT, "/v2/", false).await {
+            if registry_answers().await {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;

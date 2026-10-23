@@ -300,10 +300,10 @@ The `config` for each kind:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/tunnel` | `{enabled, account, tunnel_id, running, domains}` |
-| PUT | `/api/tunnel` | `{api_token}`: creates the tunnel and runs cloudflared. |
-| DELETE | `/api/tunnel` | |
+| PUT | `/api/tunnel` | `{api_token}`: creates the tunnel and runs cloudflared. The token needs Account > Cloudflare Tunnel > Edit and Zone > DNS > Edit. A connect that fails removes what it created. |
+| DELETE | `/api/tunnel` | Stops cloudflared and deletes the tunnel and the DNS records Tugport made for it. |
 
-Domains with `via_tunnel: true` are routed through the tunnel.
+Domains with `via_tunnel: true` are routed through the tunnel and get a proxied CNAME to it. When a domain leaves the tunnel, Tugport deletes the record it made, unless someone has pointed that record elsewhere.
 
 ## Servers
 

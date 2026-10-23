@@ -265,14 +265,18 @@ pub async fn tunnel_connect(State(app): State<AppState>, a: Auth, Json(b): Json<
     if crate::tunnel::load(&app)?.is_some() {
         return Err(ApiError::conflict("a tunnel is already connected; disconnect it first"));
     }
-    crate::tunnel::connect(&app, b.api_token.trim()).await.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    // Detached, so a dropped request can't stop it halfway with a tunnel created at Cloudflare.
+    let (app2, token) = (app.clone(), b.api_token.trim().to_string());
+    let connected = tokio::spawn(async move { crate::tunnel::connect(&app2, &token).await }).await.map_err(anyhow::Error::from)?;
+    connected.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     app.audit(Some(&a.0), "tunnel.connect", None, None, None, None);
     Ok(Json(crate::tunnel::status(&app).await?))
 }
 
 pub async fn tunnel_disconnect(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
     a.require_owner()?;
-    crate::tunnel::disconnect(&app).await?;
+    let app2 = app.clone();
+    tokio::spawn(async move { crate::tunnel::disconnect(&app2).await }).await.map_err(anyhow::Error::from)??;
     app.audit(Some(&a.0), "tunnel.disconnect", None, None, None, None);
     Ok(Json(json!({ "ok": true })))
 }

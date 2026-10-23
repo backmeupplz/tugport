@@ -37,6 +37,9 @@ fn trigger_for(a: &Auth) -> &'static str {
 pub async fn deploy(State(app): State<AppState>, a: Auth, Path(id): Path<String>, body: Option<Json<DeployBody>>) -> ApiResult<Json<Value>> {
     let b = body.map(|b| b.0).unwrap_or_default();
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
+    if b.git_ref.as_deref().is_some_and(|r| !crate::git::valid_ref(r)) {
+        return Err(ApiError::bad_request("ref is not a branch, tag or commit name"));
+    }
     let mut events = app.events.subscribe();
     let req = Request { trigger: trigger_for(&a).into(), actor: Some(a.0.name.clone()), git_ref: b.git_ref, ..Default::default() };
     let did = deploy::enqueue(&app, &s, req)?;

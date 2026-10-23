@@ -109,6 +109,42 @@ pub fn guard() -> Result<()> {
     Ok(())
 }
 
+/// Swarm's ports carry overlay traffic without authentication: VXLAN (4789/udp), gossip
+/// (7946) and management (2377). Tugport's swarm runs over the mesh, so they answer only there
+/// and to this host. `node_addr` is the swarm address Docker reports; a swarm that was here
+/// before Tugport (an old panel's) and talks over other addresses is left alone.
+pub fn guard_swarm(node_addr: Option<&str>) -> Result<()> {
+    const CHAIN: &str = "TUGPORT-SWARM";
+    if !node_addr.is_some_and(|a| a.starts_with("10.99.")) {
+        return Ok(());
+    }
+    // The mesh is IPv4 only, so over IPv6 these ports answer nobody but this host.
+    for (tool, own) in [("iptables", &["-i", IFACE, "-j", "RETURN"][..]), ("ip6tables", &[][..])] {
+        let ok = |args: &[&str]| Command::new(tool).args(["-w", "10"]).args(args).output().map(|o| o.status.success()).unwrap_or(false);
+        if !ok(&["-n", "-L", "INPUT"]) {
+            continue;
+        }
+        if !ok(&["-n", "-L", CHAIN]) {
+            run(Command::new(tool).args(["-w", "10", "-N", CHAIN])).context("guarding swarm's ports")?;
+        }
+        let mut rules: Vec<(&str, &[&str])> = vec![];
+        if !own.is_empty() {
+            rules.push((CHAIN, own));
+        }
+        rules.push((CHAIN, &["-i", "lo", "-j", "RETURN"]));
+        rules.push((CHAIN, &["-j", "DROP"]));
+        rules.push(("INPUT", &["-p", "udp", "-m", "multiport", "--dports", "4789,7946", "-j", CHAIN]));
+        rules.push(("INPUT", &["-p", "tcp", "-m", "multiport", "--dports", "2377,7946", "-j", CHAIN]));
+        for (chain, rule) in rules {
+            if !ok(&[&["-C", chain], rule].concat()) {
+                let op = if chain == "INPUT" { "-I" } else { "-A" };
+                run(Command::new(tool).args([&["-w", "10", op, chain], rule].concat())).context("guarding swarm's ports")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `tugport mesh-up`: the interface and its peers first, then the guard (even when a peer
 /// could not be set). Docker is not
 /// running yet, so nothing can reach the mesh before the guard is in place, and a failing

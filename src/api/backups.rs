@@ -144,6 +144,14 @@ pub async fn create_job(State(app): State<AppState>, a: Auth, Json(b): Json<JobB
         ("database", Some(s)) if s.spec.database.is_some() => {}
         ("database", _) => return Err(ApiError::bad_request("database backups need a database service")),
         ("volume", _) if b.volume.as_deref().is_none_or(|v| v.is_empty()) => return Err(ApiError::bad_request("volume backups need a volume name")),
+        // The name reaches `docker run -v`, where a path would mean a folder of the server, and
+        // another service's volume another project's data.
+        ("volume", Some(s))
+            if !s.spec.mounts.iter().any(|m| matches!(m, crate::model::Mount::Volume { name, .. } if Some(name.as_str()) == b.volume.as_deref())) =>
+        {
+            return Err(ApiError::bad_request("pick one of the service's volumes"));
+        }
+        ("volume", None) if b.volume.as_deref().is_some_and(|v| v.contains(['/', ':'])) => return Err(ApiError::bad_request("that is not a volume name")),
         ("volume", _) | ("state", None) => {}
         ("state", Some(_)) => return Err(ApiError::bad_request("state backups are not tied to a service")),
         _ => return Err(ApiError::bad_request("kind is database, volume or state")),

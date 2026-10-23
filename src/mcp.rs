@@ -192,7 +192,8 @@ async fn call(t: &Tool, mut args: Map<String, Value>, headers: &HeaderMap, conn:
         _ => Value::Object(args),
     };
     let mut req = Request::builder().method(t.method.clone()).uri(&path).header(header::CONTENT_TYPE, "application/json");
-    for name in [header::AUTHORIZATION, header::COOKIE, header::HOST] {
+    // MCP clients authenticate with an API key; a browser's session cookie is not forwarded.
+    for name in [header::AUTHORIZATION, header::HOST] {
         if let Some(v) = headers.get(&name) {
             req = req.header(name, v);
         }

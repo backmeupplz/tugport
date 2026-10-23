@@ -169,8 +169,9 @@ async fn remove_record(t: &Tunnel, rec: &DnsRecord) -> Result<()> {
     cf(&t.api_token, reqwest::Method::DELETE, &path, None).await.map(|_| ())
 }
 
+/// In the root-only secrets folder: anyone holding the token can run a connector for the tunnel.
 fn token_path(app: &App) -> std::path::PathBuf {
-    app.paths.run.join("cloudflared.token")
+    app.paths.secrets().join("cloudflared.token")
 }
 
 pub async fn status(app: &App) -> Result<Value> {
@@ -282,6 +283,10 @@ async fn point_at(token: &str, host: &str, target: &str) -> Result<DnsRecord> {
     let body = json!({ "type": "CNAME", "name": host, "content": target, "proxied": true, "comment": "managed by Tugport" });
     let id = match existing.iter().find(|r| r["type"] == "CNAME") {
         Some(r) if r["content"].as_str() == Some(target) => r["id"].as_str().unwrap_or_default().to_string(),
+        // Someone else's record (a SaaS CNAME, say) is left alone, like A/AAAA records.
+        Some(r) if r["comment"].as_str() != Some("managed by Tugport") => {
+            bail!("it has a CNAME record to {}; remove it so the tunnel can take over the name", r["content"].as_str().unwrap_or("somewhere else"));
+        }
         Some(r) => {
             let id = r["id"].as_str().unwrap_or_default();
             cf(token, reqwest::Method::PUT, &format!("/zones/{zone}/dns_records/{id}"), Some(body)).await?;

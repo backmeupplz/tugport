@@ -387,6 +387,9 @@ async fn aws_run_instance(creds: &Credentials, region: &str, size: &str, name: &
             ("MinCount", "1"),
             ("MaxCount", "1"),
             ("UserData", &user_data),
+            // IMDSv2 only, and one hop: containers (one hop further away) cannot read metadata.
+            ("MetadataOptions.HttpTokens", "required"),
+            ("MetadataOptions.HttpPutResponseHopLimit", "1"),
             ("SecurityGroupId.1", &group),
             ("BlockDeviceMapping.1.DeviceName", "/dev/sda1"),
             ("BlockDeviceMapping.1.Ebs.VolumeSize", "30"),

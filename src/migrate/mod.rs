@@ -370,6 +370,7 @@ async fn migrate(panel: &'static str, dry_run: bool, yes: bool) -> Result<()> {
         _ => coolify::plan(&docker).await?,
     };
     lift_git_credentials(&mut plan);
+    review_host_access(&mut plan);
     print_plan(&plan);
     if dry_run {
         return Ok(());
@@ -404,6 +405,48 @@ fn confirm(question: &str) -> Result<bool> {
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
     Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// The old panel may have given services host access that Tugport otherwise leaves to admins
+/// with the destroy grant. Say which services keep it, turn on privileged mode for Compose
+/// stacks that need it (Tugport checks their file at every deploy), and leave out services that
+/// would mount Tugport's own files.
+fn review_host_access(plan: &mut Plan) {
+    let own = crate::paths::Paths::from_env();
+    for s in plan.services.iter_mut().filter(|s| s.cutover != Cutover::Unsupported) {
+        let binds: Vec<String> = s.spec.mounts.iter().filter_map(|m| if let crate::model::Mount::Bind { source, .. } = m { Some(source.clone()) } else { None }).collect();
+        let tugports = |b: &String| {
+            let p = std::path::Path::new(b);
+            p.components().any(|c| c == std::path::Component::ParentDir) || [&own.etc, &own.data, &own.run].iter().any(|d| p.starts_with(d))
+        };
+        if binds.iter().any(tugports) {
+            s.cutover = Cutover::Unsupported;
+            s.notes.push("it mounts Tugport's own files".into());
+            continue;
+        }
+        let mut access: Vec<String> = binds.iter().map(|b| format!("bind mount {b}")).collect();
+        for (on, what) in [(s.spec.docker_socket, "the Docker socket"), (s.spec.privileged, "privileged mode"), (s.spec.host_network, "host networking")] {
+            if on {
+                access.push(what.into());
+            }
+        }
+        if !s.spec.cap_add.is_empty() {
+            access.push(format!("capabilities {}", s.spec.cap_add.join(" ")));
+        }
+        if s.kind == "compose" && !s.spec.privileged {
+            let needs = match &s.spec.source {
+                Source::Compose { yaml } => crate::compose::check_untrusted_text(yaml).err().map(|e| format!("{e:#}")),
+                _ => Some("its file is read from the repository at each deploy".into()),
+            };
+            if let Some(why) = needs {
+                s.spec.privileged = true;
+                access.push(format!("privileged mode for its Compose file ({why})"));
+            }
+        }
+        if !access.is_empty() {
+            s.notes.push(format!("keeps the host access it had: {}", access.join(", ")));
+        }
+    }
 }
 
 fn print_plan(plan: &Plan) {

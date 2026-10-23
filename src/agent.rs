@@ -122,8 +122,12 @@ pub async fn run() -> Result<()> {
                 if let Err(e) = mesh::guard() {
                     tracing::error!("{e:#}");
                 }
+                let info = app.docker.info().await.ok();
+                if let Err(e) = mesh::guard_swarm(info.as_ref().and_then(|i| i.swarm.as_ref()?.node_addr.as_deref())) {
+                    tracing::error!("{e:#}");
+                }
                 // Logs a warning when swarm mode breaks, even while the panel is away.
-                crate::nodes::swarm_problem(app.docker.info().await.ok().as_ref());
+                crate::nodes::swarm_problem(info.as_ref());
             }
         });
     }

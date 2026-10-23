@@ -242,7 +242,7 @@ async fn backup(app: &App, j: &Job) -> Result<(Option<String>, Option<i64>)> {
             pipe(dump, restic).await?
         }
         "volume" => {
-            let vol = j.volume.as_deref().ok_or_else(|| anyhow!("volume backups need a volume"))?;
+            let vol = volume_name(j)?;
             let mount = format!("{vol}:/data/{vol}:ro");
             let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
             crate::proc::output(restic_on(cli, &repo, &[mount], &["backup", "--json", &format!("/data/{vol}"), "--tag", "tugport", "--tag", &job_tag])).await?
@@ -367,8 +367,18 @@ async fn check_database(app: &App, engine: Engine, node: &str, container: &str) 
     Ok(format!("The restored copy reports {} tables/collections/keys.", out.trim()))
 }
 
+/// A job's volume, refused when it is not a plain volume name: in `docker run -v` a path would
+/// be a folder of the server.
+fn volume_name(j: &Job) -> Result<&str> {
+    let vol = j.volume.as_deref().ok_or_else(|| anyhow!("volume backups need a volume"))?;
+    if vol.is_empty() || vol.starts_with(['.', '-']) || vol.contains(['/', ':', ',']) {
+        bail!("{vol} is not a volume name");
+    }
+    Ok(vol)
+}
+
 async fn restore_volume(app: &AppState, j: &Job, repo: &Repo, snapshot: &str) -> Result<String> {
-    let vol = j.volume.as_deref().ok_or_else(|| anyhow!("no volume"))?;
+    let vol = volume_name(j)?;
     let users: Vec<runtime::Replica> = match &j.service_id {
         Some(sid) => runtime::replicas(app, sid).await?.into_iter().filter(|r| r.state == "running").collect(),
         None => vec![],

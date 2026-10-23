@@ -54,14 +54,17 @@ where
             // SAFETY: the previous process handed us this open listening socket under `key`
             // and nothing else in this process owns the descriptor.
             let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+            // Inherited without close-on-exec; programs Tugport runs (git, docker...) must not get it.
+            // SAFETY: fcntl on the descriptor we now own.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             std_listener.set_nonblocking(true)?;
             tokio::net::TcpListener::from_std(std_listener).with_context(|| format!("adopting the inherited {key} socket"))?
         }
         None => bind.await?,
     };
-    // A duplicate (without close-on-exec) keeps the socket open for the next handoff.
+    // A duplicate keeps the socket open for the next handoff; `reexec` lets it through the exec.
     // SAFETY: dup on a valid descriptor we own; the result is only stored, never closed twice.
-    let dup = unsafe { libc::dup(l.as_raw_fd()) };
+    let dup = unsafe { libc::fcntl(l.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if dup >= 0 {
         crate::util::lock(&FDS).push((key.to_string(), dup));
     }
@@ -93,6 +96,10 @@ pub async fn reexec(binary: &std::path::Path, grace: Duration) -> Result<()> {
     let started = Instant::now();
     while ACTIVE.load(Ordering::SeqCst) > 0 && started.elapsed() < grace {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for (_, fd) in crate::util::lock(&FDS).iter() {
+        // SAFETY: clearing close-on-exec on descriptors this process keeps for the new binary.
+        unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) };
     }
     let fds = crate::util::lock(&FDS).iter().map(|(k, fd)| format!("{k}={fd}")).collect::<Vec<_>>().join(",");
     tracing::info!("handing {} sockets to {}", fds.matches('=').count(), binary.display());

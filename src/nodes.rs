@@ -724,10 +724,14 @@ pub async fn health_loop(app: AppState) {
                 tracing::error!("{error}");
             }
             panel_guard_error = error;
-            if mesh_enabled(&app)
-                && let Err(e) = mesh::guard()
-            {
-                tracing::error!("{e:#}");
+            if mesh_enabled(&app) {
+                if let Err(e) = mesh::guard() {
+                    tracing::error!("{e:#}");
+                }
+                let info = app.docker.info().await.ok();
+                if let Err(e) = mesh::guard_swarm(info.as_ref().and_then(|i| i.swarm.as_ref()?.node_addr.as_deref())) {
+                    tracing::error!("{e:#}");
+                }
             }
         }
         for n in remote(&app) {
@@ -856,6 +860,12 @@ async fn restore(app: &AppState, node: &NodeHandle) -> Result<()> {
         let current = app.deployer.busy(&s.id) || runtime::live_deploy(app, &s.id).as_deref() == labels.get(runtime::L_DEPLOY).map(String::as_str);
         if !current {
             runtime::remove(app, &node.id, &id, &name).await?;
+            continue;
+        }
+        // The node lists its own containers: secrets go only to servers the service was placed on
+        // (a deploy in progress delivers them to new servers itself).
+        let placed = app.db.get_state(&format!("nodes:{}", s.id))?.is_some_and(|n| n.split(',').any(|n| n == node.id));
+        if !placed {
             continue;
         }
         put_secrets(app, node, &name, s).await?;

@@ -48,6 +48,14 @@ async fn collect_on(app: AppState, docker: bollard::Docker, following: Arc<Mutex
         for c in list {
             let (Some(id), Some(labels)) = (c.id, c.labels) else { continue };
             let Some(service) = labels.get(runtime::L_SERVICE).cloned() else { continue };
+            if crate::util::lock(&following).contains(&id) {
+                continue;
+            }
+            // Labels on other servers come from their Docker: the id names a folder here, so
+            // follow only services that exist.
+            if !crate::store::service(&app, &service).is_ok_and(|s| s.is_some_and(|s| s.id == service)) {
+                continue;
+            }
             if !crate::util::lock(&following).insert(id.clone()) {
                 continue;
             }

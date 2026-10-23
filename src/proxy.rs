@@ -278,7 +278,13 @@ async fn build_table(app: &App) -> Result<Table> {
     let services: HashMap<String, store::Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
     let mut replicas = runtime::all_replicas(app).await.unwrap_or_default();
     let draining = crate::util::lock(&app.proxy.draining).clone();
+    let settings = app.settings();
     for d in store::domains(app, None)? {
+        // The panel's domain belongs to the panel: a service route there (even a longer path)
+        // would receive its requests and the session cookie.
+        if settings.panel_domain.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&d.host)) {
+            continue;
+        }
         let Some(s) = services.get(&d.service_id) else { continue };
         let live = runtime::live_deploy(app, &s.id);
         let asleep = crate::sleep::is_asleep(app, &s.id);
@@ -308,7 +314,6 @@ async fn build_table(app: &App) -> Result<Table> {
             port: d.port,
         });
     }
-    let settings = app.settings();
     if let Some(panel) = &settings.panel_domain {
         let port = settings.panel_listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(8484);
         let ip = settings.panel_listen.rsplit_once(':').and_then(|(ip, _)| ip.trim_matches(['[', ']']).parse::<IpAddr>().ok()).filter(|ip| !ip.is_unspecified());
@@ -481,6 +486,8 @@ fn redirect(status: StatusCode, to: &str) -> Response<Body> {
 }
 
 pub fn page(status: StatusCode, title: &str, text: &str) -> Response<Body> {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let (title, text) = (esc(title), esc(text));
     let html = format!(
         "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>{title}</title>\
          <style>body{{font:16px/1.6 system-ui,sans-serif;background:#0b1018;color:#e9eef5;display:grid;place-items:center;min-height:100vh;margin:0}}\
@@ -573,7 +580,7 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
             return redirect(if *permanent { StatusCode::PERMANENT_REDIRECT } else { StatusCode::FOUND }, &target);
         }
     }
-    if !hop && !route.options.basic_auth.is_empty() && !basic_auth_ok(&app, &route, req.headers()) {
+    if !hop && !route.options.basic_auth.is_empty() && !basic_auth_ok(&app, &route, req.headers()).await {
         let mut r = page(StatusCode::UNAUTHORIZED, "Sign in", "This site needs a user name and password.");
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Restricted\", charset=\"UTF-8\""));
         return r;
@@ -718,6 +725,30 @@ fn in_mesh(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V4(v4) if v4.octets()[..2] == [10, 99])
 }
 
+/// Addresses forward auth must never reach: this server itself, the mesh (other servers'
+/// agents, Docker and registry) and cloud metadata. Its answers can go back to the visitor.
+fn internal(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || in_mesh(ip)
+        || matches!(ip, IpAddr::V4(v4) if v4.is_link_local())
+        || matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
+}
+
+/// A client for the forward-auth URL, pinned to an address checked against `internal`, so the
+/// name cannot resolve somewhere else by the time the request is made.
+async fn forward_auth_client(url: &str) -> Option<reqwest::Client> {
+    let u = reqwest::Url::parse(url).ok().filter(|u| matches!(u.scheme(), "http" | "https"))?;
+    let host = u.host_str()?.trim_matches(['[', ']']).to_string();
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), u.port_or_known_default()?)).await.ok()?.collect();
+    let first = *addrs.first()?;
+    if addrs.iter().any(|a| internal(a.ip())) {
+        return None;
+    }
+    reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).resolve(&host, first).build().ok()
+}
+
 async fn panel_challenge(host: &str, path: &str) -> Response<Body> {
     let url = format!("http://{}{path}", crate::mesh::PANEL_IP);
     let answer = async {
@@ -740,7 +771,7 @@ fn strip_hop_headers(h: &mut HeaderMap, keep_upgrade: bool) {
     }
 }
 
-fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
+async fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
     let Some(creds) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic ")) else {
         return false;
     };
@@ -751,8 +782,9 @@ fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
     }
     let Ok(decoded) = crate::crypto::unb64(creds) else { return false };
     let Ok(decoded) = String::from_utf8(decoded) else { return false };
-    let Some((user, pass)) = decoded.split_once(':') else { return false };
-    let ok = route.options.basic_auth.iter().any(|u| u.user == user && crate::auth::verify_password(pass, &u.hash));
+    let Some((user, pass)) = decoded.split_once(':').map(|(u, p)| (u.to_string(), p.to_string())) else { return false };
+    let Some(hash) = route.options.basic_auth.iter().find(|u| u.user == user).map(|u| u.hash.clone()) else { return false };
+    let ok = crate::auth::hashing(move || crate::auth::verify_password(&pass, &hash)).await.unwrap_or(false);
     if ok {
         crate::util::lock(&app.proxy.auth_cache).insert(key, now + 600);
     }
@@ -769,8 +801,8 @@ async fn forward_auth(
     client: IpAddr,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, Response<Body>> {
     let _ = app;
-    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).build() else {
-        return Err(page(StatusCode::BAD_GATEWAY, "Sign-in service unavailable", "Tugport could not create an HTTP client."));
+    let Some(http) = forward_auth_client(&fa.url).await else {
+        return Err(page(StatusCode::BAD_GATEWAY, "Sign-in service unavailable", "The authentication service's address is not allowed."));
     };
     let mut r = http
         .get(&fa.url)
@@ -832,6 +864,18 @@ mod tests {
         assert_eq!(client_ip(&h, "10.0.0.3".parse().unwrap(), &trusted).0, "203.0.113.9".parse::<IpAddr>().unwrap());
         assert!(in_mesh("10.99.0.2".parse().unwrap()));
         assert!(!in_mesh("10.98.0.2".parse().unwrap()));
+        for ip in ["127.0.0.1", "::1", "0.0.0.0", "10.99.0.1", "169.254.169.254", "fe80::1", "::ffff:127.0.0.1"] {
+            assert!(internal(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["203.0.113.9", "192.168.1.10", "2001:db8::1"] {
+            assert!(!internal(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pages_escape_what_they_show() {
+        let body = page(StatusCode::NOT_FOUND, "Nothing here yet", "No service is set up for <script>.").into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("&lt;script&gt;"));
     }
 
     #[test]

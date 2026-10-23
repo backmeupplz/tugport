@@ -1,6 +1,7 @@
 //! Running helper programs (git, docker buildx, railpack...) with their output streamed to a log.
 
 use anyhow::{Result, bail};
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -50,4 +51,35 @@ pub async fn output(mut cmd: Command) -> Result<String> {
         bail!("{program} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Variable names that change how the host tools Tugport runs (docker, compose, buildx, git,
+/// railpack...) behave, which binaries and libraries they load or which config and credentials
+/// they read, rather than the build or stack they work on. Services may still set them for their
+/// containers; they just never reach those tools' own environment.
+pub fn steers_tools(name: &str) -> bool {
+    const EXACT: &[&str] =
+        &["PATH", "HOME", "SHELL", "ENV", "BASH_ENV", "IFS", "TMPDIR", "GCONV_PATH", "GLIBC_TUNABLES", "HOSTALIASES", "LOCPATH", "NLSPATH", "SSL_CERT_FILE", "SSL_CERT_DIR"];
+    const PREFIXES: &[&str] = &["LD_", "DOCKER_", "BUILDX_", "BUILDKIT_", "COMPOSE_", "GIT_", "SSH_", "XDG_", "MALLOC_"];
+    EXACT.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// A service's variables that may go into a host tool's environment.
+pub fn tool_env(env: &BTreeMap<String, zeroize::Zeroizing<String>>) -> impl Iterator<Item = (&str, &str)> {
+    env.iter().filter(|(k, _)| !steers_tools(k)).map(|(k, v)| (k.as_str(), v.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::steers_tools;
+
+    #[test]
+    fn tool_variables() {
+        for k in ["PATH", "LD_PRELOAD", "DOCKER_CONFIG", "DOCKER_HOST", "COMPOSE_FILE", "GIT_SSH_COMMAND", "HOME"] {
+            assert!(steers_tools(k), "{k}");
+        }
+        for k in ["DATABASE_URL", "NODE_ENV", "PORT", "RAILPACK_NODE_VERSION", "NIXPACKS_PKGS", "MY_PATH"] {
+            assert!(!steers_tools(k), "{k}");
+        }
+    }
 }

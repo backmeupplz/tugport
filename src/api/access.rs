@@ -79,18 +79,70 @@ pub struct LoginBody {
     totp: Option<String>,
 }
 
+/// Failed sign-ins per address and failed 2FA codes per user, within the last 15 minutes.
+static FAILURES: std::sync::Mutex<BTreeMap<String, Vec<i64>>> = std::sync::Mutex::new(BTreeMap::new());
+const FAILURE_WINDOW: i64 = 900;
+
+/// Refuses for a while once `key` failed `limit` times within the window.
+fn throttle(key: &str, limit: usize) -> ApiResult<()> {
+    let now = util::now();
+    let mut all = util::lock(&FAILURES);
+    let times = all.entry(key.to_string()).or_default();
+    times.retain(|t| now - t < FAILURE_WINDOW);
+    match times.first() {
+        Some(first) if times.len() >= limit => {
+            let minutes = (FAILURE_WINDOW - (now - first)) / 60 + 1;
+            Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("too many failed attempts; try again in {minutes} minutes")))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn failed(key: &str) {
+    let now = util::now();
+    let mut all = util::lock(&FAILURES);
+    all.entry(key.to_string()).or_default().push(now);
+    if all.len() > 10_000 {
+        all.retain(|_, t| t.last().is_some_and(|l| now - l < FAILURE_WINDOW));
+    }
+}
+
+/// The current code (or one step either side), and each code only once.
+fn totp_ok(totp: &totp_rs::TOTP, code: &str, user_id: &str) -> bool {
+    static USED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+    let now = util::now().max(0) as u64;
+    let mut used = util::lock(&USED);
+    let last = used.get(user_id).copied().unwrap_or(0);
+    for t in [now.saturating_sub(30), now, now + 30] {
+        if t / 30 > last && util::ct_eq(&totp.generate(t), code) {
+            used.insert(user_id.to_string(), t / 30);
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn login(State(app): State<AppState>, ClientIp(ip): ClientIp, headers: HeaderMap, Json(b): Json<LoginBody>) -> ApiResult<impl IntoResponse> {
+    let from = format!("login:{}", ip.map(|i| i.to_string()).unwrap_or_default());
+    throttle(&from, 20)?;
     let row: Option<(String, Option<String>, Option<Vec<u8>>)> = app
         .db
         .conn()
         .query_row(
-            "SELECT id, password_hash, totp_secret FROM users WHERE kind = 'human' AND disabled = 0 AND (name = ?1 OR email = ?1)",
+            "SELECT id, password_hash, totp_secret FROM users WHERE kind = 'human' AND disabled = 0 AND (name = ?1 OR email = ?1) ORDER BY name = ?1 DESC LIMIT 1",
             [b.name.trim()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let verified = row.filter(|(_, hash, _)| hash.as_deref().is_some_and(|h| auth::verify_password(&b.password, h)));
-    let Some((id, _, totp_secret)) = verified else {
+    let verified = match row {
+        Some((id, Some(hash), totp_secret)) => {
+            let password = b.password.clone();
+            auth::hashing(move || auth::verify_password(&password, &hash)).await.unwrap_or(false).then_some((id, totp_secret))
+        }
+        _ => None,
+    };
+    let Some((id, totp_secret)) = verified else {
+        failed(&from);
         app.audit(None, "auth.login_failed", None, None, Some(b.name.trim()), ip.map(|i| i.to_string()).as_deref());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return Err(ApiError::unauthorized("wrong name or password"));
@@ -101,7 +153,11 @@ pub async fn login(State(app): State<AppState>, ClientIp(ip): ClientIp, headers:
         if code.is_empty() {
             return Err(ApiError::new(StatusCode::UNAUTHORIZED, "totp_required"));
         }
-        if !auth::totp(&secret, &b.name)?.check_current(&code).unwrap_or(false) {
+        // Only someone who knows the password gets this far, so this limit cannot lock the owner out.
+        let codes = format!("totp:{id}");
+        throttle(&codes, 5)?;
+        if !totp_ok(&auth::totp(&secret, &b.name)?, &code, &id) {
+            failed(&codes);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             return Err(ApiError::unauthorized("the 2FA code is wrong"));
         }
@@ -131,6 +187,11 @@ pub async fn me(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> 
 pub async fn totp_begin(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
     if a.0.kind != UserKind::Human {
         return Err(ApiError::bad_request("agents sign in with keys only"));
+    }
+    // Setting it up again would replace the secret without a current code, unlike turning it off.
+    let enabled: bool = app.db.conn().query_row("SELECT totp_secret IS NOT NULL FROM users WHERE id = ?1", [&a.0.user_id], |r| r.get(0))?;
+    if enabled {
+        return Err(ApiError::bad_request("2FA is already on; turn it off with a current code first"));
     }
     let secret = auth::new_totp_secret();
     let totp = auth::totp(&secret, &a.0.name)?;
@@ -163,7 +224,10 @@ pub async fn totp_disable(State(app): State<AppState>, a: Auth, Json(b): Json<Co
         app.db.conn().query_row("SELECT totp_secret FROM users WHERE id = ?1", [&a.0.user_id], |r| r.get(0))?;
     let Some(sealed) = sealed else { return Ok(Json(json!({ "ok": true }))) };
     let secret = app.keys.open(&format!("totp:{}", a.0.user_id), &sealed)?;
-    if !auth::totp(&secret, &a.0.name)?.check_current(b.code.trim()).unwrap_or(false) {
+    let codes = format!("totp:{}", a.0.user_id);
+    throttle(&codes, 5)?;
+    if !totp_ok(&auth::totp(&secret, &a.0.name)?, b.code.trim(), &a.0.user_id) {
+        failed(&codes);
         return Err(ApiError::bad_request("that code does not match"));
     }
     app.db.conn().execute("UPDATE users SET totp_secret = NULL WHERE id = ?1", [&a.0.user_id])?;
@@ -359,6 +423,8 @@ pub struct UpdateUserBody {
     name: Option<String>,
     email: Option<String>,
     password: Option<String>,
+    /// Needed to change one's own password.
+    current_password: Option<String>,
     description: Option<String>,
     disabled: Option<bool>,
     #[serde(default, deserialize_with = "super::present")]
@@ -376,6 +442,21 @@ pub async fn update_user(State(app): State<AppState>, a: Auth, Path(id): Path<St
     }
     if own && b.disabled == Some(true) {
         return Err(ApiError::bad_request("you cannot disable yourself"));
+    }
+    if b.name.as_deref().is_some_and(|n| n.trim().is_empty() || n.trim().len() > 64) {
+        return Err(ApiError::bad_request("names are 1 to 64 characters"));
+    }
+    // A stolen session or key must not be enough to take the account over for good.
+    if own && b.password.is_some() {
+        let hash: Option<String> = app.db.conn().query_row("SELECT password_hash FROM users WHERE id = ?1", [&id], |r| r.get(0))?;
+        let current = b.current_password.clone().unwrap_or_default();
+        let ok = match hash {
+            Some(h) => auth::hashing(move || auth::verify_password(&current, &h)).await.unwrap_or(false),
+            None => false,
+        };
+        if !ok {
+            return Err(ApiError::forbidden("send your current password (current_password) to change it"));
+        }
     }
     let mut conn = app.db.conn();
     let tx = conn.transaction()?;
@@ -479,12 +560,28 @@ pub async fn create_key(State(app): State<AppState>, a: Auth, headers: HeaderMap
         .query_row("SELECT name FROM users WHERE id = ?1", [&user], |r| r.get(0))
         .optional()?
         .ok_or_else(|| ApiError::not_found("no such user"))?;
-    let k = issue_key(&app, &a, &user, b.name.as_deref().unwrap_or("default"), b.expires_days, &b.allowed_ips, &name)?;
+    let mut expires = b.expires_days.map(|d| util::now() + d as i64 * 86400);
+    let mut ips = b.allowed_ips.clone();
+    // A key that makes a key for its own user cannot shed its expiry or address limits that way.
+    if let Some(kid) = a.0.key_id.as_deref().filter(|_| user == a.0.user_id) {
+        let (_, _, own_expiry, own_ips) = key_owner(&app, kid)?;
+        let own_ips: Vec<ipnet::IpNet> = own_ips.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if let Some(e) = own_expiry {
+            expires = Some(expires.map_or(e, |x| x.min(e)));
+        }
+        if !own_ips.is_empty() {
+            if ips.is_empty() {
+                ips = own_ips;
+            } else if !ips.iter().all(|n| own_ips.iter().any(|o| o.contains(n))) {
+                return Err(ApiError::forbidden("a key can only make keys for addresses it may use itself"));
+            }
+        }
+    }
+    let k = issue_key(&app, &a, &user, b.name.as_deref().unwrap_or("default"), expires, &ips, &name)?;
     Ok(Json(json!({ "id": k.id, "token": k.token, "snippets": snippets(&base_url(&headers), &k.token) })))
 }
 
-fn issue_key(app: &AppState, a: &Auth, user_id: &str, key_name: &str, expires_days: Option<u32>, ips: &[ipnet::IpNet], user_name: &str) -> ApiResult<auth::NewKey> {
-    let expires = expires_days.map(|d| util::now() + d as i64 * 86400);
+fn issue_key(app: &AppState, a: &Auth, user_id: &str, key_name: &str, expires: Option<i64>, ips: &[ipnet::IpNet], user_name: &str) -> ApiResult<auth::NewKey> {
     let k = auth::create_key(&app.db, user_id, key_name, expires, ips)?;
     app.audit(Some(&a.0), "key.create", None, None, Some(&format!("{user_name}/{key_name}")), None);
     Ok(k)
@@ -507,7 +604,8 @@ pub async fn create_agent(State(app): State<AppState>, a: Auth, headers: HeaderM
         return Err(ApiError::bad_request("give the agent at least one project or a role on all projects"));
     }
     let id = new_user(&app, &a, UserKind::Agent, &b.name, None, None, b.description.as_deref(), &b.access)?;
-    let k = issue_key(&app, &a, &id, b.key.name.as_deref().unwrap_or("default"), b.key.expires_days, &b.key.allowed_ips, b.name.trim())?;
+    let expires = b.key.expires_days.map(|d| util::now() + d as i64 * 86400);
+    let k = issue_key(&app, &a, &id, b.key.name.as_deref().unwrap_or("default"), expires, &b.key.allowed_ips, b.name.trim())?;
     let user = read_user(&app.db.conn(), &id)?;
     Ok(Json(json!({
         "user": user,
@@ -552,6 +650,10 @@ pub async fn rotate_key(State(app): State<AppState>, a: Auth, headers: HeaderMap
     let (user, name, expires, ips) = key_owner(&app, &id)?;
     if !a.0.is_owner && a.0.user_id != user {
         return Err(ApiError::forbidden("only the owner can rotate other users' keys"));
+    }
+    let revoked: bool = app.db.conn().query_row("SELECT revoked_at IS NOT NULL FROM api_keys WHERE id = ?1", [&id], |r| r.get(0))?;
+    if revoked {
+        return Err(ApiError::bad_request("this key was revoked; make a new one instead"));
     }
     let ips: Vec<ipnet::IpNet> = ips.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let k = auth::create_key(&app.db, &user, &name, expires, &ips)?;

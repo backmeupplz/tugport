@@ -202,6 +202,19 @@ pub async fn ensure_network(app: &App, project: &str) -> Result<String> {
     Ok(name)
 }
 
+/// Host interfaces of this server's Docker bridge networks.
+pub async fn bridge_interfaces(docker: &bollard::Docker) -> Result<Vec<String>> {
+    let nets = docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>).await.context("listing Docker networks")?;
+    Ok(nets
+        .into_iter()
+        .filter(|n| n.driver.as_deref() == Some("bridge"))
+        .filter_map(|n| match n.options.as_ref().and_then(|o| o.get("com.docker.network.bridge.name")) {
+            Some(name) => Some(name.clone()),
+            None => Some(format!("br-{}", n.id?.get(..12)?)),
+        })
+        .collect())
+}
+
 /// The ingress bridge on a server (multi-server setups only).
 async fn ensure_ingress(docker: &bollard::Docker) -> Result<()> {
     if docker.inspect_network(INGRESS, None::<bollard::query_parameters::InspectNetworkOptions>).await.is_ok() {

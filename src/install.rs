@@ -116,7 +116,17 @@ pub fn install(args: InstallArgs) -> Result<()> {
         let _ = crate::proc::succeeds(Command::new("systemctl").args(["reload", "tugport.service"]));
     }
 
-    let found = crate::block_on(crate::migrate::detect())?;
+    // Wait for the panel, then print the setup link.
+    for _ in 0..50 {
+        if std::net::TcpStream::connect("127.0.0.1:8484").is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let db = crate::db::Db::open(&paths.db())?;
+    // After a finished move the old panel is still here, stopped, for a rollback.
+    let moved = db.get_state("migration")?.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()).is_some_and(|j| j["done"] == true);
+    let found = if moved { vec![] } else { crate::block_on(crate::migrate::detect())? };
     for f in &found {
         let name = if f.panel == "easypanel" { "Easypanel" } else { "Coolify" };
         println!("\nFound {name} {} on this server.", f.version);
@@ -128,14 +138,6 @@ pub fn install(args: InstallArgs) -> Result<()> {
         }
     }
 
-    // Wait for the panel, then print the setup link.
-    for _ in 0..50 {
-        if std::net::TcpStream::connect("127.0.0.1:8484").is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    let db = crate::db::Db::open(&paths.db())?;
     match crate::setup_link(&db)? {
         Some(link) => println!("\nTugport is running. Open {link} to create your account."),
         None => println!("\nTugport is running and already set up; open http://{}:8484 to sign in.", crate::public_address().unwrap_or_else(|| "this-server".into())),

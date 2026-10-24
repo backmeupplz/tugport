@@ -1,14 +1,13 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { atLeast, patch, useApi, type Node, type Spec } from "../api";
-import { Card, Check, ErrorBox, Field, Note, Select, toast, useSubmit } from "../ui";
-import { joinArgs, labelsText, lines, matchServers, mergePatch, num, parseLabels, pinReasons, splitArgs } from "../util";
-import { BUILDS, PROVIDER_KINDS } from "./new-service";
+import { Card, Check, ErrorBox, Field, Input, Note, Select, TextArea, UnsavedBar, toast, useForm, useSubmit } from "../ui";
+import { LABELS_HINT, joinArgs, labelsText, lines, matchServers, mergePatch, num, parseLabels, patchAt, pinReasons, removeAt, splitArgs, str } from "../util";
+import { BuildFields, buildSpec, gitSource, providerOptions } from "./new-service";
 import { RedeployNote, type Ctx } from "./service";
 
 type Port = { container: string; host: string; protocol: string };
 type MountRow = { type: string; name: string; source: string; target: string; readonly: boolean };
-const str = (v: unknown) => (v == null ? "" : String(v));
 
 function toForm(spec: Spec) {
   const src = spec.source;
@@ -54,9 +53,11 @@ function toForm(spec: Spec) {
     healthTimeout: str(spec.rollout?.health_timeout_s),
     keepImages: str(spec.rollout?.keep_images),
     policy: spec.deploy_policy ?? "",
-    ports: ((spec.ports ?? []) as { container: number; host: number; protocol: string }[]).map(
-      (p): Port => ({ container: str(p.container), host: str(p.host), protocol: p.protocol }),
-    ),
+    ports: ((spec.ports ?? []) as { container: number; host: number; protocol: string }[]).map((p): Port => ({
+      container: str(p.container),
+      host: str(p.host),
+      protocol: p.protocol,
+    })),
     mounts: ((spec.mounts ?? []) as Record<string, any>[])
       .filter((m) => m.type !== "file")
       .map((m): MountRow => ({ type: m.type, name: m.name ?? "", source: m.source ?? "", target: m.target, readonly: !!m.readonly })),
@@ -76,18 +77,12 @@ type Form = ReturnType<typeof toForm>;
 
 function toSpec(spec: Spec, f: Form, kind: string): Spec {
   const next: Spec = structuredClone(spec);
-  if (f.srcType === "git") {
-    next.source = { type: "git", provider: f.provider || null, repo: f.repo.trim(), branch: f.branch.trim() || "main", path: f.path.trim(), watch_paths: lines(f.watch), auto_deploy: f.auto };
-  } else if (f.srcType === "image") next.source = { type: "image", image: f.image.trim() };
+  if (f.srcType === "git") next.source = gitSource(f);
+  else if (f.srcType === "image") next.source = { type: "image", image: f.image.trim() };
   else if (f.srcType === "dockerfile") next.source = { type: "dockerfile", content: f.content };
   else next.source = { type: "compose", yaml: f.yaml };
   if (kind === "compose" && f.srcType === "git") next.compose = { ...(spec.compose ?? {}), file: f.composeFile.trim() || "docker-compose.yml" };
-  next.build =
-    f.build === "dockerfile"
-      ? { type: "dockerfile", path: f.dockerfile.trim() || "Dockerfile", target: f.target.trim() || null }
-      : f.build === "buildpacks"
-        ? { type: "buildpacks", builder: f.builder.trim() || "heroku/builder:24" }
-        : { type: f.build };
+  next.build = buildSpec(f);
   next.build_args = lines(f.buildArgs);
   next.command = f.command.trim() ? splitArgs(f.command) : null;
   next.entrypoint = f.entrypoint.trim() ? splitArgs(f.entrypoint) : null;
@@ -147,11 +142,7 @@ export function ServiceSettings({ c }: { c: Ctx }) {
           {json ? "Back to the form" : "Edit as JSON"}
         </button>
       </div>
-      {json ? (
-        <JsonEditor key={s.updated_at} c={c} onSaved={() => setSaved(true)} />
-      ) : (
-        <SettingsForm key={s.updated_at} c={c} onSaved={() => setSaved(true)} />
-      )}
+      {json ? <JsonEditor key={s.updated_at} c={c} onSaved={() => setSaved(true)} /> : <SettingsForm key={s.updated_at} c={c} onSaved={() => setSaved(true)} />}
     </div>
   );
 }
@@ -159,9 +150,7 @@ export function ServiceSettings({ c }: { c: Ctx }) {
 function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
   const s = c.d.service;
   const canEdit = atLeast(c.d.role, "operator");
-  const [f, setF] = useState(() => toForm(s.spec));
-  const set = (p: Partial<Form>) => setF((x) => ({ ...x, ...p }));
-  const text = (k: keyof Form) => ({ value: f[k] as string, onInput: (e: { currentTarget: { value: string } }) => set({ [k]: e.currentTarget.value }) });
+  const { f, set, bind, reset } = useForm(toForm(s.spec));
   const providers = useApi<{ providers: { id: string; kind: string; name: string }[] }>(f.srcType === "git" ? "/git/providers" : null);
   const next = toSpec(s.spec, f, s.kind);
   const changes = mergePatch(s.spec, next);
@@ -177,6 +166,8 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
   const isDb = s.kind === "database";
   const isCompose = s.kind === "compose";
   const builds = f.srcType === "git" && !isCompose;
+  const port = (i: number, p: Partial<Port>) => set({ ports: patchAt(f.ports, i, p) });
+  const mount = (i: number, p: Partial<MountRow>) => set({ mounts: patchAt(f.mounts, i, p) });
 
   return (
     <form onSubmit={sub.submit}>
@@ -185,9 +176,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Source">
           {isDb ? (
-            <Field label="Image" hint="The image is pinned to an exact version, and major upgrades are manual, so take a backup before changing the major version.">
-              <input class="input font-mono" spellcheck={false} {...text("image")} />
-            </Field>
+            <Input
+              label="Image"
+              hint="The image is pinned to an exact version, and major upgrades are manual, so take a backup before changing the major version."
+              mono
+              {...bind("image")}
+            />
           ) : (
             <>
               <Field label="Type">
@@ -211,99 +205,59 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
               {f.srcType === "git" && (
                 <>
                   <Field label="Repository from">
-                    <Select
-                      value={f.provider}
-                      onChange={(provider) => set({ provider })}
-                      options={[
-                        ["", "A URL (public, or private with a deploy key)"],
-                        ...(providers.data?.providers ?? []).map((p): [string, string] => [p.id, `${p.name} (${PROVIDER_KINDS[p.kind] ?? p.kind})`]),
-                      ]}
-                    />
+                    <Select value={f.provider} onChange={(provider) => set({ provider })} options={providerOptions(providers.data?.providers)} />
                   </Field>
-                  <Field label={f.provider ? "Repository" : "Repository URL"}>
-                    <input class="input font-mono" required spellcheck={false} placeholder={f.provider ? "owner/name" : "https://github.com/owner/app.git"} {...text("repo")} />
-                  </Field>
+                  <Input
+                    label={f.provider ? "Repository" : "Repository URL"}
+                    mono
+                    required
+                    placeholder={f.provider ? "owner/name" : "https://github.com/owner/app.git"}
+                    {...bind("repo")}
+                  />
                   <div class="grid gap-4 sm:grid-cols-2">
-                    <Field label="Branch">
-                      <input class="input font-mono" spellcheck={false} {...text("branch")} />
-                    </Field>
+                    <Input label="Branch" mono {...bind("branch")} />
                     {isCompose ? (
-                      <Field label="Compose file">
-                        <input class="input font-mono" spellcheck={false} {...text("composeFile")} />
-                      </Field>
+                      <Input label="Compose file" mono {...bind("composeFile")} />
                     ) : (
-                      <Field label="Path" hint="This is the build context inside the repository.">
-                        <input class="input font-mono" spellcheck={false} {...text("path")} />
-                      </Field>
+                      <Input label="Path" hint="This is the build context inside the repository." mono {...bind("path")} />
                     )}
                   </div>
                   {!isCompose && (
-                    <Field label="Watch paths" hint="Redeploy only when a push changes these paths, one glob per line. Leave this empty to redeploy on any change.">
-                      <textarea class="input h-20" spellcheck={false} {...text("watch")} />
-                    </Field>
+                    <TextArea
+                      label="Watch paths"
+                      hint="Redeploy only when a push changes these paths, one glob per line. Leave this empty to redeploy on any change."
+                      class="h-20"
+                      {...bind("watch")}
+                    />
                   )}
                   <Check checked={f.auto} onChange={(auto) => set({ auto })} label="Deploy on every push" />
                 </>
               )}
-              {f.srcType === "image" && (
-                <Field label="Image">
-                  <input class="input font-mono" required spellcheck={false} {...text("image")} />
-                </Field>
-              )}
-              {f.srcType === "dockerfile" && (
-                <Field label="Dockerfile">
-                  <textarea class="input h-56" spellcheck={false} {...text("content")} />
-                </Field>
-              )}
-              {f.srcType === "compose" && (
-                <Field label="docker-compose.yml">
-                  <textarea class="input h-72" spellcheck={false} {...text("yaml")} />
-                </Field>
-              )}
+              {f.srcType === "image" && <Input label="Image" mono required {...bind("image")} />}
+              {f.srcType === "dockerfile" && <TextArea label="Dockerfile" class="h-56" {...bind("content")} />}
+              {f.srcType === "compose" && <TextArea label="docker-compose.yml" class="h-72" {...bind("yaml")} />}
             </>
           )}
         </Section>
 
         {builds && (
           <Section title="Build">
-            <Field label="Build method">
-              <Select value={f.build} onChange={(build) => set({ build })} options={BUILDS} />
-            </Field>
-            {f.build === "dockerfile" && (
-              <div class="grid gap-4 sm:grid-cols-2">
-                <Field label="Dockerfile path">
-                  <input class="input font-mono" spellcheck={false} {...text("dockerfile")} />
-                </Field>
-                <Field label="Target stage">
-                  <input class="input font-mono" spellcheck={false} {...text("target")} />
-                </Field>
-              </div>
-            )}
-            {f.build === "buildpacks" && (
-              <Field label="Builder image">
-                <input class="input font-mono" spellcheck={false} {...text("builder")} />
-              </Field>
-            )}
-            <Field label="Variables passed as build arguments" hint="List environment variable names, one per line, to pass in addition to the ARGs the Dockerfile declares.">
-              <textarea class="input h-16" spellcheck={false} {...text("buildArgs")} />
-            </Field>
+            <BuildFields f={f} set={set} bind={bind} />
+            <TextArea
+              label="Variables passed as build arguments"
+              hint="List environment variable names, one per line, to pass in addition to the ARGs the Dockerfile declares."
+              class="h-16"
+              {...bind("buildArgs")}
+            />
           </Section>
         )}
 
         <Section title="Runtime">
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="Command" hint="This replaces the image's command; quote arguments that contain spaces.">
-              <input class="input font-mono" spellcheck={false} placeholder="npm run start" {...text("command")} />
-            </Field>
-            <Field label="Entrypoint">
-              <input class="input font-mono" spellcheck={false} {...text("entrypoint")} />
-            </Field>
-            <Field label="Working directory">
-              <input class="input font-mono" spellcheck={false} {...text("workdir")} />
-            </Field>
-            <Field label="User">
-              <input class="input font-mono" spellcheck={false} placeholder="1000:1000" {...text("user")} />
-            </Field>
+            <Input label="Command" hint="This replaces the image's command; quote arguments that contain spaces." mono placeholder="npm run start" {...bind("command")} />
+            <Input label="Entrypoint" mono {...bind("entrypoint")} />
+            <Input label="Working directory" mono {...bind("workdir")} />
+            <Input label="User" mono placeholder="1000:1000" {...bind("user")} />
           </div>
         </Section>
 
@@ -317,15 +271,9 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Resources">
           <div class="grid gap-4 sm:grid-cols-3">
-            <Field label="CPU limit (cores)">
-              <input class="input" type="number" min={0} step="0.1" placeholder="No limit" {...text("cpus")} />
-            </Field>
-            <Field label="Memory limit (MB)">
-              <input class="input" type="number" min={0} placeholder="No limit" {...text("memory")} />
-            </Field>
-            <Field label="Memory reservation (MB)">
-              <input class="input" type="number" min={0} placeholder="None" {...text("reservation")} />
-            </Field>
+            <Input label="CPU limit (cores)" type="number" min={0} step="0.1" placeholder="No limit" {...bind("cpus")} />
+            <Input label="Memory limit (MB)" type="number" min={0} placeholder="No limit" {...bind("memory")} />
+            <Input label="Memory reservation (MB)" type="number" min={0} placeholder="None" {...bind("reservation")} />
           </div>
         </Section>
 
@@ -344,36 +292,18 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             />
           </Field>
           <div class="grid gap-4 sm:grid-cols-2">
-            {f.hKind === "http" && (
-              <Field label="Path">
-                <input class="input font-mono" {...text("hPath")} />
-              </Field>
-            )}
+            {f.hKind === "http" && <Input label="Path" class="font-mono" {...bind("hPath")} />}
             {(f.hKind === "http" || f.hKind === "tcp") && (
-              <Field label="Port" hint="Leave this empty to use the first domain's port.">
-                <input class="input" type="number" min={1} max={65535} {...text("hPort")} />
-              </Field>
+              <Input label="Port" hint="Leave this empty to use the first domain's port." type="number" min={1} max={65535} {...bind("hPort")} />
             )}
-            {f.hKind === "command" && (
-              <Field label="Command" class="sm:col-span-2">
-                <input class="input font-mono" spellcheck={false} placeholder="pg_isready -U app" {...text("hCommand")} />
-              </Field>
-            )}
+            {f.hKind === "command" && <Input label="Command" fieldClass="sm:col-span-2" mono placeholder="pg_isready -U app" {...bind("hCommand")} />}
           </div>
           {f.hKind !== "none" && (
             <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <Field label="Interval (s)">
-                <input class="input" type="number" min={1} {...text("hInterval")} />
-              </Field>
-              <Field label="Timeout (s)">
-                <input class="input" type="number" min={1} {...text("hTimeout")} />
-              </Field>
-              <Field label="Retries">
-                <input class="input" type="number" min={0} {...text("hRetries")} />
-              </Field>
-              <Field label="Start period (s)">
-                <input class="input" type="number" min={0} {...text("hStart")} />
-              </Field>
+              <Input label="Interval (s)" type="number" min={1} {...bind("hInterval")} />
+              <Input label="Timeout (s)" type="number" min={1} {...bind("hTimeout")} />
+              <Input label="Retries" type="number" min={0} {...bind("hRetries")} />
+              <Input label="Start period (s)" type="number" min={0} {...bind("hStart")} />
             </div>
           )}
         </Section>
@@ -398,15 +328,9 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             />
           </Field>
           <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
-            <Field label="Drain time (s)" hint="Old replicas get this long to finish their requests.">
-              <input class="input" type="number" min={0} {...text("drain")} />
-            </Field>
-            <Field label="Health timeout (s)" hint="A new version gets this long to become healthy.">
-              <input class="input" type="number" min={1} {...text("healthTimeout")} />
-            </Field>
-            <Field label="Images kept" hint="Old images stay for one-click rollbacks.">
-              <input class="input" type="number" min={1} {...text("keepImages")} />
-            </Field>
+            <Input label="Drain time (s)" hint="Old replicas get this long to finish their requests." type="number" min={0} {...bind("drain")} />
+            <Input label="Health timeout (s)" hint="A new version gets this long to become healthy." type="number" min={1} {...bind("healthTimeout")} />
+            <Input label="Images kept" hint="Old images stay for one-click rollbacks." type="number" min={1} {...bind("keepImages")} />
           </div>
           <Field label="When a deploy starts while another one runs">
             <Select
@@ -425,16 +349,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
           <p class="text-xs text-muted">Published ports open on the server's own address, which suits TCP and UDP services. HTTP apps should get a domain instead.</p>
           {f.ports.map((p, i) => (
             <div key={i} class="grid grid-cols-[1fr_1fr_6rem_auto] items-end gap-2">
-              <Field label="Container port">
-                <input class="input" type="number" min={1} max={65535} value={p.container} onInput={(e) => set({ ports: f.ports.map((x, j) => (j === i ? { ...x, container: e.currentTarget.value } : x)) })} />
-              </Field>
-              <Field label="Server port">
-                <input class="input" type="number" min={1} max={65535} value={p.host} placeholder={p.container} onInput={(e) => set({ ports: f.ports.map((x, j) => (j === i ? { ...x, host: e.currentTarget.value } : x)) })} />
-              </Field>
+              <Input label="Container port" type="number" min={1} max={65535} value={p.container} onInput={(e) => port(i, { container: e.currentTarget.value })} />
+              <Input label="Server port" type="number" min={1} max={65535} value={p.host} placeholder={p.container} onInput={(e) => port(i, { host: e.currentTarget.value })} />
               <Field label="Protocol">
-                <Select value={p.protocol} options={["tcp", "udp"]} onChange={(protocol) => set({ ports: f.ports.map((x, j) => (j === i ? { ...x, protocol } : x)) })} />
+                <Select value={p.protocol} options={["tcp", "udp"]} onChange={(protocol) => port(i, { protocol })} />
               </Field>
-              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ ports: f.ports.filter((_, j) => j !== i) })}>
+              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ ports: removeAt(f.ports, i) })}>
                 Remove
               </button>
             </div>
@@ -446,39 +366,42 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Mounts">
           <p class="text-xs text-muted">
-            Volumes keep data across deploys. Bind mounts reach into the server's file system, so they need the admin role and the destroy grant. Files are managed on the Files tab.
+            Volumes keep data across deploys. Bind mounts reach into the server's file system, so they need the admin role and the destroy grant. Files are managed on the Files
+            tab.
           </p>
-          {f.mounts.map((m, i) => {
-            const upd = (p: Partial<MountRow>) => set({ mounts: f.mounts.map((x, j) => (j === i ? { ...x, ...p } : x)) });
-            return (
-              <div key={i} class="grid items-end gap-2 sm:grid-cols-[7rem_1fr_1fr_auto_auto]">
-                <Field label="Type">
-                  <Select value={m.type} options={[["volume", "Volume"], ["bind", "Bind"]]} onChange={(type) => upd({ type })} />
-                </Field>
-                {m.type === "bind" ? (
-                  <Field label="Server path">
-                    <input class="input font-mono" placeholder="/srv/data" value={m.source} onInput={(e) => upd({ source: e.currentTarget.value })} />
-                  </Field>
-                ) : (
-                  <Field label="Volume name">
-                    <input class="input font-mono" value={m.name} onInput={(e) => upd({ name: e.currentTarget.value })} />
-                  </Field>
-                )}
-                <Field label="Path in the container">
-                  <input class="input font-mono" value={m.target} onInput={(e) => upd({ target: e.currentTarget.value })} />
-                </Field>
-                <label class="flex items-center gap-2 pb-2">
-                  <input type="checkbox" checked={m.readonly} onChange={(e) => upd({ readonly: e.currentTarget.checked })} />
-                  Read-only
-                </label>
-                <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ mounts: f.mounts.filter((_, j) => j !== i) })}>
-                  Remove
-                </button>
-              </div>
-            );
-          })}
+          {f.mounts.map((m, i) => (
+            <div key={i} class="grid items-end gap-2 sm:grid-cols-[7rem_1fr_1fr_auto_auto]">
+              <Field label="Type">
+                <Select
+                  value={m.type}
+                  options={[
+                    ["volume", "Volume"],
+                    ["bind", "Bind"],
+                  ]}
+                  onChange={(type) => mount(i, { type })}
+                />
+              </Field>
+              {m.type === "bind" ? (
+                <Input label="Server path" class="font-mono" placeholder="/srv/data" value={m.source} onInput={(e) => mount(i, { source: e.currentTarget.value })} />
+              ) : (
+                <Input label="Volume name" class="font-mono" value={m.name} onInput={(e) => mount(i, { name: e.currentTarget.value })} />
+              )}
+              <Input label="Path in the container" class="font-mono" value={m.target} onInput={(e) => mount(i, { target: e.currentTarget.value })} />
+              <label class="flex items-center gap-2 pb-2">
+                <input type="checkbox" checked={m.readonly} onChange={(e) => mount(i, { readonly: e.currentTarget.checked })} />
+                Read-only
+              </label>
+              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ mounts: removeAt(f.mounts, i) })}>
+                Remove
+              </button>
+            </div>
+          ))}
           {isDb && f.mounts.length > 0 && <p class="text-xs text-warn">Removing the data volume of a database loses its files on the next deploy.</p>}
-          <button type="button" class="btn" onClick={() => set({ mounts: [...f.mounts, { type: "volume", name: `tp-${s.project}-${s.name}-data`, source: "", target: "", readonly: false }] })}>
+          <button
+            type="button"
+            class="btn"
+            onClick={() => set({ mounts: [...f.mounts, { type: "volume", name: `tp-${s.project}-${s.name}-data`, source: "", target: "", readonly: false }] })}
+          >
             Add mount
           </button>
         </Section>
@@ -492,12 +415,8 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
           />
           <Check checked={f.gpu} onChange={(gpu) => set({ gpu })} label="GPU access" hint="The containers get access to the server's GPUs." />
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="Add capabilities" hint="Write one per line, like NET_ADMIN; adding them needs the destroy grant.">
-              <textarea class="input h-16" spellcheck={false} {...text("capAdd")} />
-            </Field>
-            <Field label="Drop capabilities" hint="Write one per line, like ALL.">
-              <textarea class="input h-16" spellcheck={false} {...text("capDrop")} />
-            </Field>
+            <TextArea label="Add capabilities" hint="Write one per line, like NET_ADMIN; adding them needs the destroy grant." class="h-16" {...bind("capAdd")} />
+            <TextArea label="Drop capabilities" hint="Write one per line, like ALL." class="h-16" {...bind("capDrop")} />
           </div>
           <div class="space-y-3 rounded-md border border-bad/40 p-3">
             <p class="text-xs text-bad">These switches give the service control over the whole server. Turning them on needs the admin role and the destroy grant.</p>
@@ -505,21 +424,33 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
               checked={f.privileged}
               onChange={(privileged) => set({ privileged })}
               label="Privileged mode"
-              hint={isCompose ? "For a Compose stack this also allows host-level Compose options, such as bind mounts outside its folder, the Docker socket and host networking." : undefined}
+              hint={
+                isCompose
+                  ? "For a Compose stack this also allows host-level Compose options, such as bind mounts outside its folder, the Docker socket and host networking."
+                  : undefined
+              }
             />
             <Check checked={f.socket} onChange={(socket) => set({ socket })} label="Docker socket" hint="The service can then start and stop any container on the server." />
-            <Check checked={f.hostNet} onChange={(hostNet) => set({ hostNet })} label="Host networking" hint="The service then shares the server's network stack instead of the project network." />
+            <Check
+              checked={f.hostNet}
+              onChange={(hostNet) => set({ hostNet })}
+              label="Host networking"
+              hint="The service then shares the server's network stack instead of the project network."
+            />
           </div>
         </Section>
 
         {f.srcType === "image" && !isDb && (
           <Section title="Image auto-update">
-            <Check checked={f.auEnabled} onChange={(auEnabled) => set({ auEnabled })} label="Update the image automatically" hint="New images roll out with health checks and roll back if they fail." />
+            <Check
+              checked={f.auEnabled}
+              onChange={(auEnabled) => set({ auEnabled })}
+              label="Update the image automatically"
+              hint="New images roll out with health checks and roll back if they fail."
+            />
             {f.auEnabled && (
               <div class="grid gap-4 sm:grid-cols-2">
-                <Field label="Check every (minutes)">
-                  <input class="input" type="number" min={5} {...text("auInterval")} />
-                </Field>
+                <Input label="Check every (minutes)" type="number" min={5} {...bind("auInterval")} />
                 <Field label="Follow">
                   <Select
                     value={f.auPolicy}
@@ -536,28 +467,10 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
         )}
       </fieldset>
 
-      {canEdit && dirty && (
-        <div class="sticky bottom-0 z-10 -mx-4 mt-6 flex flex-wrap items-center justify-between gap-2 border-t border-line bg-surface px-4 py-3 md:mx-0 md:rounded-lg md:border">
-          <span class="text-dim">You have unsaved changes.</span>
-          <span class="flex gap-2">
-            <button type="button" class="btn" onClick={() => setF(toForm(s.spec))}>
-              Discard
-            </button>
-            <button class="btn btn-primary" disabled={sub.busy}>
-              Save settings
-            </button>
-          </span>
-          {sub.error && (
-            <div class="w-full">
-              <ErrorBox error={sub.error} />
-            </div>
-          )}
-        </div>
-      )}
+      {canEdit && dirty && <UnsavedBar s={sub} onDiscard={reset} />}
     </form>
   );
 }
-
 const HEALTH_HELP: Record<string, string> = {
   auto: "Tugport uses the image's HEALTHCHECK if it has one, then an HTTP check on the first domain's port, and otherwise only checks that the container keeps running.",
   http: "A new version gets traffic once this path answers with a 2xx or 3xx status.",
@@ -609,11 +522,16 @@ export function PlacementFields(props: { nodes: Node[] | undefined; rules: Rules
             ))}
           </datalist>
         </Field>
-        <Field label="Labels" hint="Write key=value pairs, separated by commas or new lines. Only servers with every one of these labels qualify.">
-          <textarea class="input h-16" spellcheck={false} placeholder="disk=ssd" value={f.labels} onInput={(e) => set({ labels: e.currentTarget.value })} />
-        </Field>
+        <TextArea
+          label="Labels"
+          hint="Write key=value pairs, separated by commas or new lines. Only servers with every one of these labels qualify."
+          class="h-16"
+          placeholder="disk=ssd"
+          value={f.labels}
+          onInput={(e) => set({ labels: e.currentTarget.value })}
+        />
       </div>
-      {!labels && <p class="text-sm text-bad">Write each label as key=value, separated by commas or new lines.</p>}
+      {!labels && <p class="text-sm text-bad">{LABELS_HINT}</p>}
       {matches &&
         (matches.length ? (
           <p class="text-dim">Servers that match right now: {and(matches.map((n) => n.name))}.</p>
@@ -632,7 +550,7 @@ function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; ne
   return (
     <Section title="Placement and replicas">
       <PlacementFields nodes={props.c.nodes?.nodes} rules={f} set={set}>
-        <Field
+        <Input
           label="Replicas"
           hint={
             kind === "database"
@@ -641,9 +559,13 @@ function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; ne
                 ? "Every replica runs on the same server."
                 : "Replicas spread over the matching servers, and each one gets traffic once it is healthy."
           }
-        >
-          <input class="input" type="number" min={0} max={100} disabled={kind === "database"} value={f.replicas} onInput={(e) => set({ replicas: e.currentTarget.value })} />
-        </Field>
+          type="number"
+          min={0}
+          max={100}
+          disabled={kind === "database"}
+          value={f.replicas}
+          onInput={(e) => set({ replicas: e.currentTarget.value })}
+        />
       </PlacementFields>
       {reasons.length > 0 && props.moved && (
         <Note tone="warn">
@@ -652,8 +574,8 @@ function Placement(props: { c: Ctx; f: Form; set: (p: Partial<Form>) => void; ne
       )}
       <p class="text-xs text-muted">
         {reasons.length > 0 && `This service stays on one server because ${and(reasons)}. `}
-        Databases and services with volumes, bind mounts, published ports, host networking or the Docker socket stay on one server, because their data or ports live there.
-        Other services spread their replicas over every online server that matches.
+        Databases and services with volumes, bind mounts, published ports, host networking or the Docker socket stay on one server, because their data or ports live there. Other
+        services spread their replicas over every online server that matches.
       </p>
     </Section>
   );
@@ -681,7 +603,14 @@ function JsonEditor({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
     <Card title="Service spec">
       <form class="space-y-3" onSubmit={sub.submit}>
         <p class="text-xs text-muted">Saving sends only the fields you changed, as a JSON merge patch. Removing a field resets it to its default.</p>
-        <textarea class="input h-[60vh]" spellcheck={false} aria-label="Service spec as JSON" value={text} onInput={(e) => setText(e.currentTarget.value)} disabled={!atLeast(c.d.role, "operator")} />
+        <textarea
+          class="input h-[60vh]"
+          spellcheck={false}
+          aria-label="Service spec as JSON"
+          value={text}
+          onInput={(e) => setText(e.currentTarget.value)}
+          disabled={!atLeast(c.d.role, "operator")}
+        />
         <ErrorBox error={sub.error} />
         {atLeast(c.d.role, "operator") && (
           <button class="btn btn-primary" disabled={sub.busy}>

@@ -11,7 +11,15 @@ export function sentence(msg: string): string {
 const isObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === "object" && !Array.isArray(x);
 /** Key order differs between the API (sorted) and objects the forms build, so it must not count. */
 const sorted = (x: unknown): unknown =>
-  Array.isArray(x) ? x.map(sorted) : isObj(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, sorted(x[k])])) : x;
+  Array.isArray(x)
+    ? x.map(sorted)
+    : isObj(x)
+      ? Object.fromEntries(
+          Object.keys(x)
+            .sort()
+            .map((k) => [k, sorted(x[k])]),
+        )
+      : x;
 const same = (a: unknown, b: unknown) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
 
 /** RFC 7386 JSON merge patch that turns `a` into `b`. Arrays are replaced whole; removed keys become null. */
@@ -80,11 +88,14 @@ export function splitArgs(s: string): string[] {
   return out;
 }
 
-export const joinArgs = (a: string[]) =>
-  a.map((x) => (/^[\w@%+=:,./-]+$/.test(x) ? x : `'${x.replace(/'/g, `'\\''`)}'`)).join(" ");
+export const joinArgs = (a: string[]) => a.map((x) => (/^[\w@%+=:,./-]+$/.test(x) ? x : `'${x.replace(/'/g, `'\\''`)}'`)).join(" ");
 
 /** One entry per line, trimmed, blanks dropped. */
-export const lines = (s: string) => s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+export const lines = (s: string) =>
+  s
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
 /** Entries separated by commas, spaces or newlines. */
 export const words = (s: string) => s.split(/[\s,]+/).filter(Boolean);
 /** "disk=ssd, gpu=yes" (commas or new lines) -> {disk: "ssd", gpu: "yes"}; null when an entry lacks a key or a value. */
@@ -96,6 +107,13 @@ export function parseLabels(text: string): Record<string, string> | null {
     out[w.slice(0, eq)] = w.slice(eq + 1);
   }
   return out;
+}
+export const LABELS_HINT = "Write each label as key=value, separated by commas or new lines.";
+/** parseLabels for a form being submitted: badly written labels stop it with LABELS_HINT. */
+export function requireLabels(text: string): Record<string, string> {
+  const labels = parseLabels(text);
+  if (!labels) throw new Error(LABELS_HINT);
+  return labels;
 }
 export const labelsText = (l: Record<string, string> | null | undefined) =>
   Object.entries(l ?? {})
@@ -154,6 +172,35 @@ export function sizeLabel(s: MachineSize, region: string): string {
   return `${s.id}: ${parts.filter(Boolean).join(", ")}${isNaN(price) ? "" : `, €${price.toFixed(4)} an hour`}`;
 }
 
+/** null and undefined -> "", anything else as text (form fields hold numbers as strings). */
+export const str = (v: unknown) => (v == null ? "" : String(v));
+/** A copy of `list` with row `i` changed, for forms that edit a list of rows. */
+export const patchAt = <T>(list: T[], i: number, p: Partial<T>) => list.map((x, j) => (j === i ? { ...x, ...p } : x));
+export const removeAt = <T>(list: T[], i: number) => list.filter((_, j) => j !== i);
+
+/** The parameters when `path` fits a pattern like "/projects/:project/:tab?", otherwise null. */
+export function matchPath(pattern: string, path: string): Record<string, string> | null {
+  const want = pattern.split("/").filter(Boolean);
+  const got = path.split("/").filter(Boolean);
+  if (got.length > want.length) return null;
+  const out: Record<string, string> = {};
+  for (const [i, w] of want.entries()) {
+    const v = got[i];
+    if (w[0] !== ":") {
+      if (w !== v) return null;
+    } else if (v === undefined) {
+      if (!w.endsWith("?")) return null;
+    } else {
+      try {
+        out[w.slice(1).replace(/\?$/, "")] = decodeURIComponent(v);
+      } catch {
+        return null; // a malformed %-escape
+      }
+    }
+  }
+  return out;
+}
+
 /** "10.0.0.7" -> "10.0.0.7/32": the API takes CIDR ranges only. */
 export const cidr = (s: string) => (s.includes("/") ? s : s.includes(":") ? `${s}/128` : `${s}/32`);
 /** "" -> null, "12" -> 12 (number inputs map to optional numbers). */
@@ -178,8 +225,7 @@ export function ago(sec: number | null | undefined): string {
   return rtf.format(Math.round(d / UNIT[unit]), unit);
 }
 
-export const when = (sec: number | null | undefined) =>
-  sec ? new Date(sec * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "";
+export const when = (sec: number | null | undefined) => (sec ? new Date(sec * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "");
 
 export const clock = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour12: false });
 

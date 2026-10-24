@@ -6,50 +6,44 @@ use crate::app::{App, AppState};
 use crate::model::Engine;
 use crate::{databases, runtime, store, util};
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde_json::Value;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 
 const RESTIC: &str = "restic/restic:0.19.1";
 
 pub struct Target {
-    pub id: String,
-    pub kind: String,
-    pub config: Value,
+    id: String,
+    kind: String,
+    config: Value,
 }
 
 pub struct Job {
     pub id: String,
     pub service_id: Option<String>,
-    pub target_id: String,
+    target_id: String,
     pub kind: String,
-    pub volume: Option<String>,
-    pub keep_last: i64,
+    volume: Option<String>,
+    keep_last: i64,
 }
 
 pub fn target(app: &App, id: &str) -> Result<Target> {
-    let (kind, config): (String, Vec<u8>) = app
-        .db
-        .conn()
-        .query_row("SELECT kind, config FROM backup_targets WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?
-        .ok_or_else(|| anyhow!("backup target {id} not found"))?;
+    let (kind, config): (String, Vec<u8>) =
+        app.db.row("SELECT kind, config FROM backup_targets WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?.ok_or_else(|| anyhow!("backup target {id} not found"))?;
     let config = serde_json::from_str(&app.keys.open_str(&format!("backup-target:{id}"), &config)?)?;
     Ok(Target { id: id.into(), kind, config })
 }
 
 pub fn job(app: &App, id: &str) -> Result<Job> {
     app.db
-        .conn()
-        .query_row("SELECT id, service_id, target_id, kind, volume, keep_last FROM backup_jobs WHERE id = ?1", [id], |r| {
+        .row("SELECT id, service_id, target_id, kind, volume, keep_last FROM backup_jobs WHERE id = ?1", [id], |r| {
             Ok(Job { id: r.get(0)?, service_id: r.get(1)?, target_id: r.get(2)?, kind: r.get(3)?, volume: r.get(4)?, keep_last: r.get(5)? })
-        })
-        .optional()?
+        })?
         .ok_or_else(|| anyhow!("backup job {id} not found"))
 }
 
@@ -91,12 +85,11 @@ fn repo(app: &App, t: &Target) -> Result<Repo> {
         }
         other => bail!("unknown target kind {other}"),
     }
-    let env_file = app.paths.run.join(format!("restic-{}.env", util::id()));
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&env_file)?;
-    for (k, v) in env {
-        writeln!(f, "{k}={v}")?;
-    }
-    Ok(Repo { env_file, mounts })
+    // Made first, so a failed write is cleaned up too.
+    let repo = Repo { env_file: app.paths.run.join(format!("restic-{}.env", util::id())), mounts };
+    let lines: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    util::write_private(&repo.env_file, lines.as_bytes())?;
+    Ok(repo)
 }
 
 fn restic_cmd(repo: &Repo, extra_mounts: &[String], args: &[&str]) -> Command {
@@ -123,28 +116,21 @@ async fn ensure_repo(repo: &Repo) -> Result<()> {
     Ok(())
 }
 
-fn dump_name(engine: Engine) -> &'static str {
-    match engine {
-        Engine::Postgres => "dump.pgc",
-        Engine::Mysql | Engine::Mariadb => "dump.sql",
-        Engine::Mongo => "dump.archive.gz",
-        Engine::Redis => "dump.rdb",
-    }
-}
-
 /// The server a job's volume lives on: its service's server, else this one.
 fn volume_node(app: &App, j: &Job) -> String {
-    j.service_id.as_ref().and_then(|sid| app.db.get_state(&format!("pin:{sid}")).ok().flatten()).unwrap_or_else(|| "local".into())
+    j.service_id.as_ref().and_then(|sid| app.db.state::<String>(&format!("pin:{sid}"))).unwrap_or_else(|| "local".into())
 }
 
-/// The running container of a service's live deploy.
-async fn live_container(app: &App, service_id: &str) -> Result<runtime::Replica> {
-    let live = runtime::live_deploy(app, service_id);
-    runtime::replicas(app, service_id)
-        .await?
-        .into_iter()
-        .find(|r| r.state == "running" && live.as_deref().is_none_or(|l| r.deploy == l))
-        .ok_or_else(|| anyhow!("the service is not running"))
+/// `docker exec` of a shell command in a container, through Tugport's init (so with the
+/// container's environment). `stdin` keeps standard input open for a pipe.
+pub fn exec_cli(app: &App, node: &str, container: &str, stdin: bool, script: &str) -> Result<Command> {
+    let mut c = crate::nodes::docker_cli(app, node)?;
+    c.arg("exec");
+    if stdin {
+        c.arg("-i");
+    }
+    c.args([container, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", script]);
+    Ok(c)
 }
 
 /// Run `producer`'s stdout into `consumer`'s stdin; returns the consumer's stdout.
@@ -155,21 +141,21 @@ pub async fn pipe(mut producer: Command, mut consumer: Command) -> Result<String
     let mut c = consumer.spawn()?;
     let mut from = p.stdout.take().ok_or_else(|| anyhow!("no producer stdout"))?;
     let mut to = c.stdin.take().ok_or_else(|| anyhow!("no consumer stdin"))?;
-    let copy = tokio::spawn(async move {
+    let copy = async move {
         let n = tokio::io::copy(&mut from, &mut to).await;
         drop(to);
         n
-    });
-    let p_out = p.wait_with_output().await?;
-    let copied = copy.await.map_err(|e| anyhow!("copy task failed: {e}"))??;
-    let c_out = c.wait_with_output().await?;
+    };
+    // All at once: a consumer that writes a lot (restic's progress) must not stall the copy.
+    let (p_out, c_out, copied) = tokio::join!(p.wait_with_output(), c.wait_with_output(), copy);
+    let (p_out, c_out) = (p_out?, c_out?);
     if !p_out.status.success() {
         bail!("the dump failed: {}", String::from_utf8_lossy(&p_out.stderr).trim());
     }
     if !c_out.status.success() {
         bail!("restic failed: {}", String::from_utf8_lossy(&c_out.stderr).trim());
     }
-    if copied == 0 {
+    if copied? == 0 {
         bail!("the dump was empty");
     }
     Ok(String::from_utf8_lossy(&c_out.stdout).to_string())
@@ -178,19 +164,37 @@ pub async fn pipe(mut producer: Command, mut consumer: Command) -> Result<String
 fn summary(json_lines: &str) -> (Option<String>, Option<i64>) {
     for line in json_lines.lines().rev() {
         if let Ok(v) = serde_json::from_str::<Value>(line)
-            && v["message_type"] == "summary" {
-                let size = v["total_bytes_processed"].as_i64().or(v["data_added"].as_i64());
-                return (v["snapshot_id"].as_str().map(String::from), size);
-            }
+            && v["message_type"] == "summary"
+        {
+            let size = v["total_bytes_processed"].as_i64().or(v["data_added"].as_i64());
+            return (v["snapshot_id"].as_str().map(String::from), size);
+        }
     }
     (None, None)
 }
 
 /// Runs left mid-way by a crash or restart: mark them failed.
 pub fn recover_interrupted(app: &App) -> Result<()> {
-    app.db.conn().execute(
-        "UPDATE backup_runs SET status = 'failed', error = 'Tugport restarted during this run', finished_at = ?1 WHERE status = 'running'",
-        [util::now()],
+    app.db.exec("UPDATE backup_runs SET status = 'failed', error = 'Tugport restarted during this run', finished_at = ?1 WHERE status = 'running'", [util::now()])?;
+    Ok(())
+}
+
+/// Record a run (backup, restore or test-restore) as started; returns its id.
+fn start_run(app: &App, job_id: &str, kind: &str, snapshot: Option<&str>) -> Result<String> {
+    let id = util::id();
+    app.db.exec(
+        "INSERT INTO backup_runs (id, job_id, kind, status, snapshot, started_at) VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+        params![id, job_id, kind, snapshot, util::now()],
+    )?;
+    Ok(id)
+}
+
+/// Record how a run ended; a restore keeps the snapshot it started from.
+fn end_run(app: &App, id: &str, error: Option<&str>, snapshot: Option<&str>, size: Option<i64>) -> Result<()> {
+    let status = if error.is_some() { "failed" } else { "ok" };
+    app.db.exec(
+        "UPDATE backup_runs SET status = ?1, error = ?2, snapshot = COALESCE(?3, snapshot), size_bytes = ?4, finished_at = ?5 WHERE id = ?6",
+        params![status, error, snapshot, size, util::now(), id],
     )?;
     Ok(())
 }
@@ -198,23 +202,13 @@ pub fn recover_interrupted(app: &App) -> Result<()> {
 /// Run a backup job now. Returns the run id.
 pub async fn run_job(app: &AppState, job_id: &str) -> Result<String> {
     let j = job(app, job_id)?;
-    let run_id = util::id();
-    app.db.conn().execute(
-        "INSERT INTO backup_runs (id, job_id, kind, status, started_at) VALUES (?1, ?2, 'backup', 'running', ?3)",
-        params![run_id, j.id, util::now()],
-    )?;
+    let run_id = start_run(app, &j.id, "backup", None)?;
     let result = backup(app, &j).await;
-    let now = util::now();
     match &result {
-        Ok((snapshot, size)) => {
-            app.db.conn().execute(
-                "UPDATE backup_runs SET status = 'ok', snapshot = ?1, size_bytes = ?2, finished_at = ?3 WHERE id = ?4",
-                params![snapshot, size, now, run_id],
-            )?;
-        }
+        Ok((snapshot, size)) => end_run(app, &run_id, None, snapshot.as_deref(), *size)?,
         Err(e) => {
             let msg = format!("{e:#}");
-            app.db.conn().execute("UPDATE backup_runs SET status = 'failed', error = ?1, finished_at = ?2 WHERE id = ?3", params![msg, now, run_id])?;
+            end_run(app, &run_id, Some(&msg), None, None)?;
             let s = j.service_id.as_deref().and_then(|id| store::service(app, id).ok().flatten());
             let what = s.as_ref().map(|s| format!("{}/{}", s.project, s.name)).unwrap_or_else(|| "Tugport".into());
             crate::notify::event(app, "backup.failed", &format!("Backup of {what} failed"), &msg, s.as_ref()).await;
@@ -224,6 +218,14 @@ pub async fn run_job(app: &AppState, job_id: &str) -> Result<String> {
     result.map(|_| run_id)
 }
 
+/// A database job's service and engine.
+fn database(app: &App, j: &Job) -> Result<(store::Service, Engine)> {
+    let sid = j.service_id.as_deref().ok_or_else(|| anyhow!("database backups need a service"))?;
+    let s = store::service(app, sid)?.ok_or_else(|| anyhow!("the service was deleted"))?;
+    let engine = s.spec.database.as_ref().map(|d| d.engine).ok_or_else(|| anyhow!("{} is not a database", s.name))?;
+    Ok((s, engine))
+}
+
 async fn backup(app: &App, j: &Job) -> Result<(Option<String>, Option<i64>)> {
     let t = target(app, &j.target_id)?;
     let repo = repo(app, &t)?;
@@ -231,13 +233,10 @@ async fn backup(app: &App, j: &Job) -> Result<(Option<String>, Option<i64>)> {
     let job_tag = format!("job:{}", j.id);
     let out = match j.kind.as_str() {
         "database" => {
-            let sid = j.service_id.as_deref().ok_or_else(|| anyhow!("database backups need a service"))?;
-            let s = store::service(app, sid)?.ok_or_else(|| anyhow!("the service was deleted"))?;
-            let engine = s.spec.database.as_ref().map(|d| d.engine).ok_or_else(|| anyhow!("{} is not a database", s.name))?;
-            let ctr = live_container(app, &s.id).await?;
-            let mut dump = crate::nodes::docker_cli(app, &ctr.node)?;
-            dump.args(["exec", &ctr.id, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", databases::dump_command(engine)]);
-            let filename = format!("{}/{}", s.name, dump_name(engine));
+            let (s, engine) = database(app, j)?;
+            let ctr = runtime::running_replica(app, &s).await?;
+            let dump = exec_cli(app, &ctr.node, &ctr.id, false, databases::preset(engine).dump)?;
+            let filename = format!("{}/{}", s.name, databases::preset(engine).dump_file);
             let restic = restic_cmd(&repo, &[], &["backup", "--json", "--stdin", "--stdin-filename", &filename, "--tag", "tugport", "--tag", &job_tag]);
             pipe(dump, restic).await?
         }
@@ -267,16 +266,12 @@ async fn backup(app: &App, j: &Job) -> Result<(Option<String>, Option<i64>)> {
 /// Restore a run in place, or (test) into a throwaway copy that is checked and removed.
 pub async fn restore(app: &AppState, run_id: &str, test: bool) -> Result<String> {
     let (job_id, snapshot): (String, Option<String>) =
-        app.db.conn().query_row("SELECT job_id, snapshot FROM backup_runs WHERE id = ?1", [run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        app.db.row("SELECT job_id, snapshot FROM backup_runs WHERE id = ?1", [run_id], |r| Ok((r.get(0)?, r.get(1)?)))?.ok_or_else(|| anyhow!("backup run {run_id} not found"))?;
     let snapshot = snapshot.ok_or_else(|| anyhow!("this run has no snapshot"))?;
     let j = job(app, &job_id)?;
     let t = target(app, &j.target_id)?;
     let repo = repo(app, &t)?;
-    let restore_id = util::id();
-    app.db.conn().execute(
-        "INSERT INTO backup_runs (id, job_id, kind, status, snapshot, started_at) VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
-        params![restore_id, j.id, if test { "test-restore" } else { "restore" }, snapshot, util::now()],
-    )?;
+    let restore_id = start_run(app, &j.id, if test { "test-restore" } else { "restore" }, Some(&snapshot))?;
     let result = match j.kind.as_str() {
         "database" => restore_database(app, &j, &repo, &snapshot, test).await,
         "volume" if !test => restore_volume(app, &j, &repo, &snapshot).await,
@@ -284,11 +279,7 @@ pub async fn restore(app: &AppState, run_id: &str, test: bool) -> Result<String>
         "state" => restore_state(app, &repo, &snapshot).await,
         other => Err(anyhow!("unknown backup kind {other}")),
     };
-    let (status, err) = match &result {
-        Ok(_) => ("ok", None),
-        Err(e) => ("failed", Some(format!("{e:#}"))),
-    };
-    app.db.conn().execute("UPDATE backup_runs SET status = ?1, error = ?2, finished_at = ?3 WHERE id = ?4", params![status, err, util::now(), restore_id])?;
+    end_run(app, &restore_id, result.as_ref().err().map(|e| format!("{e:#}")).as_deref(), None, None)?;
     result
 }
 
@@ -299,31 +290,36 @@ async fn verify_snapshot(repo: &Repo, snapshot: &str) -> Result<String> {
 }
 
 async fn restore_database(app: &AppState, j: &Job, repo: &Repo, snapshot: &str, test: bool) -> Result<String> {
-    let sid = j.service_id.as_deref().ok_or_else(|| anyhow!("no service"))?;
-    let s = store::service(app, sid)?.ok_or_else(|| anyhow!("the service was deleted"))?;
-    let engine = s.spec.database.as_ref().map(|d| d.engine).ok_or_else(|| anyhow!("not a database"))?;
+    let (s, engine) = database(app, j)?;
     if engine == Engine::Redis && !test {
         bail!("restoring Redis replaces its data file; stop the service and use the volume backup instead");
     }
-    let path = format!("/{}/{}", s.name, dump_name(engine));
+    let db = databases::preset(engine);
+    let path = format!("/{}/{}", s.name, db.dump_file);
     let (node, container, scratch_name) = if test {
         let (node, id, name) = scratch_database(app, &s).await?;
         (node, id, Some(name))
     } else {
-        let r = live_container(app, &s.id).await?;
+        let r = runtime::running_replica(app, &s).await?;
         (r.node, r.id, None)
     };
-    let dump = restic_cmd(repo, &[], &["dump", snapshot, &path]);
-    let mut load = crate::nodes::docker_cli(app, &node)?;
-    load.args(["exec", "-i", &container, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", databases::restore_command(engine)]);
-    let result = pipe(dump, load).await;
-    let check = if test && result.is_ok() { check_database(app, engine, &node, &container).await } else { Ok(String::new()) };
-    if let Some(name) = scratch_name {
-        let _ = runtime::remove(app, &node, &container, &name).await;
+    // The temporary copy goes whatever happens from here on.
+    let result = async {
+        let load = exec_cli(app, &node, &container, true, db.restore)?;
+        pipe(restic_cmd(repo, &[], &["dump", snapshot, &path]), load).await?;
+        if !test {
+            return Ok("Restored in place.".to_string());
+        }
+        let count = crate::proc::output(exec_cli(app, &node, &container, false, db.count)?).await?;
+        Ok(format!("Test restore succeeded. The restored copy reports {} tables/collections/keys.", count.trim()))
     }
-    result?;
-    let detail = check?;
-    Ok(if test { format!("Test restore succeeded. {detail}") } else { "Restored in place.".into() })
+    .await;
+    if let Some(name) = scratch_name
+        && let Err(e) = runtime::remove(app, &node, &container, &name).await
+    {
+        tracing::warn!("removing the test restore {name}: {e:#}");
+    }
+    result
 }
 
 /// A temporary copy of a database service (same image and credentials, empty data) on
@@ -342,29 +338,16 @@ async fn scratch_database(app: &AppState, s: &store::Service) -> Result<(String,
     let node = crate::nodes::home(app, s)?;
     crate::nodes::ship_image(app, &node, s, image, &|_| {}).await?;
     let id = runtime::create_replica(app, &node, &copy, "restoretest", 1, image, &img, &network, false).await?;
-    if let Err(e) = runtime::start(app, &node.id, &id).await {
+    let started = async {
+        runtime::start(app, &node.id, &id).await?;
+        runtime::wait_healthy(app, &copy, &node.id, &id, &network, Duration::from_secs(120), img.has_healthcheck, &|_| {}).await.context("the temporary database did not start")
+    }
+    .await;
+    if let Err(e) = started {
         let _ = runtime::remove(app, &node.id, &id, &name).await;
         return Err(e);
     }
-    if let Err(e) = runtime::wait_healthy(app, &copy, &node.id, &id, &network, Duration::from_secs(120), img.has_healthcheck, &|_| {}).await {
-        let _ = runtime::remove(app, &node.id, &id, &name).await;
-        return Err(e.context("the temporary database did not start"));
-    }
     Ok((node.id.clone(), id, name))
-}
-
-async fn check_database(app: &App, engine: Engine, node: &str, container: &str) -> Result<String> {
-    let query = match engine {
-        Engine::Postgres => "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -tAc \"select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema')\"",
-        Engine::Mysql => "mysql -uroot -p\"$MYSQL_ROOT_PASSWORD\" -N -e \"select count(*) from information_schema.tables where table_schema not in ('mysql','sys','information_schema','performance_schema')\"",
-        Engine::Mariadb => "mariadb -uroot -p\"$MARIADB_ROOT_PASSWORD\" -N -e \"select count(*) from information_schema.tables where table_schema not in ('mysql','sys','information_schema','performance_schema')\"",
-        Engine::Mongo => "mongosh --quiet -u \"$MONGO_INITDB_ROOT_USERNAME\" -p \"$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'db.adminCommand({listDatabases:1}).databases.length'",
-        Engine::Redis => "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning dbsize",
-    };
-    let mut c = crate::nodes::docker_cli(app, node)?;
-    c.args(["exec", container, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", query]);
-    let out = crate::proc::output(c).await?;
-    Ok(format!("The restored copy reports {} tables/collections/keys.", out.trim()))
 }
 
 /// A job's volume, refused when it is not a plain volume name: in `docker run -v` a path would
@@ -383,17 +366,26 @@ async fn restore_volume(app: &AppState, j: &Job, repo: &Repo, snapshot: &str) ->
         Some(sid) => runtime::replicas(app, sid).await?.into_iter().filter(|r| r.state == "running").collect(),
         None => vec![],
     };
-    for r in &users {
-        runtime::stop(app, &r.node, &r.id, 30).await?;
+    // Whatever was stopped starts again, also when stopping another one or the restore fails.
+    let mut stopped = vec![];
+    let res = async {
+        for r in &users {
+            runtime::stop(app, &r.node, &r.id, 30).await?;
+            stopped.push(r);
+        }
+        let mount = format!("{vol}:/data/{vol}");
+        let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
+        crate::proc::output(restic_on(cli, repo, &[mount], &["restore", snapshot, "--target", "/", "--include", &format!("/data/{vol}")])).await
     }
-    let mount = format!("{vol}:/data/{vol}");
-    let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
-    let res = crate::proc::output(restic_on(cli, repo, &[mount], &["restore", snapshot, "--target", "/", "--include", &format!("/data/{vol}")])).await;
-    for r in &users {
-        let _ = runtime::start(app, &r.node, &r.id).await;
+    .await;
+    for r in stopped {
+        if let Err(e) = runtime::start(app, &r.node, &r.id).await {
+            tracing::warn!("starting {} again after restoring {vol}: {e:#}", r.name);
+        }
     }
-    res?;
+    // Restarted containers may have new addresses, also when the restore failed.
     crate::proxy::reload(app);
+    res?;
     Ok(format!("Restored volume {vol}."))
 }
 
@@ -411,43 +403,43 @@ async fn restore_state(app: &App, repo: &Repo, snapshot: &str) -> Result<String>
 
 /// Start due jobs. One run per job at a time.
 pub async fn scheduler(app: AppState) {
-    use std::str::FromStr;
-    let running: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Default::default();
-    loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        let jobs: Vec<(String, String)> = {
-            let conn = app.db.conn();
-            let Ok(mut stmt) = conn.prepare("SELECT id, schedule FROM backup_jobs WHERE enabled = 1") else { continue };
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|m| m.filter_map(|r| r.ok()).collect()).unwrap_or_default()
-        };
-        let now = chrono::Utc::now();
-        for (id, schedule) in jobs {
-            let Ok(cron) = croner::Cron::from_str(&schedule) else { continue };
-            let last: i64 = app
-                .db
-                .conn()
-                .query_row("SELECT COALESCE(MAX(started_at), 0) FROM backup_runs WHERE job_id = ?1 AND kind = 'backup'", [&id], |r| r.get(0))
-                .unwrap_or(0);
-            let created: i64 = app.db.conn().query_row("SELECT created_at FROM backup_jobs WHERE id = ?1", [&id], |r| r.get(0)).unwrap_or(0);
-            let from = chrono::DateTime::from_timestamp(last.max(created), 0).unwrap_or(now);
-            let Ok(next) = cron.find_next_occurrence(&from, false) else { continue };
-            if next > now || !crate::util::lock(&running).insert(id.clone()) {
-                continue;
-            }
-            let (app, running) = (app.clone(), running.clone());
-            tokio::spawn(async move {
-                if let Err(e) = run_job(&app, &id).await {
-                    tracing::warn!("backup job {id} failed: {e:#}");
-                }
-                crate::util::lock(&running).remove(&id);
-            });
+    let running: Arc<Mutex<HashSet<String>>> = Default::default();
+    crate::util::every(30, "backup scheduler", || start_due(app.clone(), running.clone())).await
+}
+
+async fn start_due(app: AppState, running: Arc<Mutex<HashSet<String>>>) -> Result<()> {
+    // Each job counts from its last run, or from when it was made.
+    let jobs: Vec<(String, String, i64)> = app.db.rows(
+        "SELECT j.id, j.schedule, MAX(j.created_at, COALESCE((SELECT MAX(r.started_at) FROM backup_runs r WHERE r.job_id = j.id AND r.kind = 'backup'), 0))
+         FROM backup_jobs j WHERE j.enabled = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let now = chrono::Utc::now();
+    for (id, schedule, last) in jobs {
+        let Some(cron) = cron(&schedule) else { continue };
+        let from = chrono::DateTime::from_timestamp(last, 0).unwrap_or(now);
+        let Ok(next) = cron.find_next_occurrence(&from, false) else { continue };
+        if next > now || !util::lock(&running).insert(id.clone()) {
+            continue;
         }
+        let (app, running) = (app.clone(), running.clone());
+        tokio::spawn(async move {
+            if let Err(e) = run_job(&app, &id).await {
+                tracing::warn!("backup job {id} failed: {e:#}");
+            }
+            util::lock(&running).remove(&id);
+        });
     }
+    Ok(())
+}
+
+fn cron(s: &str) -> Option<croner::Cron> {
+    s.parse().ok()
 }
 
 pub fn valid_schedule(s: &str) -> bool {
-    use std::str::FromStr;
-    croner::Cron::from_str(s).is_ok()
+    cron(s).is_some()
 }
 
 #[cfg(test)]
@@ -460,5 +452,18 @@ mod tests {
         assert_eq!(summary(out), (Some("abc123".into()), Some(42)));
         assert!(valid_schedule("0 3 * * *"));
         assert!(!valid_schedule("every day"));
+    }
+
+    /// A consumer that talks a lot before reading (restic's progress) must not deadlock the pipe.
+    #[tokio::test]
+    async fn pipe_drains_a_chatty_consumer() {
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        let piped = pipe(sh("head -c 300000 /dev/zero"), sh("head -c 300000 /dev/zero | tr '\\0' x; wc -c"));
+        let out = tokio::time::timeout(Duration::from_secs(20), piped).await.expect("the pipe stalled").unwrap();
+        assert!(out.trim_end().ends_with("300000"), "{}", out.len());
     }
 }

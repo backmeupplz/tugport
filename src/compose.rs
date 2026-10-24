@@ -7,7 +7,7 @@
 // services) they are visible in `docker inspect`; wrap each container with the init
 // shim when that matters.
 
-use crate::app::{App, AppState};
+use crate::app::AppState;
 use crate::deploy::{Deploy, DeployLog};
 use crate::model::Source;
 use crate::runtime;
@@ -16,28 +16,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_yaml::{Mapping, Value};
 use tokio::process::Command;
 
-pub fn project_name(s: &Service) -> String {
-    s.slug()
-}
-
 pub async fn deploy(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> Result<()> {
-    let work = app.paths.sources().join(&s.id);
-    std::fs::create_dir_all(&work)?;
     let (dir, file) = match &s.spec.source {
-        Source::Compose { yaml } => {
-            let dir = work.join("inline");
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(dir.join("docker-compose.yml"), yaml)?;
-            (dir.clone(), dir.join("docker-compose.yml"))
-        }
-        Source::Git { provider, repo, branch, path, .. } => {
-            let git_ref = d.commit_sha.clone().or(d.git_ref.clone()).unwrap_or_else(|| branch.clone());
-            let checkout = work.join("repo");
-            let (sha, msg) = crate::git::checkout(app, s, provider.as_deref(), repo, &git_ref, &checkout, &|l| log.line(l)).await?;
-            app.db.conn().execute("UPDATE deploys SET commit_sha = ?1, commit_message = ?2 WHERE id = ?3", rusqlite::params![sha, msg, d.id])?;
-            let dir = crate::util::inside(&checkout, path).filter(|d| d.is_dir()).ok_or_else(|| anyhow!("the path {path} does not exist in the repository"))?;
-            let name = s.spec.compose.as_ref().map(|c| c.file.clone()).unwrap_or_else(|| "docker-compose.yml".into());
-            let file = crate::util::inside(&dir, &name).ok_or_else(|| anyhow!("the compose file {name} must be inside the repository"))?;
+        Source::Compose { yaml } => crate::builder::write_inline(app, s, "docker-compose.yml", yaml)?,
+        Source::Git { .. } => {
+            let (dir, _) = crate::git::checkout(app, s, d, &|l| log.line(l)).await?;
+            let name = s.spec.compose.as_ref().map_or("docker-compose.yml", |c| c.file.as_str());
+            let file = crate::util::inside(&dir, name).ok_or_else(|| anyhow!("the compose file {name} must be inside the repository"))?;
             (dir, file)
         }
         _ => bail!("Compose stacks come from pasted YAML or a Git repository"),
@@ -54,7 +39,7 @@ pub async fn deploy(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) ->
     let env_file = if dotenv.is_file() { dotenv } else { std::path::PathBuf::from("/dev/null") };
     let compose = |args: &[&str]| {
         let mut c = Command::new("docker");
-        c.args(["compose", "-p", &project_name(s), "-f"]).arg(&generated).arg("--env-file").arg(&env_file).args(args).current_dir(&dir);
+        c.args(["compose", "-p", &s.slug(), "-f"]).arg(&generated).arg("--env-file").arg(&env_file).args(args).current_dir(&dir);
         // The variables feed `${VAR}` interpolation; ones like PATH or DOCKER_CONFIG would steer docker itself.
         c.envs(crate::proc::tool_env(&env));
         c
@@ -71,37 +56,23 @@ pub async fn deploy(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) ->
 }
 
 /// Add Tugport labels, the project network and log limits to every compose service.
-pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Result<String> {
-    let mut doc: Value = serde_yaml::from_str(text).context("the compose file is not valid YAML")?;
-    // Compose applies `<<` merges itself, so check (and hand it) the merged document.
-    doc.apply_merge().context("the compose file has an invalid `<<` merge")?;
+fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Result<String> {
+    let mut doc = parse(text)?;
     if !s.spec.privileged {
         check_untrusted(&doc)?;
     }
     let services = doc.get_mut("services").and_then(|v| v.as_mapping_mut()).ok_or_else(|| anyhow!("the compose file has no services"))?;
     for (name, svc) in services.iter_mut() {
-        let name = name.as_str().unwrap_or_default().to_string();
         let Some(svc) = svc.as_mapping_mut() else { continue };
         let Some(labels) = entry_map(svc, "labels") else { continue };
         // Only Tugport says which service a container belongs to (routing and logs follow it).
         labels.retain(|k, _| !k.as_str().is_some_and(|k| k.starts_with("tugport.")));
-        for (k, v) in [
-            (runtime::L_MANAGED, "true".to_string()),
-            (runtime::L_PROJECT, s.project_id.clone()),
-            (runtime::L_SERVICE, s.id.clone()),
-            (runtime::L_DEPLOY, deploy_id.to_string()),
-            (runtime::L_NODE, "local".to_string()),
-        ] {
-            labels.insert(Value::String(k.into()), Value::String(v));
+        for (k, v) in runtime::labels(s, deploy_id, "local") {
+            labels.insert(k.into(), v.into());
         }
         if !svc.contains_key("logging") {
-            let mut options = Mapping::new();
-            options.insert("max-size".into(), "10m".into());
-            options.insert("max-file".into(), "3".into());
-            let mut logging = Mapping::new();
-            logging.insert("driver".into(), "json-file".into());
-            logging.insert("options".into(), Value::Mapping(options));
-            svc.insert("logging".into(), Value::Mapping(logging));
+            let options = runtime::LOG_LIMITS.iter().map(|&(k, v)| (k.into(), v.into())).collect();
+            svc.insert("logging".into(), Value::Mapping(Mapping::from_iter([("driver".into(), "json-file".into()), ("options".into(), Value::Mapping(options))])));
         }
         if !svc.contains_key("restart") {
             svc.insert("restart".into(), "unless-stopped".into());
@@ -109,19 +80,13 @@ pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Resul
         if svc.contains_key("network_mode") {
             continue;
         }
-        let alias = format!("{}-{name}", s.name);
+        let alias = format!("{}-{}", s.name, name.as_str().unwrap_or_default());
         let nets = svc.entry("networks".into()).or_insert_with(|| Value::Sequence(vec!["default".into()]));
         if let Value::Sequence(list) = nets {
-            let mut m = Mapping::new();
-            for n in list.drain(..) {
-                m.insert(n, Value::Null);
-            }
-            *nets = Value::Mapping(m);
+            *nets = Value::Mapping(list.drain(..).map(|n| (n, Value::Null)).collect());
         }
         if let Value::Mapping(m) = nets {
-            let mut cfg = Mapping::new();
-            cfg.insert("aliases".into(), Value::Sequence(vec![Value::String(alias)]));
-            m.insert(Value::String(network.into()), Value::Mapping(cfg));
+            m.insert(network.into(), Value::Mapping(Mapping::from_iter([("aliases".into(), Value::Sequence(vec![alias.into()]))])));
         }
     }
     let root = doc.as_mapping_mut().ok_or_else(|| anyhow!("the compose file is not a mapping"))?;
@@ -130,9 +95,7 @@ pub fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Resul
         *networks = Value::Mapping(Mapping::new());
     }
     if let Value::Mapping(m) = networks {
-        let mut ext = Mapping::new();
-        ext.insert("external".into(), Value::Bool(true));
-        m.insert(Value::String(network.into()), Value::Mapping(ext));
+        m.insert(network.into(), Value::Mapping(Mapping::from_iter([("external".into(), Value::Bool(true))])));
     }
     Ok(serde_yaml::to_string(&doc)?)
 }
@@ -158,16 +121,24 @@ const BUILD_KEYS: &[&str] = &[
 
 /// Whether a Compose file can run without privileged mode (and why not); for migrations.
 pub fn check_untrusted_text(text: &str) -> Result<()> {
+    check_untrusted(&parse(text)?)
+}
+
+/// Compose applies `<<` merges itself, so check (and hand it) the merged document.
+fn parse(text: &str) -> Result<Value> {
     let mut doc: Value = serde_yaml::from_str(text).context("the compose file is not valid YAML")?;
     doc.apply_merge().context("the compose file has an invalid `<<` merge")?;
-    check_untrusted(&doc)
+    Ok(doc)
+}
+
+fn privileged(what: impl std::fmt::Display) -> anyhow::Error {
+    anyhow!("{what} needs the stack's privileged mode, which an admin with the destroy grant can turn on")
 }
 
 /// Refuse what an unprivileged stack must not do. Values that decide where a mount or a file
 /// comes from may not use `${VAR}`, since interpolation would change them after this check.
 fn check_untrusted(doc: &Value) -> Result<()> {
     let root = doc.as_mapping().ok_or_else(|| anyhow!("the compose file is not a mapping"))?;
-    let privileged = |what: &str| anyhow!("{what} needs the stack's privileged mode, which an admin with the destroy grant can turn on");
     for (k, v) in root {
         let v = plain(v);
         match key(k)? {
@@ -181,7 +152,7 @@ fn check_untrusted(doc: &Value) -> Result<()> {
                 only(n, &["driver", "labels", "internal", "attachable", "enable_ipv4", "enable_ipv6"], &format!("network {name}"))?;
                 match str_at(n, "driver") {
                     None | Some("bridge") => Ok(()),
-                    Some(_) => Err(privileged(&format!("network {name}'s driver"))),
+                    Some(_) => Err(privileged(format_args!("network {name}'s driver"))),
                 }
             })?,
             "volumes" => each(v, |name, vol| only(vol, &["labels"], &format!("volume {name}")))?,
@@ -198,7 +169,6 @@ fn check_untrusted(doc: &Value) -> Result<()> {
 
 fn check_service(svc: &Value) -> Result<()> {
     let Some(m) = svc.as_mapping() else { return Ok(()) };
-    let privileged = |what: &str| anyhow!("{what} needs the stack's privileged mode, which an admin with the destroy grant can turn on");
     for (k, v) in m {
         let (k, v) = (key(k)?, plain(v));
         if k.starts_with("x-") || (k == "privileged" && *v == Value::Bool(false)) {
@@ -257,7 +227,7 @@ fn check_build(v: &Value) -> Result<()> {
             continue;
         }
         if !BUILD_KEYS.contains(&k) {
-            bail!("build.{k} needs the stack's privileged mode, which an admin with the destroy grant can turn on");
+            return Err(privileged(format_args!("build.{k}")));
         }
         match k {
             "context" => context(val.as_str().unwrap_or("$"))?,
@@ -306,7 +276,7 @@ fn check_mount(v: &Value) -> Result<()> {
     match str_at(v, "type").unwrap_or("volume") {
         "bind" => rel(source),
         "volume" | "tmpfs" | "image" => Ok(()),
-        t => bail!("{t} mounts need the stack's privileged mode, which an admin with the destroy grant can turn on"),
+        t => Err(privileged(format_args!("a {t} mount"))),
     }
 }
 
@@ -328,7 +298,7 @@ fn rel(p: &str) -> Result<()> {
 fn allowed(v: &Value, exact: &[&str], what: &str) -> Result<()> {
     match v.as_str() {
         Some(x) if !x.contains('$') && (exact.contains(&x) || x.starts_with("service:")) => Ok(()),
-        _ => bail!("{what}: {} needs the stack's privileged mode, which an admin with the destroy grant can turn on", serde_yaml::to_string(v).unwrap_or_default().trim()),
+        _ => Err(privileged(format_args!("{what}: {}", serde_yaml::to_string(v).unwrap_or_default().trim()))),
     }
 }
 
@@ -345,7 +315,7 @@ fn only(v: &Value, keys: &[&str], what: &str) -> Result<()> {
     for k in v.as_mapping().into_iter().flatten().map(|(k, _)| k) {
         let k = key(k)?;
         if !k.starts_with("x-") && !keys.contains(&k) {
-            bail!("{k} in {what} needs the stack's privileged mode, which an admin with the destroy grant can turn on");
+            return Err(privileged(format_args!("{k} in {what}")));
         }
     }
     Ok(())
@@ -395,13 +365,12 @@ fn entry_map<'a>(svc: &'a mut Mapping, key: &str) -> Option<&'a mut Mapping> {
     v.as_mapping_mut()
 }
 
-pub async fn down(app: &App, s: &Service, volumes: bool) -> Result<()> {
+pub async fn down(s: &Service, volumes: bool) -> Result<()> {
     let mut c = Command::new("docker");
-    c.args(["compose", "-p", &project_name(s), "down", "--remove-orphans"]);
+    c.args(["compose", "-p", &s.slug(), "down", "--remove-orphans"]);
     if volumes {
         c.arg("--volumes");
     }
-    let _ = app;
     crate::proc::output(c).await.map(|_| ())
 }
 

@@ -2,19 +2,45 @@
 // quick confirmations, <fieldset disabled> for read-only forms.
 import type { ComponentChildren, JSX } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { ApiError } from "./api";
+import type { ApiError } from "./api";
+import { Icon } from "./icons";
 import { copyText, sentence } from "./util";
 
-export const errText = (e: unknown) =>
-  e instanceof ApiError ? sentence(e.message) : e instanceof Error ? sentence(e.message) : "Something went wrong.";
+export const errText = (e: unknown) => (e instanceof Error ? sentence(e.message) : "Something went wrong.");
 
-export function Page(props: { title: ComponentChildren; sub?: ComponentChildren; actions?: ComponentChildren; children?: ComponentChildren }) {
+/**
+ * A page: breadcrumbs (label and link pairs leading here), the title with `meta` (pills, chips)
+ * beside it, a line of `sub` text and the page's main actions.
+ */
+export function Page(props: {
+  title: ComponentChildren;
+  crumbs?: [string, string][];
+  meta?: ComponentChildren;
+  sub?: ComponentChildren;
+  actions?: ComponentChildren;
+  children?: ComponentChildren;
+}) {
   return (
-    <div class="mx-auto w-full max-w-6xl px-4 py-6 md:px-8 md:py-8">
-      <header class="mb-6 flex flex-wrap items-start justify-between gap-3">
+    <div class="mx-auto w-full max-w-6xl px-4 py-6 md:px-10 md:py-9">
+      {props.crumbs && (
+        <nav aria-label="Breadcrumb" class="mb-2 flex flex-wrap items-center gap-1.5 text-[13px] text-muted">
+          {props.crumbs.map(([label, href], i) => (
+            <span key={href} class="flex items-center gap-1.5">
+              {i > 0 && <span aria-hidden="true">/</span>}
+              <a class="hover:text-text" href={href}>
+                {label}
+              </a>
+            </span>
+          ))}
+        </nav>
+      )}
+      <header class="mb-7 flex flex-wrap items-start justify-between gap-4">
         <div class="min-w-0">
-          <h1 class="break-words text-xl font-semibold">{props.title}</h1>
-          {props.sub && <div class="mt-1 text-dim">{props.sub}</div>}
+          <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <h1 class="break-words text-2xl font-semibold tracking-tight">{props.title}</h1>
+            {props.meta}
+          </div>
+          {props.sub && <div class="mt-1.5 max-w-3xl text-dim">{props.sub}</div>}
         </div>
         {props.actions && <div class="flex flex-wrap gap-2">{props.actions}</div>}
       </header>
@@ -27,12 +53,12 @@ export function Card(props: { title?: ComponentChildren; actions?: ComponentChil
   return (
     <section class={`card min-w-0 ${props.class ?? ""}`}>
       {(props.title || props.actions) && (
-        <header class="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3">
-          <h2 class="font-semibold">{props.title}</h2>
+        <header class="flex min-h-13 flex-wrap items-center justify-between gap-2 border-b border-line px-5 py-2.5">
+          <h2 class="text-sm font-semibold">{props.title}</h2>
           {props.actions && <div class="flex flex-wrap gap-2">{props.actions}</div>}
         </header>
       )}
-      <div class={props.pad === false ? "" : "p-4"}>{props.children}</div>
+      <div class={props.pad === false ? "" : "p-5"}>{props.children}</div>
     </section>
   );
 }
@@ -48,16 +74,42 @@ export function Field(props: { label: ComponentChildren; hint?: ComponentChildre
   );
 }
 
+type Labelled = { label: ComponentChildren; hint?: ComponentChildren; fieldClass?: string };
+
+/** A labelled text input. `mono` suits names, paths and commands: monospace and no spellcheck. */
+export function Input({ label, hint, fieldClass, mono, ...rest }: Labelled & { mono?: boolean } & JSX.IntrinsicElements["input"]) {
+  return (
+    <Field label={label} hint={hint} class={fieldClass}>
+      <input spellcheck={mono ? false : undefined} {...rest} class={`input${mono ? " font-mono" : ""}${rest.class ? ` ${rest.class}` : ""}`} />
+    </Field>
+  );
+}
+
+/** A labelled textarea for lists, files and code, so without spellcheck. `class` sets its height. */
+export function TextArea({ label, hint, fieldClass, ...rest }: Labelled & JSX.IntrinsicElements["textarea"]) {
+  return (
+    <Field label={label} hint={hint} class={fieldClass}>
+      <textarea spellcheck={false} {...rest} class={`input ${rest.class ?? ""}`} />
+    </Field>
+  );
+}
+
+/** The 6-digit code from an authenticator app. */
+export const CodeInput = (props: JSX.IntrinsicElements["input"]) => (
+  <input class="input h-11 text-center font-mono text-lg tracking-[0.4em]" required inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} {...props} />
+);
+
+/** "Type the name to confirm" in front of something that cannot be undone. */
+export function ConfirmName(props: { name: string; value: string; onChange: (v: string) => void; disabled?: boolean }) {
+  return (
+    <Input label={`Type ${props.name} to confirm`} mono autoComplete="off" disabled={props.disabled} value={props.value} onInput={(e) => props.onChange(e.currentTarget.value)} />
+  );
+}
+
 export function Check(props: { checked: boolean; onChange: (v: boolean) => void; label: ComponentChildren; hint?: ComponentChildren; disabled?: boolean }) {
   return (
     <label class="flex items-start gap-2.5">
-      <input
-        type="checkbox"
-        class="mt-0.5 size-4 shrink-0"
-        checked={props.checked}
-        disabled={props.disabled}
-        onChange={(e) => props.onChange(e.currentTarget.checked)}
-      />
+      <input type="checkbox" class="mt-0.5 size-4 shrink-0" checked={props.checked} disabled={props.disabled} onChange={(e) => props.onChange(e.currentTarget.checked)} />
       <span class="min-w-0">
         <span class="font-medium">{props.label}</span>
         {props.hint && <span class="hint">{props.hint}</span>}
@@ -66,14 +118,7 @@ export function Check(props: { checked: boolean; onChange: (v: boolean) => void;
   );
 }
 
-export function Select(props: {
-  value: string;
-  onChange: (v: string) => void;
-  options: (string | [string, string])[];
-  class?: string;
-  disabled?: boolean;
-  "aria-label"?: string;
-}) {
+export function Select(props: { value: string; onChange: (v: string) => void; options: (string | [string, string])[]; class?: string; disabled?: boolean; "aria-label"?: string }) {
   return (
     <select
       class={`input ${props.class ?? ""}`}
@@ -112,10 +157,13 @@ export function NameInput(props: { value: string; onChange: (v: string) => void;
   );
 }
 
-/** Form state with `bind("field")` for text inputs, selects and textareas. */
+/**
+ * Form state with `bind("field")` for text inputs, selects and textareas. Updates merge into the
+ * latest state, because autofill fires several input events before the next render.
+ */
 export function useForm<T extends Record<string, any>>(init: T) {
   const [f, setF] = useState(init);
-  const set = (p: Partial<T>) => setF((s) => ({ ...s, ...p }));
+  const set = (p: Partial<T> | ((s: T) => Partial<T>)) => setF((s) => ({ ...s, ...(typeof p === "function" ? p(s) : p) }));
   const bind = (k: keyof T) => ({
     value: f[k] as string,
     onInput: (e: JSX.TargetedEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => set({ [k]: e.currentTarget.value } as Partial<T>),
@@ -142,16 +190,61 @@ export function useSubmit(fn: () => Promise<unknown>) {
   return { busy, error, submit, setError };
 }
 
-/** A button that runs an API call, disables itself meanwhile and reports the outcome as a toast. */
-export function Action(props: {
-  run: () => Promise<unknown>;
-  children: ComponentChildren;
-  class?: string;
-  confirm?: string;
-  done?: string;
+/** A form's error and its Cancel (a button or a link) and submit buttons. */
+export function FormButtons(props: {
+  s: { busy: boolean; error?: string };
+  submit: ComponentChildren;
+  onCancel?: () => void;
+  cancelHref?: string;
+  cancel?: ComponentChildren;
+  danger?: boolean;
   disabled?: boolean;
-  title?: string;
 }) {
+  return (
+    <>
+      <ErrorBox error={props.s.error} />
+      <div class="flex justify-end gap-2">
+        {props.cancelHref ? (
+          <a class="btn" href={props.cancelHref}>
+            Cancel
+          </a>
+        ) : (
+          <button type="button" class="btn" onClick={props.onCancel}>
+            {props.cancel ?? "Cancel"}
+          </button>
+        )}
+        <button class={`btn ${props.danger ? "btn-danger" : "btn-primary"}`} disabled={props.s.busy || props.disabled}>
+          {props.submit}
+        </button>
+      </div>
+    </>
+  );
+}
+
+/** The bar that sticks under a long settings form while it has unsaved changes. */
+export function UnsavedBar(props: { s: { busy: boolean; error: string }; onDiscard: () => void }) {
+  return (
+    <div class="sticky bottom-0 z-10 -mx-4 mt-6 flex flex-wrap items-center justify-between gap-2 border-t border-line bg-surface px-4 py-3 md:mx-0 md:rounded-lg md:border">
+      <span class="text-dim">You have unsaved changes.</span>
+      <span class="flex gap-2">
+        <button type="button" class="btn" onClick={props.onDiscard}>
+          Discard
+        </button>
+        <button class="btn btn-primary" disabled={props.s.busy}>
+          Save settings
+        </button>
+      </span>
+      {props.s.error && (
+        <div class="w-full">
+          <ErrorBox error={props.s.error} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A button that runs an API call, disables itself meanwhile and reports the outcome as a toast. */
+export function Action(props: { run: () => Promise<unknown>; children: ComponentChildren; class?: string; confirm?: string; done?: string; disabled?: boolean; title?: string }) {
   const [busy, setBusy] = useState(false);
   return (
     <button
@@ -177,31 +270,35 @@ export function Action(props: {
   );
 }
 
-export function Modal(props: { open: boolean; onClose: () => void; title: ComponentChildren; children?: ComponentChildren; wide?: boolean }) {
+/** A ref for a <dialog> that shows as a modal while `open`. */
+export function useDialog(open: boolean) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
-    if (props.open && !d.open) d.showModal();
-    if (!props.open && d.open) d.close();
-  }, [props.open]);
+    if (open && !d.open) d.showModal();
+    if (!open && d.open) d.close();
+  }, [open]);
+  return ref;
+}
+
+export function Modal(props: { open: boolean; onClose: () => void; title: ComponentChildren; children?: ComponentChildren; wide?: boolean }) {
+  const ref = useDialog(props.open);
   return (
     <dialog
       ref={ref}
       onClose={props.onClose}
-      class={`m-auto max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] overflow-y-auto rounded-xl border border-line bg-surface p-0 text-text shadow-2xl ${props.wide ? "max-w-3xl" : "max-w-lg"}`}
+      class={`m-auto max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] overflow-y-auto rounded-2xl border border-line bg-surface p-0 text-text shadow-2xl ${props.wide ? "max-w-3xl" : "max-w-lg"}`}
     >
       {props.open && (
         <div>
-          <header class="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-line bg-surface px-5 py-3">
+          <header class="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-line bg-surface px-6 py-3.5">
             <h2 class="min-w-0 truncate text-base font-semibold">{props.title}</h2>
             <button type="button" class="btn btn-ghost -mr-2 px-2" aria-label="Close" onClick={props.onClose}>
-              <svg viewBox="0 0 16 16" class="size-4" aria-hidden="true">
-                <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-              </svg>
+              <Icon name="close" />
             </button>
           </header>
-          <div class="p-5">{props.children}</div>
+          <div class="p-6">{props.children}</div>
         </div>
       )}
     </dialog>
@@ -213,7 +310,7 @@ export function CopyButton(props: { text: string; label?: string; class?: string
   return (
     <button
       type="button"
-      class={props.class ?? "btn px-2 py-1 text-xs"}
+      class={props.class ?? "btn btn-sm"}
       onClick={async () => {
         setState((await copyText(props.text)) ? "ok" : "fail");
         setTimeout(() => setState(""), 1600);
@@ -226,8 +323,8 @@ export function CopyButton(props: { text: string; label?: string; class?: string
 
 export function CodeBlock(props: { text: string; label?: ComponentChildren }) {
   return (
-    <div class="min-w-0 rounded-md border border-line bg-bg">
-      <div class="flex items-center justify-between gap-2 border-b border-line px-3 py-1.5 text-xs text-dim">
+    <div class="min-w-0 rounded-lg border border-line bg-bg">
+      <div class="flex items-center justify-between gap-2 border-b border-line py-1.5 pr-1.5 pl-3 text-xs text-dim">
         <span class="min-w-0 truncate">{props.label}</span>
         <CopyButton text={props.text} />
       </div>
@@ -238,7 +335,7 @@ export function CodeBlock(props: { text: string; label?: ComponentChildren }) {
 
 export function Empty(props: { title?: ComponentChildren; children?: ComponentChildren; action?: ComponentChildren }) {
   return (
-    <div class="rounded-lg border border-dashed border-line px-6 py-10 text-center">
+    <div class="rounded-xl border border-dashed border-line-strong px-6 py-12 text-center">
       {props.title && <p class="font-medium">{props.title}</p>}
       {props.children && <p class="mx-auto mt-1 max-w-md text-dim">{props.children}</p>}
       {props.action && <div class="mt-4">{props.action}</div>}
@@ -246,14 +343,23 @@ export function Empty(props: { title?: ComponentChildren; children?: ComponentCh
   );
 }
 
-/** Calm stand-in for endpoints that docs/API.md marks as planned. */
-export const Planned = () => <Empty>This arrives in a later build.</Empty>;
+/** A card's list: an empty state without items, otherwise one divided row (an <li> with a key) per item. */
+export function Rows<T>(props: { items: T[]; empty: ComponentChildren; emptyTitle?: ComponentChildren; class?: string; children: (x: T) => ComponentChildren }) {
+  if (!props.items.length) {
+    return (
+      <div class="p-5">
+        <Empty title={props.emptyTitle}>{props.empty}</Empty>
+      </div>
+    );
+  }
+  return <ul class={`divide-y divide-line ${props.class ?? ""}`}>{props.items.map((x) => props.children(x))}</ul>;
+}
 
 export function ErrorBox(props: { error: unknown }) {
   if (!props.error) return null;
   const text = typeof props.error === "string" ? props.error : errText(props.error);
   return (
-    <div role="alert" class="rounded-md border border-bad/40 bg-bad/10 px-3 py-2 text-bad">
+    <div role="alert" class="rounded-lg border border-bad/40 bg-bad/10 px-3 py-2 text-bad">
       {text}
     </div>
   );
@@ -266,18 +372,24 @@ export function Note(props: { tone?: "info" | "warn" | "bad" | "ok"; children: C
     bad: "border-bad/40 bg-bad/10",
     ok: "border-ok/30 bg-ok/10",
   }[props.tone ?? "info"];
-  return <div class={`rounded-md border px-3 py-2 text-sm ${tone} ${props.class ?? ""}`}>{props.children}</div>;
+  return <div class={`rounded-lg border px-3 py-2 text-sm ${tone} ${props.class ?? ""}`}>{props.children}</div>;
 }
 
 export const Loading = () => <p class="py-6 text-muted">Loading…</p>;
 
 /** Shows the right state for a useApi result: an error, a loading line or the content. */
-export function Loaded<T>(props: { r: { data?: T; error?: ApiError }; children: (d: T) => ComponentChildren; planned?: boolean }) {
-  if (props.r.error && props.planned && props.r.error.status === 404) return <Planned />;
+export function Loaded<T>(props: { r: { data?: T; error?: ApiError }; children: (d: T) => ComponentChildren }) {
   if (props.r.data !== undefined) return <>{props.children(props.r.data)}</>;
   if (props.r.error) return <ErrorBox error={props.r.error} />;
   return <Loading />;
 }
+
+/** A detail page before its data arrives, or with the error when it does not. */
+export const LoadingPage = (props: { title?: string; r: { data?: unknown; error?: ApiError } }) => (
+  <Page title={props.title}>
+    <Loaded r={props.r}>{() => null}</Loaded>
+  </Page>
+);
 
 const TONE: Record<string, string> = {
   running: "ok",
@@ -324,15 +436,15 @@ export function Pill(props: { state: string; label?: string; class?: string }) {
 
 export function Tabs(props: { items: [string, string, string][]; current: string; label: string }) {
   return (
-    <nav aria-label={props.label} class="-mx-4 mb-6 overflow-x-auto border-b border-line px-4 md:mx-0 md:px-0">
-      <div class="flex gap-1">
+    <nav aria-label={props.label} class="-mx-4 mb-7 overflow-x-auto border-b border-line px-4 md:mx-0 md:px-0">
+      <div class="flex gap-0.5">
         {props.items.map(([id, label, href]) => (
           <a
             key={id}
             href={href}
             aria-current={id === props.current ? "page" : undefined}
-            class={`-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium ${
-              id === props.current ? "border-accent text-text" : "border-transparent text-dim hover:text-text"
+            class={`-mb-px whitespace-nowrap border-b-2 px-3 pt-1.5 pb-2.5 text-[13px] font-medium ${
+              id === props.current ? "border-accent text-text" : "border-transparent text-muted hover:text-text"
             }`}
           >
             {label}
@@ -383,7 +495,7 @@ export function Toasts() {
         <div
           key={t.id}
           role={t.tone === "bad" ? "alert" : "status"}
-          class={`pointer-events-auto max-w-sm rounded-md border px-3 py-2 text-sm shadow-lg ${
+          class={`pointer-events-auto max-w-sm rounded-lg border px-3.5 py-2.5 text-sm shadow-lg ${
             t.tone === "bad" ? "border-bad/40 bg-surface text-bad" : "border-line bg-surface text-text"
           }`}
         >

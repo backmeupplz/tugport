@@ -1,7 +1,8 @@
 //! Backup targets (S3 or local), jobs, runs and restores.
 
-use super::projects::service_or_404;
-use super::{ApiError, ApiResult, Auth};
+use super::service_or_404;
+use super::{bad, detached, row_json};
+use super::{ApiError, ApiResult, Auth, Owner, ok};
 use crate::app::AppState;
 use crate::auth::Role;
 use crate::{backup, util};
@@ -12,15 +13,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub async fn list_targets(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
-    if !a.0.is_owner && a.0.all_projects_role.is_none() {
-        return Err(ApiError::forbidden("needs the owner or a role on all projects"));
-    }
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT id, name, kind, created_at FROM backup_targets ORDER BY created_at")?;
-    let rows: Vec<Value> = stmt
-        .query_map([], |r| Ok(json!({ "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?, "created_at": r.get::<_, i64>(3)? })))?
-        .filter_map(|r| r.ok())
-        .collect();
+    a.require_servers("needs the owner or a role on all projects")?;
+    let rows = app.db.rows("SELECT id, name, kind, created_at FROM backup_targets ORDER BY created_at", [], row_json)?;
     Ok(Json(json!({ "targets": rows })))
 }
 
@@ -31,8 +25,7 @@ pub struct TargetBody {
     config: Value,
 }
 
-pub async fn create_target(State(app): State<AppState>, a: Auth, Json(b): Json<TargetBody>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn create_target(State(app): State<AppState>, Owner(a): Owner, Json(b): Json<TargetBody>) -> ApiResult<Json<Value>> {
     let need: &[&str] = match b.kind.as_str() {
         "s3" => &["bucket", "access_key", "secret_key"],
         "local" => &["path"],
@@ -48,27 +41,31 @@ pub async fn create_target(State(app): State<AppState>, a: Auth, Json(b): Json<T
     }
     let id = util::id();
     let sealed = app.keys.seal_str(&format!("backup-target:{id}"), &b.config.to_string())?;
-    app.db.conn().execute(
+    app.db.exec(
         "INSERT INTO backup_targets (id, name, kind, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![id, b.name, b.kind, sealed, util::now()],
     )?;
-    app.audit(Some(&a.0), "backup.target_create", None, None, Some(&b.name), Some(&b.kind));
+    a.audit(&app, "backup.target_create", Some(&b.name), Some(&b.kind));
     Ok(Json(json!({ "id": id })))
 }
 
-pub async fn delete_target(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
-    app.db.conn().execute("DELETE FROM backup_targets WHERE id = ?1", [&id])?;
-    app.audit(Some(&a.0), "backup.target_delete", None, None, Some(&id), None);
-    Ok(Json(json!({ "ok": true })))
+pub async fn delete_target(State(app): State<AppState>, Owner(a): Owner, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    app.db.exec("DELETE FROM backup_targets WHERE id = ?1", [&id])?;
+    a.audit(&app, "backup.target_delete", Some(&id), None);
+    Ok(ok())
+}
+
+/// The project of a job's service (None for jobs not tied to a service, which are the owner's).
+fn project_of(app: &AppState, service_id: Option<&str>) -> ApiResult<Option<String>> {
+    Ok(match service_id {
+        Some(sid) => crate::store::service(app, sid)?.map(|s| s.project_id),
+        None => None,
+    })
 }
 
 fn job_project(app: &AppState, job_id: &str) -> ApiResult<(backup::Job, Option<String>)> {
     let j = backup::job(app, job_id).map_err(|_| ApiError::not_found("backup job not found"))?;
-    let project = match &j.service_id {
-        Some(sid) => crate::store::service(app, sid)?.map(|s| s.project_id),
-        None => None,
-    };
+    let project = project_of(app, j.service_id.as_deref())?;
     Ok((j, project))
 }
 
@@ -79,37 +76,20 @@ fn require_job(a: &Auth, project: &Option<String>, role: Role) -> ApiResult<()> 
     }
 }
 
-#[allow(clippy::type_complexity)]
 pub async fn list_jobs(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
-    let rows: Vec<(String, Option<String>, String, String, Option<String>, String, i64, bool)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT id, service_id, target_id, kind, volume, schedule, keep_last, enabled FROM backup_jobs ORDER BY created_at")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.filter_map(|r| r.ok()).collect()
-    };
+    let jobs = app.db.rows("SELECT id, service_id, target_id, kind, volume, schedule, keep_last, enabled FROM backup_jobs ORDER BY created_at", [], row_json)?;
     let mut out = vec![];
-    for (id, service_id, target_id, kind, volume, schedule, keep_last, enabled) in rows {
-        let project = match &service_id {
-            Some(sid) => crate::store::service(&app, sid)?.map(|s| s.project_id),
-            None => None,
-        };
-        let visible = match &project {
-            Some(p) => a.0.can(p, Role::Viewer),
-            None => a.0.is_owner,
-        };
-        if !visible {
+    for mut job in jobs {
+        if require_job(&a, &project_of(&app, job["service_id"].as_str())?, Role::Viewer).is_err() {
             continue;
         }
-        let last: Option<Value> = app
-            .db
-            .conn()
-            .query_row(
-                "SELECT status, finished_at, error FROM backup_runs WHERE job_id = ?1 AND kind = 'backup' ORDER BY started_at DESC LIMIT 1",
-                [&id],
-                |r| Ok(json!({ "status": r.get::<_, String>(0)?, "finished_at": r.get::<_, Option<i64>>(1)?, "error": r.get::<_, Option<String>>(2)? })),
-            )
-            .ok();
-        out.push(json!({ "id": id, "service_id": service_id, "target_id": target_id, "kind": kind, "volume": volume,
-                         "schedule": schedule, "keep_last": keep_last, "enabled": enabled, "last_run": last }));
+        job["enabled"] = json!(job["enabled"] != 0);
+        job["last_run"] = json!(app.db.row(
+            "SELECT status, finished_at, error FROM backup_runs WHERE job_id = ?1 AND kind = 'backup' ORDER BY started_at DESC LIMIT 1",
+            [job["id"].as_str()],
+            row_json,
+        )?);
+        out.push(job);
     }
     Ok(Json(json!({ "jobs": out })))
 }
@@ -158,7 +138,7 @@ pub async fn create_job(State(app): State<AppState>, a: Auth, Json(b): Json<JobB
     }
     backup::target(&app, &b.target_id).map_err(|_| ApiError::bad_request("unknown backup target"))?;
     let id = util::id();
-    app.db.conn().execute(
+    app.db.exec(
         "INSERT INTO backup_jobs (id, service_id, target_id, kind, volume, schedule, keep_last, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![id, service.as_ref().map(|s| s.id.clone()), b.target_id, b.kind, b.volume, b.schedule, b.keep_last.max(1), util::now()],
     )?;
@@ -180,20 +160,20 @@ pub async fn update_job(State(app): State<AppState>, a: Auth, Path(id): Path<Str
         && !backup::valid_schedule(s) {
             return Err(ApiError::bad_request("the schedule is not a valid cron expression"));
         }
-    app.db.conn().execute(
+    app.db.exec(
         "UPDATE backup_jobs SET schedule = COALESCE(?1, schedule), keep_last = COALESCE(?2, keep_last), enabled = COALESCE(?3, enabled) WHERE id = ?4",
         params![b.schedule, b.keep_last.map(|k| k.max(1)), b.enabled, j.id],
     )?;
     app.audit(Some(&a.0), "backup.job_update", project.as_deref(), j.service_id.as_deref(), Some(&j.kind), None);
-    Ok(Json(json!({ "ok": true })))
+    Ok(ok())
 }
 
 pub async fn delete_job(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let (j, project) = job_project(&app, &id)?;
     require_job(&a, &project, Role::Admin)?;
-    app.db.conn().execute("DELETE FROM backup_jobs WHERE id = ?1", [&j.id])?;
+    app.db.exec("DELETE FROM backup_jobs WHERE id = ?1", [&j.id])?;
     app.audit(Some(&a.0), "backup.job_delete", project.as_deref(), j.service_id.as_deref(), Some(&j.kind), None);
-    Ok(Json(json!({ "ok": true })))
+    Ok(ok())
 }
 
 pub async fn run_job(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -202,26 +182,18 @@ pub async fn run_job(State(app): State<AppState>, a: Auth, Path(id): Path<String
     app.audit(Some(&a.0), "backup.run", project.as_deref(), j.service_id.as_deref(), Some(&j.kind), None);
     // The run finishes even if the caller goes away.
     let (app2, jid) = (app.clone(), j.id.clone());
-    let run = tokio::spawn(async move { backup::run_job(&app2, &jid).await }).await.map_err(anyhow::Error::from)?;
-    let run = run.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let run = detached(async move { backup::run_job(&app2, &jid).await }).await?.map_err(bad)?;
     Ok(Json(json!({ "run_id": run })))
 }
 
 pub async fn list_runs(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let (j, project) = job_project(&app, &id)?;
     require_job(&a, &project, Role::Viewer)?;
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare(
+    let runs = app.db.rows(
         "SELECT id, kind, status, snapshot, size_bytes, error, started_at, finished_at FROM backup_runs WHERE job_id = ?1 ORDER BY started_at DESC LIMIT 100",
+        [&j.id],
+        row_json,
     )?;
-    let runs: Vec<Value> = stmt
-        .query_map([&j.id], |r| {
-            Ok(json!({ "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?,
-                       "snapshot": r.get::<_, Option<String>>(3)?, "size_bytes": r.get::<_, Option<i64>>(4)?,
-                       "error": r.get::<_, Option<String>>(5)?, "started_at": r.get::<_, i64>(6)?, "finished_at": r.get::<_, Option<i64>>(7)? }))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
     Ok(Json(json!({ "runs": runs })))
 }
 
@@ -233,11 +205,7 @@ pub struct RestoreBody {
 
 pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<String>, body: Option<Json<RestoreBody>>) -> ApiResult<Json<Value>> {
     let test = body.map(|b| b.0.test).unwrap_or(false);
-    let job_id: String = app
-        .db
-        .conn()
-        .query_row("SELECT job_id FROM backup_runs WHERE id = ?1", [&run_id], |r| r.get(0))
-        .map_err(|_| ApiError::not_found("backup run not found"))?;
+    let job_id: String = app.db.row("SELECT job_id FROM backup_runs WHERE id = ?1", [&run_id], |r| r.get(0))?.ok_or_else(|| ApiError::not_found("backup run not found"))?;
     let (j, project) = job_project(&app, &job_id)?;
     if test {
         require_job(&a, &project, Role::Operator)?;
@@ -251,7 +219,6 @@ pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<St
     }
     app.audit(Some(&a.0), if test { "backup.test_restore" } else { "backup.restore" }, project.as_deref(), j.service_id.as_deref(), Some(&run_id), None);
     let (app2, rid) = (app.clone(), run_id.clone());
-    let msg = tokio::spawn(async move { backup::restore(&app2, &rid, test).await }).await.map_err(anyhow::Error::from)?;
-    let msg = msg.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let msg = detached(async move { backup::restore(&app2, &rid, test).await }).await?.map_err(bad)?;
     Ok(Json(json!({ "ok": true, "message": msg })))
 }

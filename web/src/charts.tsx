@@ -10,7 +10,7 @@ export interface Line {
 }
 
 export const fmt = {
-  pct: (v: number) => `${v < 10 ? v.toFixed(1) : Math.round(v)}%`,
+  pct: (v: number) => (v > 0 && v < 0.01 ? "<0.01%" : `${v > 0 && v < 1 ? v.toFixed(2) : v < 10 ? v.toFixed(1) : Math.round(v)}%`),
   bytes: (v: number) => bytes(v),
   rate: (v: number) => `${bytes(v)}/s`,
   count: (v: number) => (Math.abs(v) >= 1000 ? `${(v / 1000).toFixed(1)}K` : `${Math.round(v * 100) / 100}`),
@@ -50,23 +50,29 @@ function useThemeTick() {
   return tick;
 }
 
+/** Seconds -> "8:05 PM" for the hover readout. */
+const at = (t: number) => new Date(t * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
 export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) => string; max?: number }) {
   const box = useRef<HTMLDivElement>(null);
   const tick = useThemeTick();
+  // The values under the cursor, which replace the summary while pointing at the chart.
+  const [hover, setHover] = useState<string | null>(null);
   const lines = props.lines.slice(0, 3); // a fourth series would need a fourth validated color
   const signature = lines.map((l) => `${l.label}:${l.points.length}:${l.points[l.points.length - 1]?.join(",")}`).join("|");
   const hasData = lines.some((l) => l.points.length > 0);
   const last = (p: Points) => p[p.length - 1][1];
   // One series: its current value and peak. Several: each one's current value, named.
   const summary =
-    lines.length === 1
+    hover ??
+    (lines.length === 1
       ? lines[0].points.length
         ? `now ${props.fmt(last(lines[0].points))} · peak ${props.fmt(Math.max(...lines[0].points.map((p) => p[1])))}`
         : ""
       : lines
           .filter((l) => l.points.length)
           .map((l) => `${l.label} ${props.fmt(last(l.points))}`)
-          .join(" · ");
+          .join(" · "));
 
   useEffect(() => {
     const el = box.current;
@@ -88,7 +94,20 @@ export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) =>
           width: el.clientWidth,
           height: 170,
           cursor: { points: { size: 8 } },
-          legend: { live: true },
+          legend: { show: false },
+          hooks: {
+            setCursor: [
+              (u: { cursor: { idx?: number | null } }) => {
+                const i = u.cursor.idx;
+                if (i == null) return setHover(null);
+                const vals = lines.map((l, k) => {
+                  const v = data[k + 1][i];
+                  return `${lines.length > 1 ? `${l.label} ` : ""}${v == null ? "–" : props.fmt(v)}`;
+                });
+                setHover(`${at(data[0][i] ?? 0)} · ${vals.join(" · ")}`);
+              },
+            ],
+          },
           scales: { y: { range: (_u: unknown, _min: number, max: number) => [0, props.max ?? (max > 0 ? max * 1.15 : 1)] } },
           axes: [
             { stroke: ink, font, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1 } },
@@ -102,7 +121,6 @@ export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) =>
               width: 2,
               fill: lines.length === 1 ? withAlpha(colors[i], 0.1) : undefined,
               points: { show: false },
-              value: (_u: unknown, v: number | null) => (v == null ? "–" : props.fmt(v)),
             })),
           ],
         },
@@ -120,11 +138,21 @@ export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) =>
   }, [signature, tick, hasData]);
 
   return (
-    <section class="card min-w-0 p-4" aria-label={`${props.title} chart`}>
-      <header class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-        <h3 class="text-sm font-medium">{props.title}</h3>
-        {summary && <span class="text-xs text-muted">{summary}</span>}
+    <section class="card min-w-0 p-5" aria-label={`${props.title} chart`}>
+      <header class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <h3 class="text-sm font-semibold">{props.title}</h3>
+        {summary && <span class="text-xs text-muted tabular-nums">{summary}</span>}
       </header>
+      {lines.length > 1 && (
+        <p class="-mt-1 mb-2 flex gap-3 text-xs text-dim">
+          {lines.map((l, i) => (
+            <span key={l.label} class="flex items-center gap-1.5">
+              <span class="h-0.5 w-3 rounded-full" style={{ background: `var(--series-${i + 1})` }} aria-hidden="true" />
+              {l.label}
+            </span>
+          ))}
+        </p>
+      )}
       {hasData ? <div ref={box} /> : <p class="py-12 text-center text-sm text-muted">There is no data for this range yet.</p>}
     </section>
   );

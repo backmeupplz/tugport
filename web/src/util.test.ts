@@ -1,7 +1,26 @@
 // Run with `npm test` (Node's built-in runner strips the types).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cidr, joinArgs, labelsText, matchServers, mergePatch, parseEnv, parseLabels, pinReasons, sentence, sizeLabel, sizesIn, splitArgs, sumUsage, varName } from "./util.ts";
+import {
+  cidr,
+  joinArgs,
+  labelsText,
+  matchPath,
+  matchServers,
+  mergePatch,
+  parseEnv,
+  parseLabels,
+  patchAt,
+  pinReasons,
+  removeAt,
+  sentence,
+  sizeLabel,
+  sizesIn,
+  splitArgs,
+  str,
+  sumUsage,
+  varName,
+} from "./util.ts";
 
 test("merge patch keeps only changes and nulls removed keys", () => {
   const a = { replicas: 1, source: { type: "git", repo: "o/r", branch: "main" }, ports: [{ container: 80 }], user: "app" };
@@ -90,7 +109,40 @@ test("database variables and machine sizes", () => {
 });
 
 test("usage adds up over servers and skips servers without the service", () => {
-  const s = (cpu: number, memory: number, restarts = 0) => ({ services: [{ id: "a", cpu, memory, restarts }, { id: "b", cpu: 50, memory: 9, restarts: 9 }] });
+  const s = (cpu: number, memory: number, restarts = 0) => ({
+    services: [
+      { id: "a", cpu, memory, restarts },
+      { id: "b", cpu: 50, memory: 9, restarts: 9 },
+    ],
+  });
   assert.deepEqual(sumUsage([s(1.5, 100, 2), null, s(2, 50)], "a"), { cpu: 3.5, memory: 150, restarts: 2 });
   assert.equal(sumUsage([null, { services: [] }], "a"), null);
+});
+
+test("paths match patterns with parameters and optional ones, and nothing longer", () => {
+  assert.deepEqual(matchPath("/", "/"), {});
+  assert.deepEqual(matchPath("/projects/:project", "/projects/web"), { project: "web" });
+  assert.equal(matchPath("/projects/:project", "/projects/web/api"), null);
+  assert.equal(matchPath("/projects/:project", "/projects"), null);
+  assert.deepEqual(matchPath("/settings/:tab?", "/settings"), {});
+  assert.deepEqual(matchPath("/settings/:tab?", "/settings/git/"), { tab: "git" });
+  assert.equal(matchPath("/servers/cloud", "/servers/b"), null);
+  assert.deepEqual(matchPath("/access/users/:id", "/access/users/a%20b"), { id: "a b" });
+  assert.equal(matchPath("/access/users/:id", "/access/users/%E0"), null);
+});
+
+test("row edits and form text", () => {
+  const rows = [
+    { a: 1, b: "x" },
+    { a: 2, b: "y" },
+  ];
+  assert.deepEqual(patchAt(rows, 1, { b: "z" }), [
+    { a: 1, b: "x" },
+    { a: 2, b: "z" },
+  ]);
+  assert.deepEqual(removeAt(rows, 0), [{ a: 2, b: "y" }]);
+  assert.equal(rows[1].b, "y");
+  assert.equal(str(null), "");
+  assert.equal(str(undefined), "");
+  assert.equal(str(0), "0");
 });

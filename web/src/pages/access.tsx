@@ -1,7 +1,29 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { route } from "preact-router";
-import { ROLES, ROLE_HELP, del, get, patch, post, useApi, useEvent, useMe, type Key, type Project, type Role, type Snippets, type User } from "../api";
-import { Action, Card, CodeBlock, Empty, ErrorBox, Field, Loaded, Loading, Modal, Note, Page, Select, Tabs, toast, useSubmit } from "../ui";
+import { ROLES, ROLE_HELP, del, get, patch, post, useApi, useEvent, useMe, useProjects, type Key, type Project, type Role, type Snippets, type User } from "../api";
+import { route } from "../router";
+import {
+  Action,
+  Card,
+  CodeBlock,
+  Empty,
+  ErrorBox,
+  Field,
+  FormButtons,
+  Input,
+  Loaded,
+  Loading,
+  LoadingPage,
+  Modal,
+  Note,
+  Page,
+  Rows,
+  Select,
+  Tabs,
+  TextArea,
+  toast,
+  useForm,
+  useSubmit,
+} from "../ui";
 import { ago, cidr, qs, when, words } from "../util";
 
 // ---- Access editing shared by new agents, new people and existing users ----
@@ -57,7 +79,7 @@ function AccessEditor(props: { value: Access; onChange: (a: Access) => void; pro
           (props.projects.length === 0 ? (
             <p class="ml-7 text-muted">There are no projects yet, so give access to all projects instead.</p>
           ) : (
-            <ul class="ml-7 divide-y divide-line rounded-md border border-line">
+            <ul class="ml-7 inset-list">
               {props.projects.map((p) => (
                 <li key={p.id} class="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
                   <span class="font-medium">{p.name}</span>
@@ -100,7 +122,9 @@ function AccessEditor(props: { value: Access; onChange: (a: Access) => void; pro
           <input type="checkbox" class="mt-1 size-4" checked={a.destroy} onChange={(e) => set({ destroy: e.currentTarget.checked })} />
           <span>
             <span class="font-medium">Destroy</span> <code class="text-xs text-muted">destroy</code>
-            <span class="hint">The grant lets an admin delete services, volumes and databases, and turn on privileged mode, the Docker socket, host networking, bind mounts and extra capabilities.</span>
+            <span class="hint">
+              The grant lets an admin delete services, volumes and databases, and turn on privileged mode, the Docker socket, host networking, bind mounts and extra capabilities.
+            </span>
           </span>
         </label>
         {a.destroy && (
@@ -121,15 +145,22 @@ const EXPIRY: [string, string][] = [
   ["", "Never"],
 ];
 
-function KeyFields(props: { expires: string; setExpires: (v: string) => void; ips: string; setIps: (v: string) => void }) {
+type KeyForm = { expires: string; ips: string };
+const keyBody = (f: KeyForm) => ({ expires_days: f.expires ? Number(f.expires) : undefined, allowed_ips: words(f.ips).map(cidr) });
+
+function KeyFields(props: { f: KeyForm; set: (p: Partial<KeyForm>) => void }) {
   return (
     <div class="grid gap-4 sm:grid-cols-2">
       <Field label="Key expires">
-        <Select value={props.expires} onChange={props.setExpires} options={EXPIRY} />
+        <Select value={props.f.expires} onChange={(expires) => props.set({ expires })} options={EXPIRY} />
       </Field>
-      <Field label="Allowed addresses (optional)" hint="Write addresses or ranges separated by commas or new lines, like 203.0.113.7 or 10.0.0.0/8, or leave this empty to allow any address.">
-        <textarea class="input h-16" spellcheck={false} value={props.ips} onInput={(e) => props.setIps(e.currentTarget.value)} />
-      </Field>
+      <TextArea
+        label="Allowed addresses (optional)"
+        hint="Write addresses or ranges separated by commas or new lines, like 203.0.113.7 or 10.0.0.0/8, or leave this empty to allow any address."
+        class="h-16"
+        value={props.f.ips}
+        onInput={(e) => props.set({ ips: e.currentTarget.value })}
+      />
     </div>
   );
 }
@@ -176,7 +207,7 @@ function AccessTabs(props: { current: string }) {
 
 // ---- Pages ----
 
-export function Access(_: { path?: string }) {
+export function Access() {
   const me = useMe();
   // Only the owner manages other users; everyone else manages their own keys here.
   return me.principal.is_owner ? <People /> : <UserPage id={me.principal.user_id} />;
@@ -184,7 +215,7 @@ export function Access(_: { path?: string }) {
 
 function People() {
   const users = useApi<{ users: User[] }>("/users", (e) => e.kind === "audit" && /^(user|agent|key)\./.test(e.data?.action ?? ""));
-  const projects = useApi<{ projects: Project[] }>("/projects");
+  const projects = useProjects();
   const names = Object.fromEntries((projects.data?.projects ?? []).map((p) => [p.id, p.name]));
   const summary = (u: User) =>
     u.is_owner
@@ -214,7 +245,7 @@ function People() {
           <ul class="card divide-y divide-line">
             {d.users.map((u) => (
               <li key={u.id}>
-                <a href={`/access/users/${u.id}`} class="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 hover:bg-raised">
+                <a href={`/access/users/${u.id}`} class="row gap-y-1 hover:bg-raised/60">
                   <span class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
                     <span class="font-medium">{u.name}</span>
                     <span class="chip">{u.kind}</span>
@@ -237,26 +268,16 @@ function People() {
   );
 }
 
-export function NewAgent(_: { path?: string }) {
+export function NewAgent() {
   const me = useMe();
-  const projects = useApi<{ projects: Project[] }>("/projects");
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
+  const projects = useProjects();
+  const { f, set, bind } = useForm({ name: "", description: "", expires: "90", ips: "" });
   const [access, setAccess] = useState<Access>({ mode: "all", allRole: "deployer", projects: {}, secrets: false, destroy: false });
-  const [expires, setExpires] = useState("90");
-  const [ips, setIps] = useState("");
   const [result, setResult] = useState<{ user: User; key: { id: string; token: string }; snippets: Snippets } | null>(null);
   const s = useSubmit(async () => {
     const body = accessBody(access);
     if (access.mode === "some" && Object.keys(body.projects).length === 0) throw new Error("Choose at least one project, or give the agent a role on all projects.");
-    setResult(
-      await post("/agents", {
-        name: name.trim(),
-        description: description.trim() || undefined,
-        ...body,
-        key: { expires_days: expires ? Number(expires) : undefined, allowed_ips: words(ips).map(cidr) },
-      }),
-    );
+    setResult(await post("/agents", { name: f.name.trim(), description: f.description.trim() || undefined, ...body, key: keyBody(f) }));
     window.scrollTo(0, 0);
   });
 
@@ -287,39 +308,23 @@ export function NewAgent(_: { path?: string }) {
       <form class="max-w-3xl space-y-6" onSubmit={s.submit}>
         <Card title="Agent">
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="Name">
-              <input class="input" required autoFocus maxLength={64} placeholder="ci-deployer" value={name} onInput={(e) => setName(e.currentTarget.value)} />
-            </Field>
-            <Field label="Description (optional)">
-              <input class="input" placeholder="Deploys from GitHub Actions" value={description} onInput={(e) => setDescription(e.currentTarget.value)} />
-            </Field>
+            <Input label="Name" required autoFocus maxLength={64} placeholder="ci-deployer" {...bind("name")} />
+            <Input label="Description (optional)" placeholder="Deploys from GitHub Actions" {...bind("description")} />
           </div>
         </Card>
-        <Card title="Access">
-          {projects.data ? <AccessEditor value={access} onChange={setAccess} projects={projects.data.projects} who="the agent" /> : <Loading />}
-        </Card>
+        <Card title="Access">{projects.data ? <AccessEditor value={access} onChange={setAccess} projects={projects.data.projects} who="the agent" /> : <Loading />}</Card>
         <Card title="Key">
-          <KeyFields expires={expires} setExpires={setExpires} ips={ips} setIps={setIps} />
+          <KeyFields f={f} set={set} />
         </Card>
-        <ErrorBox error={s.error} />
-        <div class="flex justify-end gap-2">
-          <a class="btn" href="/access">
-            Cancel
-          </a>
-          <button class="btn btn-primary" disabled={s.busy}>
-            Create agent and key
-          </button>
-        </div>
+        <FormButtons s={s} submit="Create agent and key" cancelHref="/access" />
       </form>
     </Page>
   );
 }
 
-export function NewPerson(_: { path?: string }) {
-  const projects = useApi<{ projects: Project[] }>("/projects");
-  const [f, setF] = useState({ name: "", email: "", password: "" });
-  // Functional updates: autofill fires several input events before the next render.
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+export function NewPerson() {
+  const projects = useProjects();
+  const { f, bind } = useForm({ name: "", email: "", password: "" });
   const [access, setAccess] = useState<Access>({ mode: "some", allRole: "viewer", projects: {}, secrets: false, destroy: false });
   const s = useSubmit(async () => {
     const u = await post<User>("/users", { kind: "human", name: f.name.trim(), email: f.email.trim() || undefined, password: f.password, ...accessBody(access) });
@@ -331,66 +336,48 @@ export function NewPerson(_: { path?: string }) {
       <form class="max-w-3xl space-y-6" onSubmit={s.submit}>
         <Card title="Person">
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="Name">
-              <input class="input" required autoFocus maxLength={64} autoComplete="off" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
-            </Field>
-            <Field label="Email (optional)">
-              <input class="input" type="email" autoComplete="off" value={f.email} onInput={(e) => upd({email: e.currentTarget.value })} />
-            </Field>
-            <Field label="Password" hint="Use at least 10 characters, and share it through a safe channel.">
-              <input class="input" type="password" required minLength={10} autoComplete="new-password" value={f.password} onInput={(e) => upd({password: e.currentTarget.value })} />
-            </Field>
+            <Input label="Name" required autoFocus maxLength={64} autoComplete="off" {...bind("name")} />
+            <Input label="Email (optional)" type="email" autoComplete="off" {...bind("email")} />
+            <Input
+              label="Password"
+              hint="Use at least 10 characters, and share it through a safe channel."
+              type="password"
+              required
+              minLength={10}
+              autoComplete="new-password"
+              {...bind("password")}
+            />
           </div>
         </Card>
-        <Card title="Access">
-          {projects.data ? <AccessEditor value={access} onChange={setAccess} projects={projects.data.projects} who="this person" /> : <Loading />}
-        </Card>
-        <ErrorBox error={s.error} />
-        <div class="flex justify-end gap-2">
-          <a class="btn" href="/access">
-            Cancel
-          </a>
-          <button class="btn btn-primary" disabled={s.busy}>
-            Create person
-          </button>
-        </div>
+        <Card title="Access">{projects.data ? <AccessEditor value={access} onChange={setAccess} projects={projects.data.projects} who="this person" /> : <Loading />}</Card>
+        <FormButtons s={s} submit="Create person" cancelHref="/access" />
       </form>
     </Page>
   );
 }
 
-export function UserPage(props: { id?: string; path?: string }) {
+export function UserPage(props: { id?: string }) {
   const me = useMe();
   const id = props.id ?? "";
   const owner = me.principal.is_owner;
   const self = id === me.principal.user_id;
   const r = useApi<User>(`/users/${id}`);
-  const projects = useApi<{ projects: Project[] }>(owner ? "/projects" : null);
+  const projects = useProjects(owner);
   const u = r.data;
-  if (!u) {
-    return (
-      <Page title="Access">
-        <Loaded r={r}>{() => null}</Loaded>
-      </Page>
-    );
-  }
+  if (!u) return <LoadingPage title="Access" r={r} />;
   const editable = owner && !u.is_owner;
   return (
     <Page
       title={u.name}
-      sub={
-        <span class="flex flex-wrap items-center gap-2">
-          {owner && (
-            <a class="link" href="/access">
-              Access
-            </a>
-          )}
+      crumbs={owner ? [["Access", "/access"]] : undefined}
+      meta={
+        <>
           <span class="chip">{u.kind}</span>
           {u.is_owner && <span class="chip">owner</span>}
           {u.disabled && <span class="chip text-bad">disabled</span>}
-          {u.description && <span>{u.description}</span>}
-        </span>
+        </>
       }
+      sub={u.description}
       actions={
         editable && (
           <>
@@ -452,16 +439,11 @@ function Keys(props: { user: User; self: boolean }) {
   const keys = useApi<{ keys: Key[] }>(`/users/${u.id}/keys`);
   const [reveal, setReveal] = useState<{ token: string; snippets: Snippets } | null>(null);
   const [creating, setCreating] = useState(false);
-  const [f, setF] = useState({ name: "", expires: "90", ips: "" });
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+  const { f, set, bind, reset } = useForm({ name: "", expires: "90", ips: "" });
   const s = useSubmit(async () => {
-    const k = await post<{ id: string; token: string; snippets: Snippets }>(`/users/${u.id}/keys`, {
-      name: f.name.trim() || undefined,
-      expires_days: f.expires ? Number(f.expires) : undefined,
-      allowed_ips: words(f.ips).map(cidr),
-    });
+    const k = await post<{ id: string; token: string; snippets: Snippets }>(`/users/${u.id}/keys`, { name: f.name.trim() || undefined, ...keyBody(f) });
     setCreating(false);
-    setF({ name: "", expires: "90", ips: "" });
+    reset();
     setReveal(k);
     keys.reload();
   });
@@ -477,77 +459,68 @@ function Keys(props: { user: User; self: boolean }) {
       pad={false}
     >
       <Loaded r={keys}>
-        {(d) =>
-          d.keys.length === 0 ? (
-            <div class="p-4">
-              <Empty>{u.kind === "agent" ? "This agent has no keys, so it cannot reach the API until you create one." : "There are no API keys yet. Keys let scripts use the API as this user."}</Empty>
-            </div>
-          ) : (
-            <ul class="divide-y divide-line">
-              {d.keys.map((k) => {
-                const expired = k.expires_at != null && k.expires_at < nowSec;
-                const state = k.revoked_at ? "revoked" : expired ? "expired" : "active";
-                return (
-                  <li key={k.id} class={`flex flex-wrap items-center gap-3 px-4 py-3 ${state === "active" ? "" : "opacity-60"}`}>
-                    <div class="min-w-0 flex-1 space-y-1">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <span class="font-medium">{k.name}</span>
-                        <code class="text-xs text-muted">{k.prefix}…</code>
-                        <span class={`chip ${state === "active" ? "text-ok" : "text-bad"}`}>{state}</span>
-                      </div>
-                      <p class="text-xs text-muted">
-                        {k.last_used_at ? `Last used ${ago(k.last_used_at)}${k.last_used_ip ? ` from ${k.last_used_ip}` : ""}` : "Never used"}
-                        {" · "}
-                        {k.revoked_at ? `revoked ${ago(k.revoked_at)}` : k.expires_at ? `${expired ? "expired" : "expires"} ${when(k.expires_at)}` : "never expires"}
-                        {" · "}
-                        {k.allowed_ips.length ? `allowed from ${k.allowed_ips.join(", ")}` : "allowed from any address"}
-                        {" · "}created {ago(k.created_at)}
-                      </p>
+        {(d) => (
+          <Rows
+            items={d.keys}
+            empty={
+              u.kind === "agent"
+                ? "This agent has no keys, so it cannot reach the API until you create one."
+                : "There are no API keys yet. Keys let scripts use the API as this user."
+            }
+          >
+            {(k) => {
+              const expired = k.expires_at != null && k.expires_at < nowSec;
+              const state = k.revoked_at ? "revoked" : expired ? "expired" : "active";
+              return (
+                <li key={k.id} class={`row ${state === "active" ? "" : "opacity-60"}`}>
+                  <div class="min-w-0 flex-1 space-y-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="font-medium">{k.name}</span>
+                      <code class="text-xs text-muted">{k.prefix}…</code>
+                      <span class={`chip ${state === "active" ? "text-ok" : "text-bad"}`}>{state}</span>
                     </div>
-                    {state !== "revoked" && (
-                      <span class="flex gap-2">
-                        <Action
-                          confirm={`Rotate ${k.name}? The current token stops working right away.`}
-                          run={async () => {
-                            setReveal(await post(`/keys/${k.id}/rotate`));
-                            keys.reload();
-                          }}
-                        >
-                          Rotate
-                        </Action>
-                        <Action
-                          class="btn btn-danger"
-                          confirm={`Revoke ${k.name}? Anything using it loses access right away.`}
-                          run={() => del(`/keys/${k.id}`).then(keys.reload)}
-                          done="Key revoked."
-                        >
-                          Revoke
-                        </Action>
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-          )
-        }
+                    <p class="text-xs text-muted">
+                      {k.last_used_at ? `Last used ${ago(k.last_used_at)}${k.last_used_ip ? ` from ${k.last_used_ip}` : ""}` : "Never used"}
+                      {" · "}
+                      {k.revoked_at ? `revoked ${ago(k.revoked_at)}` : k.expires_at ? `${expired ? "expired" : "expires"} ${when(k.expires_at)}` : "never expires"}
+                      {" · "}
+                      {k.allowed_ips.length ? `allowed from ${k.allowed_ips.join(", ")}` : "allowed from any address"}
+                      {" · "}created {ago(k.created_at)}
+                    </p>
+                  </div>
+                  {state !== "revoked" && (
+                    <span class="flex gap-2">
+                      <Action
+                        confirm={`Rotate ${k.name}? The current token stops working right away.`}
+                        run={async () => {
+                          setReveal(await post(`/keys/${k.id}/rotate`));
+                          keys.reload();
+                        }}
+                      >
+                        Rotate
+                      </Action>
+                      <Action
+                        class="btn btn-danger"
+                        confirm={`Revoke ${k.name}? Anything using it loses access right away.`}
+                        run={() => del(`/keys/${k.id}`).then(keys.reload)}
+                        done="Key revoked."
+                      >
+                        Revoke
+                      </Action>
+                    </span>
+                  )}
+                </li>
+              );
+            }}
+          </Rows>
+        )}
       </Loaded>
       <Modal open={creating} onClose={() => setCreating(false)} title="New API key" wide>
         <form class="space-y-4" onSubmit={s.submit}>
-          <Field label="Key name" hint="A name helps you tell keys apart, like the machine or pipeline that uses the key.">
-            <input class="input" autoFocus placeholder="laptop" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
-          </Field>
-          <KeyFields expires={f.expires} setExpires={(expires) => upd({expires })} ips={f.ips} setIps={(ips) => upd({ips })} />
+          <Input label="Key name" hint="A name helps you tell keys apart, like the machine or pipeline that uses the key." autoFocus placeholder="laptop" {...bind("name")} />
+          <KeyFields f={f} set={set} />
           <p class="text-xs text-muted">The key acts with {props.self ? "your" : `${u.name}'s`} access, no more and no less.</p>
-          <ErrorBox error={s.error} />
-          <div class="flex justify-end gap-2">
-            <button type="button" class="btn" onClick={() => setCreating(false)}>
-              Cancel
-            </button>
-            <button class="btn btn-primary" disabled={s.busy}>
-              Create key
-            </button>
-          </div>
+          <FormButtons s={s} submit="Create key" onCancel={() => setCreating(false)} />
         </form>
       </Modal>
       <Modal open={!!reveal} onClose={() => setReveal(null)} title="New token" wide>
@@ -572,9 +545,9 @@ interface Entry {
 }
 const PAGE = 100;
 
-export function Audit(_: { path?: string }) {
+export function Audit() {
   const me = useMe();
-  const projects = useApi<{ projects: Project[] }>("/projects");
+  const projects = useProjects();
   const users = useApi<{ users: User[] }>(me.principal.is_owner ? "/users" : null);
   const [project, setProject] = useState("");
   const [actor, setActor] = useState("");
@@ -610,15 +583,15 @@ export function Audit(_: { path?: string }) {
       <AccessTabs current="audit" />
       <div class="mb-4 flex flex-wrap gap-3">
         <Field label="Project" class="min-w-44">
-          <Select
-            value={project}
-            onChange={setProject}
-            options={[["", "All projects"], ...(projects.data?.projects ?? []).map((p): [string, string] => [p.id, p.name])]}
-          />
+          <Select value={project} onChange={setProject} options={[["", "All projects"], ...(projects.data?.projects ?? []).map((p): [string, string] => [p.id, p.name])]} />
         </Field>
         <Field label="Who" class="min-w-44">
           {users.data ? (
-            <Select value={actor} onChange={setActor} options={[["", "Everyone"], ...users.data.users.map((u): [string, string] => [u.name, `${u.name} (${u.kind})`]), ["tugport", "Tugport itself"]]} />
+            <Select
+              value={actor}
+              onChange={setActor}
+              options={[["", "Everyone"], ...users.data.users.map((u): [string, string] => [u.name, `${u.name} (${u.kind})`]), ["tugport", "Tugport itself"]]}
+            />
           ) : (
             <input class="input" placeholder="Name" value={actor} onChange={(e) => setActor(e.currentTarget.value.trim())} />
           )}
@@ -634,7 +607,7 @@ export function Audit(_: { path?: string }) {
         <>
           <ul class="card divide-y divide-line">
             {entries.map((e) => (
-              <li key={e.id} class="px-4 py-2.5">
+              <li key={e.id} class="px-5 py-2.5">
                 <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                   <span class="font-medium">{e.actor ?? "tugport"}</span>
                   {e.actor_kind && e.actor_kind !== "human" && <span class="chip">{e.actor_kind}</span>}
@@ -642,7 +615,9 @@ export function Audit(_: { path?: string }) {
                   {e.target && <span class="min-w-0 break-all text-dim">{e.target}</span>}
                 </div>
                 <p class="mt-0.5 text-xs text-muted">
-                  {[when(e.at), e.project_id ? (names[e.project_id] ?? e.project_id) : "", e.ip ?? "", e.key_id ? `key ${e.key_id}` : "", e.detail ?? ""].filter(Boolean).join(" · ")}
+                  {[when(e.at), e.project_id ? (names[e.project_id] ?? e.project_id) : "", e.ip ?? "", e.key_id ? `key ${e.key_id}` : "", e.detail ?? ""]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </p>
               </li>
             ))}

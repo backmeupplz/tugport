@@ -50,9 +50,6 @@ export const put = <T = any>(p: string, body: unknown) => api<T>("PUT", p, body)
 export const patch = <T = any>(p: string, body: unknown) => api<T>("PATCH", p, body);
 export const del = <T = any>(p: string, body?: unknown) => api<T>("DELETE", p, body);
 
-/** Endpoints marked "planned" in docs/API.md answer 404 until a later build implements them. */
-export const isPlanned = (e: unknown) => e instanceof ApiError && e.status === 404;
-
 // ---- Types (only the fields the panel reads) ----
 
 export type Role = "viewer" | "deployer" | "operator" | "admin";
@@ -232,8 +229,7 @@ export function useNodes() {
 }
 
 /** A server's name for display. Without the server list only the panel's own server is known. */
-export const nodeName = (nodes: { nodes: Node[] } | null, id: string) =>
-  nodes?.nodes.find((n) => n.id === id)?.name ?? (id === "local" ? "the panel's server" : "another server");
+export const nodeName = (nodes: { nodes: Node[] } | null, id: string) => nodes?.nodes.find((n) => n.id === id)?.name ?? (id === "local" ? "the panel's server" : "another server");
 
 export const FINAL = new Set(["live", "failed", "cancelled", "superseded"]);
 
@@ -316,6 +312,9 @@ export function useEvent(fn: (e: Event) => void) {
  * also refetches after that long without a refetch, for data the stream does not bring to
  * everyone: "metrics" and "nodes" events reach only the owner.
  */
+/** The projects the caller can see; `enabled: false` skips the request. */
+export const useProjects = (enabled = true) => useApi<{ projects: Project[] }>(enabled ? "/projects" : null);
+
 export function useApi<T = any>(path: string | null, live?: (e: Event) => boolean, poll?: number) {
   const [state, setState] = useState<{ path?: string | null; data?: T; error?: ApiError }>({});
   const latest = useRef(path);

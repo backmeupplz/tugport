@@ -45,7 +45,6 @@ mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::sync::Arc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COMMIT: &str = match option_env!("TUGPORT_COMMIT") {
@@ -95,6 +94,8 @@ fn main() -> Result<()> {
     if shim::invoked_as_init() {
         shim::run(std::env::args().skip(1).collect());
     }
+    // One TLS provider for every command that talks HTTPS (panel, node, client, joins).
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Version => {
@@ -139,17 +140,20 @@ fn main() -> Result<()> {
         Cmd::Node => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(agent::run()),
         Cmd::Migrate { cmd } => migrate::main(cmd),
         Cmd::Client(c) => {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let code = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(cli::run(c, cli.json))?;
+            let code = block_on(cli::run(c, cli.json))??;
             std::process::exit(code);
         }
     }
 }
 
+/// Run a future to completion on a single-threaded runtime (one-shot commands).
+pub fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
+    Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(f))
+}
+
 /// Fresh one-time setup link, or None once an owner exists.
 pub fn setup_link(db: &db::Db) -> Result<Option<String>> {
-    let users: i64 = db.conn().query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
-    if users > 0 {
+    if db.row("SELECT 1 FROM users LIMIT 1", [], |_| Ok(()))?.is_some() {
         return Ok(None);
     }
     let token = util::token(32);
@@ -172,13 +176,13 @@ pub fn public_address() -> Option<String> {
     FOUND
         .get_or_init(|| {
             let own = public_ip()?;
-            let private = own.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_private() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64));
+            let private = own.parse().is_ok_and(nodes::local_only);
             if !private {
                 return Some(own);
             }
-            let out = std::process::Command::new("curl").args(["-s", "--max-time", "3", "https://1.1.1.1/cdn-cgi/trace"]).output().ok()?;
-            let seen = String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.strip_prefix("ip=").map(|v| v.trim().to_string()));
-            seen.filter(|ip| ip.parse::<std::net::IpAddr>().is_ok()).or(Some(own))
+            let trace = proc::run_sync(std::process::Command::new("curl").args(["-s", "--max-time", "3", "https://1.1.1.1/cdn-cgi/trace"])).unwrap_or_default();
+            let seen = trace.lines().find_map(|l| l.strip_prefix("ip=")).map(str::trim).filter(|ip| ip.parse::<std::net::IpAddr>().is_ok());
+            Some(seen.map_or(own, String::from))
         })
         .clone()
 }
@@ -211,18 +215,12 @@ async fn serve() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(logs::SelfLogHandle(selflog.clone())))
         .init();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let master = match crypto::load_master(&paths.etc) {
-        Ok(k) => k,
-        Err(_) if !paths.etc.join("master.key").exists() && !paths.etc.join("master.key.cred").exists() => {
-            let (k, store) = crypto::create_master(&paths.etc)?;
-            eprintln!(
-                "Created a new master key ({store:?}). Save this recovery key somewhere safe; it is shown only once:\n\n  {}\n",
-                crypto::recovery_key(&k)
-            );
-            k
-        }
-        Err(e) => return Err(e),
+    let master = if crypto::has_master(&paths.etc) {
+        crypto::load_master(&paths.etc)?
+    } else {
+        let (k, store) = crypto::create_master(&paths.etc)?;
+        eprintln!("Created a new master key ({store:?}). Save this recovery key somewhere safe; it is shown only once:\n\n  {}\n", crypto::recovery_key(&k));
+        k
     };
     let db = db::Db::open(&paths.db())?;
     let docker = bollard::Docker::connect_with_local_defaults().context("connecting to Docker")?;
@@ -230,22 +228,8 @@ async fn serve() -> Result<()> {
         tracing::info!("open {link} to create the owner account");
     }
 
-    let (events, _) = tokio::sync::broadcast::channel(4096);
     let slots = db.get_setting::<app::Settings>("instance")?.unwrap_or_default().builds.max_parallel.max(1) as usize;
-    let app: app::AppState = Arc::new(app::App {
-        paths,
-        db,
-        keys: crypto::Keyring::new(&master),
-        docker,
-        events,
-        deployer: deploy::Deployer::default(),
-        build_slots: Arc::new(tokio::sync::Semaphore::new(slots)),
-        proxy: proxy::Proxy::new()?,
-        logs: tokio::sync::broadcast::channel(8192).0,
-        selflog,
-        metrics: metrics::Metrics::default(),
-        nodes: nodes::Nodes::default(),
-    });
+    let app = app::App::new(paths, db, crypto::Keyring::new(&master), docker, selflog, slots)?;
     drop(master);
     nodes::load(&app)?;
     if let Err(e) = mesh::install_boot_hook() {
@@ -289,13 +273,8 @@ async fn serve() -> Result<()> {
     tokio::spawn(async {
         let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
         while hup.recv().await.is_some() {
-            match handoff::binary_path() {
-                Ok(exe) => {
-                    if let Err(e) = handoff::reexec(&exe, std::time::Duration::from_secs(30)).await {
-                        tracing::error!("reload failed: {e:#}");
-                    }
-                }
-                Err(e) => tracing::error!("reload failed: {e}"),
+            if let Err(e) = async { handoff::reexec(&handoff::binary_path()?, std::time::Duration::from_secs(30)).await }.await {
+                tracing::error!("reload failed: {e:#}");
             }
         }
     });

@@ -8,7 +8,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
 
 /// (api host, repository path) for an image reference.
-pub fn locate(image: &str) -> (String, String) {
+fn locate(image: &str) -> (String, String) {
     let (repo, _) = crate::runtime::split_image(image);
     let host = crate::runtime::registry_host(repo);
     if host == "docker.io" {
@@ -16,22 +16,8 @@ pub fn locate(image: &str) -> (String, String) {
         let path = if path.contains('/') { path.to_string() } else { format!("library/{path}") };
         ("registry-1.docker.io".into(), path)
     } else {
-        (host.to_string(), repo[host.len() + 1..].to_string())
+        (host.to_string(), repo.strip_prefix(host).and_then(|p| p.strip_prefix('/')).unwrap_or(repo).to_string())
     }
-}
-
-fn credentials(app: &App, image: &str) -> Option<(String, String)> {
-    use rusqlite::OptionalExtension;
-    let host = crate::runtime::registry_host(image);
-    let row: Option<(String, Vec<u8>)> = app
-        .db
-        .conn()
-        .query_row("SELECT username, password FROM registries WHERE host = ?1", [host], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()
-        .ok()
-        .flatten();
-    let (u, p) = row?;
-    Some((u, app.keys.open_str(&format!("registry:{host}"), &p).ok()?.to_string()))
 }
 
 /// A client for one registry URL: HTTPS only, and never to this server, the mesh or cloud
@@ -42,24 +28,24 @@ async fn client_for(url: &str) -> Result<reqwest::Client> {
 
 async fn send(app: &App, image: &str, method: reqwest::Method, url: &str) -> Result<reqwest::Response> {
     let client = client_for(url).await?;
-    let creds = credentials(app, image);
+    let creds = crate::runtime::registry_login(app, image).ok().flatten();
     let first = client.request(method.clone(), url).header(ACCEPT, MANIFEST_TYPES).send().await?;
     if first.status() != reqwest::StatusCode::UNAUTHORIZED {
         return Ok(first);
     }
-    let challenge = first.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let challenge = first.headers().get(WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let auth = if let Some(params) = challenge.strip_prefix("Bearer ") {
         let field = |k: &str| params.split(',').find_map(|p| p.trim().strip_prefix(&format!("{k}=")).map(|v| v.trim_matches('"').to_string()));
         let realm = field("realm").ok_or_else(|| anyhow!("registry sent no token realm"))?;
         let mut req = client_for(&realm).await?.get(&realm).query(&[("service", field("service").unwrap_or_default()), ("scope", field("scope").unwrap_or_default())]);
         if let Some((u, p)) = &creds {
-            req = req.basic_auth(u, Some(p));
+            req = req.basic_auth(u, Some(p.as_str()));
         }
         let tok: serde_json::Value = serde_json::from_slice(&crate::util::read_capped(req.send().await?.error_for_status()?, 1 << 20).await?)?;
         let token = tok["token"].as_str().or(tok["access_token"].as_str()).ok_or_else(|| anyhow!("registry gave no token"))?;
         format!("Bearer {token}")
     } else if let Some((u, p)) = &creds {
-        format!("Basic {}", crate::crypto::b64(format!("{u}:{p}").as_bytes()))
+        format!("Basic {}", crate::crypto::b64(format!("{u}:{}", p.as_str()).as_bytes()))
     } else {
         bail!("the registry needs credentials; add them under registries");
     };

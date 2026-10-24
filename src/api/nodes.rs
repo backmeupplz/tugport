@@ -1,6 +1,7 @@
 //! Servers: list, add (join command), rename/label, remove.
 
-use super::{ApiError, ApiResult, Auth, base_url};
+use super::{bad, detached};
+use super::{ApiError, ApiResult, Auth, Owner, base_url, ok};
 use crate::app::AppState;
 use crate::nodes;
 use axum::Json;
@@ -11,29 +12,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-fn require_servers(a: &Auth) -> ApiResult<()> {
-    if a.0.is_owner || a.0.all_projects_role.is_some() { Ok(()) } else { Err(ApiError::forbidden("servers need the owner or a role on all projects")) }
-}
-
 pub async fn list(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
-    require_servers(&a)?;
+    a.require_servers("servers need the owner or a role on all projects")?;
     let mesh = nodes::mesh_enabled(&app);
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT id, name, is_local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at, ingress FROM nodes ORDER BY is_local DESC, name")?;
-    let rows: Vec<Value> = stmt
-        .query_map([], |r| {
-            let labels: String = r.get(6)?;
-            let info: String = r.get(8)?;
-            let local: bool = r.get(2)?;
-            Ok(json!({
-                "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "local": local,
-                "address": r.get::<_, Option<String>>(3)?, "mesh_ip": r.get::<_, Option<String>>(4)?, "region": r.get::<_, Option<String>>(5)?,
-                "labels": serde_json::from_str::<Value>(&labels).unwrap_or_default(), "status": r.get::<_, String>(7)?,
-                "info": serde_json::from_str::<Value>(&info).unwrap_or_default(), "last_seen_at": r.get::<_, Option<i64>>(9)?,
-                "created_at": r.get::<_, i64>(10)?, "ingress": local || r.get::<_, bool>(11)?,
-            }))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+    let sql = "SELECT id, name, is_local, address, mesh_ip, region, labels, status, info, last_seen_at, created_at, ingress FROM nodes ORDER BY is_local DESC, name";
+    let json_col = |r: &rusqlite::Row, i| r.get::<_, String>(i).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default());
+    let rows = app.db.rows(sql, [], |r| {
+        let local: bool = r.get(2)?;
+        Ok(json!({
+            "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "local": local,
+            "address": r.get::<_, Option<String>>(3)?, "mesh_ip": r.get::<_, Option<String>>(4)?, "region": r.get::<_, Option<String>>(5)?,
+            "labels": json_col(r, 6)?, "status": r.get::<_, String>(7)?, "info": json_col(r, 8)?, "last_seen_at": r.get::<_, Option<i64>>(9)?,
+            "created_at": r.get::<_, i64>(10)?, "ingress": local || r.get::<_, bool>(11)?,
+        }))
+    })?;
     Ok(Json(json!({ "nodes": rows, "mesh": mesh })))
 }
 
@@ -45,11 +37,10 @@ pub struct TokenBody {
 }
 
 /// A one-hour command that adds a server (turning on the mesh the first time).
-pub async fn join_token(State(app): State<AppState>, a: Auth, headers: HeaderMap, body: Option<Json<TokenBody>>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn join_token(State(app): State<AppState>, Owner(a): Owner, headers: HeaderMap, body: Option<Json<TokenBody>>) -> ApiResult<Json<Value>> {
     let url = body.and_then(|b| b.0.panel_url).unwrap_or_else(|| base_url(&headers));
-    let t = nodes::join_token(&app, url.trim_end_matches('/')).await?;
-    app.audit(Some(&a.0), "node.join_token", None, None, None, None);
+    let t = nodes::join_token_for(&app, url.trim_end_matches('/'), None).await?;
+    a.audit(&app, "node.join_token", None, None);
     Ok(Json(serde_json::to_value(t)?))
 }
 
@@ -58,10 +49,8 @@ pub async fn join(State(app): State<AppState>, super::ClientIp(seen): super::Cli
     // The panel address this server reached us at, when it is a plain IP.
     let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
     let panel_ip = host.parse::<std::net::SocketAddr>().map(|a| a.ip()).or_else(|_| host.trim_matches(['[', ']']).parse()).ok();
-    match nodes::join(&app, req, panel_ip, seen).await {
-        Ok(r) => Ok(Json(serde_json::to_value(r)?)),
-        Err(e) => Err(ApiError::bad_request(format!("{e:#}"))),
-    }
+    let r = nodes::join(&app, req, panel_ip, seen).await.map_err(bad)?;
+    Ok(Json(serde_json::to_value(r)?))
 }
 
 #[derive(Deserialize)]
@@ -76,8 +65,7 @@ pub struct UpdateBody {
     ingress: Option<bool>,
 }
 
-pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Json(b): Json<UpdateBody>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn update(State(app): State<AppState>, Owner(a): Owner, Path(id): Path<String>, Json(b): Json<UpdateBody>) -> ApiResult<Json<Value>> {
     if app.node(&id).is_none() {
         return Err(ApiError::not_found("server not found"));
     }
@@ -85,29 +73,28 @@ pub async fn update(State(app): State<AppState>, a: Auth, Path(id): Path<String>
         if !crate::util::valid_name(name) {
             return Err(ApiError::bad_request("use lowercase letters, digits and dashes"));
         }
-        app.db.conn().execute("UPDATE nodes SET name = ?1 WHERE id = ?2", params![name, id])?;
+        app.db.exec("UPDATE nodes SET name = ?1 WHERE id = ?2", params![name, id])?;
     }
     if let Some(region) = &b.region {
         let region = region.as_deref().map(str::trim).filter(|r| !r.is_empty());
-        app.db.conn().execute("UPDATE nodes SET region = ?1 WHERE id = ?2", params![region, id])?;
+        app.db.exec("UPDATE nodes SET region = ?1 WHERE id = ?2", params![region, id])?;
     }
     if let Some(labels) = &b.labels {
-        app.db.conn().execute("UPDATE nodes SET labels = ?1 WHERE id = ?2", params![serde_json::to_string(labels)?, id])?;
+        app.db.exec("UPDATE nodes SET labels = ?1 WHERE id = ?2", params![serde_json::to_string(labels)?, id])?;
     }
-    let ingress_changed = b.ingress.is_some();
     if let Some(ingress) = b.ingress {
         // The panel is always ingress; this toggles the other servers.
-        app.db.conn().execute("UPDATE nodes SET ingress = ?1 WHERE id = ?2 AND is_local = 0", params![ingress, id])?;
+        app.db.exec("UPDATE nodes SET ingress = ?1 WHERE id = ?2 AND is_local = 0", params![ingress, id])?;
     }
     nodes::load(&app)?;
-    if ingress_changed {
+    if b.ingress.is_some() {
         // A server turned into an ingress needs the certificates and the full table; one turned
         // back loses them on its next pushed table (the old ones linger until it restarts).
         nodes::push_certs(&app).await;
         nodes::push_routes(&app);
     }
-    app.audit(Some(&a.0), "node.update", None, None, Some(&id), None);
-    Ok(Json(json!({ "ok": true })))
+    a.audit(&app, "node.update", Some(&id), None);
+    Ok(ok())
 }
 
 #[derive(Deserialize, Default)]
@@ -121,39 +108,37 @@ pub struct RemoveQuery {
 
 /// Remove a server. Movable services go to other servers first; a machine Tugport created
 /// in a cloud account is deleted there as well.
-pub async fn remove(State(app): State<AppState>, a: Auth, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn remove(State(app): State<AppState>, Owner(a): Owner, Path(id): Path<String>, Query(q): Query<RemoveQuery>) -> ApiResult<Json<Value>> {
     let node = app.node(&id).ok_or_else(|| ApiError::not_found("server not found"))?;
     if node.local {
         return Err(ApiError::bad_request("the panel's own server cannot be removed"));
     }
-    let name = node.name.clone();
     let keeping: Vec<String> = crate::store::services(&app, None)?
         .into_iter()
-        .filter(|s| app.db.get_state(&format!("pin:{}", s.id)).ok().flatten().as_deref() == Some(id.as_str()))
+        .filter(|s| app.db.state::<String>(&format!("pin:{}", s.id)).as_deref() == Some(id.as_str()))
         .map(|s| format!("{}/{}", s.project, s.name))
         .collect();
     if !keeping.is_empty() && !q.force {
-        return Err(ApiError::conflict(format!("{name} keeps the data of {}; move or delete them first (or remove with force)", keeping.join(", "))));
+        return Err(ApiError::conflict(format!("{} keeps the data of {}; move or delete them first (or remove with force)", node.name, keeping.join(", "))));
     }
     let machine = crate::cloud::machine_of(&app, &id);
     // Finishes even if the caller goes away: a half-drained server would take no new work.
     let (app2, id2, m2) = (app.clone(), id.clone(), machine.clone());
-    let done = tokio::spawn(async move {
+    detached(async move {
         if nodes::online(&app2, &id2) {
             nodes::drain(&app2, &id2).await?;
         }
         nodes::remove(&app2, &id2).await?;
         match &m2 {
             Some(m) if q.keep_machine => {
-                app2.db.conn().execute("DELETE FROM cloud_servers WHERE id = ?1", [m])?;
+                app2.db.exec("DELETE FROM cloud_servers WHERE id = ?1", [m])?;
             }
             Some(m) => crate::cloud::destroy(&app2, m).await?,
             None => {}
         }
         anyhow::Ok(())
-    });
-    done.await.map_err(anyhow::Error::from)??;
-    app.audit(Some(&a.0), "node.remove", None, None, Some(&name), machine.as_ref().map(|_| if q.keep_machine { "machine kept" } else { "machine deleted" }));
+    })
+    .await??;
+    a.audit(&app, "node.remove", Some(&node.name), machine.as_ref().map(|_| if q.keep_machine { "machine kept" } else { "machine deleted" }));
     Ok(Json(json!({ "ok": true, "machine_deleted": machine.is_some() && !q.keep_machine })))
 }

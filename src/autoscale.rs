@@ -21,7 +21,7 @@ pub fn replicas(app: &App, s: &store::Service) -> u32 {
     match &s.spec.autoscale {
         Some(a) => {
             let (min, max) = bounds(a);
-            let current = app.db.get_state(&format!("scale:{}", s.id)).ok().flatten().and_then(|v| v.parse().ok());
+            let current = app.db.state(&format!("scale:{}", s.id));
             current.unwrap_or(min).clamp(min, max)
         }
         None => s.spec.replicas.max(1),
@@ -30,7 +30,7 @@ pub fn replicas(app: &App, s: &store::Service) -> u32 {
 
 /// Replicas the load calls for: total CPU (percent of one core, all replicas) over the
 /// per-replica target, or requests per second over theirs, whichever wants more.
-pub fn wanted(a: &Autoscale, running: u32, cpu: Option<f64>, rps: Option<f64>) -> u32 {
+fn wanted(a: &Autoscale, running: u32, cpu: Option<f64>, rps: Option<f64>) -> u32 {
     let need = |load: Option<f64>, target: Option<u32>| Some((load? / target?.max(1) as f64).ceil() as u32);
     let want = need(cpu, a.cpu_percent).into_iter().chain(need(rps, a.rps)).max().unwrap_or(running);
     let (min, max) = bounds(a);

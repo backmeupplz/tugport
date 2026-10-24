@@ -9,7 +9,8 @@ use anyhow::Result;
 use bollard::query_parameters::{ListContainersOptions, LogsOptions};
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,9 +26,11 @@ pub struct LogLine {
     pub line: String,
 }
 
-pub fn service_dir(app: &App, service_id: &str) -> PathBuf {
+fn service_dir(app: &App, service_id: &str) -> PathBuf {
     app.paths.logs().join(service_id)
 }
+
+const DAY_MS: i64 = 86_400_000;
 
 fn day_file(dir: &Path, ts_ms: i64) -> PathBuf {
     let day = chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_default().format("%Y-%m-%d");
@@ -43,12 +46,12 @@ pub async fn collect(app: AppState) {
 
 async fn collect_on(app: AppState, docker: bollard::Docker, following: Arc<Mutex<HashSet<String>>>) {
     loop {
-        let filters = HashMap::from([("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)])]);
+        let filters = runtime::managed();
         let Ok(list) = docker.list_containers(Some(ListContainersOptions { filters: Some(filters), ..Default::default() })).await else { return };
         for c in list {
             let (Some(id), Some(labels)) = (c.id, c.labels) else { continue };
             let Some(service) = labels.get(runtime::L_SERVICE).cloned() else { continue };
-            if crate::util::lock(&following).contains(&id) {
+            if util::lock(&following).contains(&id) {
                 continue;
             }
             // Labels on other servers come from their Docker: the id names a folder here, so
@@ -56,14 +59,14 @@ async fn collect_on(app: AppState, docker: bollard::Docker, following: Arc<Mutex
             if !crate::store::service(&app, &service).is_ok_and(|s| s.is_some_and(|s| s.id == service)) {
                 continue;
             }
-            if !crate::util::lock(&following).insert(id.clone()) {
+            if !util::lock(&following).insert(id.clone()) {
                 continue;
             }
-            let name = c.names.and_then(|n| n.first().cloned()).unwrap_or_default().trim_start_matches('/').to_string();
+            let name = runtime::listed_name(c.names);
             let (app, docker, following) = (app.clone(), docker.clone(), following.clone());
             tokio::spawn(async move {
                 follow(&app, &docker, &id, &name, &service).await;
-                crate::util::lock(&following).remove(&id);
+                util::lock(&following).remove(&id);
             });
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -72,7 +75,7 @@ async fn collect_on(app: AppState, docker: bollard::Docker, following: Arc<Mutex
 
 async fn follow(app: &AppState, docker: &bollard::Docker, container: &str, name: &str, service_id: &str) {
     let pos_key = format!("logpos:{container}");
-    let last_ms: i64 = app.db.get_state(&pos_key).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let last_ms: i64 = app.db.state(&pos_key).unwrap_or(0);
     let since = if last_ms > 0 { (last_ms / 1000) as i32 } else { (util::now() - 5) as i32 };
     let mut stream = docker.logs(
         container,
@@ -84,7 +87,10 @@ async fn follow(app: &AppState, docker: &bollard::Docker, container: &str, name:
     let mut masker_at = std::time::Instant::now();
     let mut newest = last_ms;
     let mut saved_at = std::time::Instant::now();
-    let mut file: Option<(PathBuf, std::fs::File)> = None;
+    // The open day file, by day number, and its lines from this chunk: written at once, so
+    // replicas appending to the same file never interleave within a line.
+    let mut file: Option<(i64, std::fs::File)> = None;
+    let mut pending = String::new();
     while let Some(Ok(chunk)) = stream.next().await {
         let (stream_name, bytes) = match chunk {
             bollard::container::LogOutput::StdErr { message } => ("stderr", message),
@@ -100,23 +106,37 @@ async fn follow(app: &AppState, docker: &bollard::Docker, container: &str, name:
             if ts <= last_ms {
                 continue;
             }
-            let text = masker.mask(text).into_owned();
+            let text = masker.mask(text);
             newest = newest.max(ts);
-            let path = day_file(&dir, ts);
-            if file.as_ref().is_none_or(|(p, _)| *p != path) {
-                file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok().map(|f| (path, f));
+            let day = ts.div_euclid(DAY_MS);
+            if file.as_ref().is_none_or(|(d, _)| *d != day) {
+                write_pending(&mut file, &mut pending);
+                file = std::fs::OpenOptions::new().create(true).append(true).open(day_file(&dir, ts)).ok().map(|f| (day, f));
             }
-            if let Some((_, f)) = file.as_mut() {
-                let _ = writeln!(f, "{ts}\t{name}\t{stream_name}\t{}", text.replace('\t', "    "));
+            let _ = if text.contains('\t') {
+                writeln!(pending, "{ts}\t{name}\t{stream_name}\t{}", text.replace('\t', "    "))
+            } else {
+                writeln!(pending, "{ts}\t{name}\t{stream_name}\t{text}")
+            };
+            // Live viewers only; most of the time nobody is watching.
+            if app.logs.receiver_count() > 0 {
+                let _ = app.logs.send(LogLine { service_id: service_id.to_string(), ts, replica: name.to_string(), stream: stream_name, line: text.into_owned() });
             }
-            let _ = app.logs.send(LogLine { service_id: service_id.to_string(), ts, replica: name.to_string(), stream: stream_name, line: text });
         }
+        write_pending(&mut file, &mut pending);
         if saved_at.elapsed() > Duration::from_secs(5) {
             let _ = app.db.set_state(&pos_key, &newest.to_string());
             saved_at = std::time::Instant::now();
         }
     }
     let _ = app.db.set_state(&pos_key, &newest.to_string());
+}
+
+fn write_pending(file: &mut Option<(i64, std::fs::File)>, pending: &mut String) {
+    if let Some((_, f)) = file {
+        let _ = f.write_all(pending.as_bytes());
+    }
+    pending.clear();
 }
 
 fn masker_fn(app: &App, service_id: &str) -> Masker {
@@ -229,15 +249,15 @@ pub fn cleanup(app: &App) -> Result<usize> {
     files.sort_by_key(|f| f.1);
     let mut total: u64 = files.iter().map(|f| f.2).sum();
     let cap = (s.max_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-    let oldest_kept = s.max_days.map(|d| util::now_ms() - d as i64 * 86_400_000);
+    let oldest_kept = s.max_days.map(|d| util::now_ms() - i64::from(d) * DAY_MS);
     let mut removed = 0;
     for (path, start, size) in files {
-        let too_old = oldest_kept.is_some_and(|o| start + 86_400_000 < o);
+        let too_old = oldest_kept.is_some_and(|o| start + DAY_MS < o);
         if !too_old && total <= cap {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {
-            total -= size;
+            total = total.saturating_sub(size);
             removed += 1;
         }
     }
@@ -266,14 +286,14 @@ impl SelfLog {
             return;
         }
         {
-            let mut r = crate::util::lock(&self.recent);
+            let mut r = util::lock(&self.recent);
             if r.len() >= 2000 {
                 r.pop_front();
             }
             r.push_back(line.to_string());
         }
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let mut f = crate::util::lock(&self.file);
+        let mut f = util::lock(&self.file);
         if f.as_ref().is_none_or(|(d, _)| *d != day) {
             *f = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join(format!("{day}.log"))).ok().map(|file| (day, file));
         }
@@ -283,12 +303,10 @@ impl SelfLog {
     }
 }
 
-pub struct SelfLogWriter(pub Arc<SelfLog>);
-
-impl Write for SelfLogWriter {
+impl Write for &SelfLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         for line in String::from_utf8_lossy(buf).lines() {
-            self.0.write_line(line);
+            self.write_line(line);
         }
         Ok(buf.len())
     }
@@ -298,9 +316,9 @@ impl Write for SelfLogWriter {
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SelfLogHandle {
-    type Writer = SelfLogWriter;
+    type Writer = &'a SelfLog;
     fn make_writer(&'a self) -> Self::Writer {
-        SelfLogWriter(self.0.clone())
+        &self.0
     }
 }
 

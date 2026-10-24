@@ -1,21 +1,21 @@
 //! Alerts: thresholds that hold for a while, crash loops and out-of-memory kills.
 
 use crate::app::{App, AppState};
-use crate::metrics::Snapshot;
+use crate::metrics::{Snapshot, percent};
 use crate::{runtime, store, util};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use std::collections::{HashMap, VecDeque};
 
 /// Threshold alerts for a server's snapshot (`node` None = the panel's own server).
 pub async fn evaluate(app: &App, node: Option<&crate::nodes::NodeHandle>, s: &Snapshot) {
     let a = app.settings().alerts;
-    let pct = |u: &crate::metrics::Usage| u.used as f64 / u.total.max(1) as f64 * 100.0;
+    let memory = percent(s.memory.used, s.memory.total);
     let mut checks: Vec<(String, bool, String)> = vec![
         ("cpu".into(), s.cpu > a.cpu_percent, format!("CPU is at {:.0}%", s.cpu)),
-        ("memory".into(), pct(&s.memory) > a.memory_percent, format!("Memory is at {:.0}%", pct(&s.memory))),
+        ("memory".into(), memory > a.memory_percent, format!("Memory is at {:.0}%", memory)),
     ];
     for d in &s.disks {
-        let p = d.used as f64 / d.total.max(1) as f64 * 100.0;
+        let p = percent(d.used, d.total);
         checks.push((format!("disk:{}", d.mount), p > a.disk_percent, format!("Disk {} is {:.0}% full", d.mount, p)));
     }
     for g in &s.gpus {
@@ -29,15 +29,14 @@ pub async fn evaluate(app: &App, node: Option<&crate::nodes::NodeHandle>, s: &Sn
             Some(n) => (format!("{}:{key}", n.id), format!("{}: {msg}", n.name)),
             None => (key, msg),
         };
-        let row: Option<(i64, Option<i64>)> =
-            app.db.conn().query_row("SELECT since, last_notified FROM alerts WHERE key = ?1", [&key], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
+        let row: Option<(i64, Option<i64>)> = app.db.row("SELECT since, last_notified FROM alerts WHERE key = ?1", [&key], |r| Ok((r.get(0)?, r.get(1)?))).ok().flatten();
         match (firing, row) {
             (true, None) => {
-                let _ = app.db.conn().execute("INSERT INTO alerts (key, firing, since, message) VALUES (?1, 1, ?2, ?3)", params![key, now, msg]);
+                let _ = app.db.exec("INSERT INTO alerts (key, firing, since, message) VALUES (?1, 1, ?2, ?3)", params![key, now, msg]);
             }
             (true, Some((since, None))) if now - since >= a.for_minutes as i64 * 60 => {
                 crate::notify::event(app, "alert", &format!("Alert: {msg}"), &format!("It has lasted {} minutes.", (now - since) / 60), None).await;
-                let _ = app.db.conn().execute("UPDATE alerts SET last_notified = ?1, message = ?2 WHERE key = ?3", params![now, msg, key]);
+                let _ = app.db.exec("UPDATE alerts SET last_notified = ?1, message = ?2 WHERE key = ?3", params![now, msg, key]);
                 app.emit("alert", None, None, serde_json::json!({ "key": key, "message": msg, "firing": true }));
             }
             (false, Some((_, notified))) => {
@@ -45,7 +44,7 @@ pub async fn evaluate(app: &App, node: Option<&crate::nodes::NodeHandle>, s: &Sn
                     crate::notify::event(app, "alert", &format!("Resolved: {key}"), "Back to normal.", None).await;
                     app.emit("alert", None, None, serde_json::json!({ "key": key, "firing": false }));
                 }
-                let _ = app.db.conn().execute("DELETE FROM alerts WHERE key = ?1", [&key]);
+                let _ = app.db.exec("DELETE FROM alerts WHERE key = ?1", [&key]);
             }
             _ => {}
         }
@@ -63,13 +62,15 @@ async fn watch_on(app: AppState, docker: bollard::Docker) {
     let mut quiet_until: HashMap<String, i64> = HashMap::new();
     // Containers being stopped on purpose (Docker sends them a kill first): their exit is no crash.
     let mut stopping: HashMap<String, i64> = HashMap::new();
-    let filters = HashMap::from([
-        ("type".to_string(), vec!["container".to_string()]),
-        ("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)]),
-    ]);
+    let mut filters = runtime::managed();
+    filters.insert("type".into(), vec!["container".into()]);
     let mut events = docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
     while let Some(Ok(e)) = events.next().await {
-        let action = e.action.clone().unwrap_or_default();
+        let action = e.action.unwrap_or_default();
+        let status = matches!(action.as_str(), "start" | "die" | "oom" | "pause" | "unpause") || action.starts_with("health_status");
+        if !status && action != "kill" {
+            continue;
+        }
         let attrs = e.actor.and_then(|a| a.attributes).unwrap_or_default();
         let Some(service_id) = attrs.get(runtime::L_SERVICE).cloned() else { continue };
         let name = attrs.get("name").cloned().unwrap_or_default();
@@ -108,7 +109,7 @@ async fn watch_on(app: AppState, docker: bollard::Docker) {
             }
             _ => {}
         }
-        if matches!(action.as_str(), "start" | "die" | "oom" | "pause" | "unpause") || action.starts_with("health_status") {
+        if status {
             status_changed(&app, &s, &action, &name);
         }
     }

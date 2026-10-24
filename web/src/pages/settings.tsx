@@ -1,8 +1,30 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { del, isPlanned, patch, post, put, useApi, useMe } from "../api";
-import { Action, Card, Check, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Planned, Select, Tabs, toast, useSubmit } from "../ui";
-import { ago, bytes, cidr, mergePatch, num, sentence, when, words } from "../util";
+import { del, patch, post, put, useApi, useMe } from "../api";
+import {
+  Action,
+  Card,
+  Check,
+  Empty,
+  ErrorBox,
+  Field,
+  FormButtons,
+  Input,
+  Loaded,
+  Modal,
+  Note,
+  Page,
+  Pill,
+  Rows,
+  Select,
+  Tabs,
+  TextArea,
+  UnsavedBar,
+  toast,
+  useForm,
+  useSubmit,
+} from "../ui";
+import { ago, bytes, cidr, mergePatch, num, sentence, str, when, words } from "../util";
 import { PROVIDER_KINDS } from "./new-service";
 
 const TABS: [string, string][] = [
@@ -15,7 +37,7 @@ const TABS: [string, string][] = [
   ["about", "About"],
 ];
 
-export function Settings(props: { tab?: string; path?: string }) {
+export function Settings(props: { tab?: string }) {
   const me = useMe();
   const tab = TABS.some(([id]) => id === props.tab) ? (props.tab as string) : "general";
   const owner = me.principal.is_owner;
@@ -44,7 +66,6 @@ export function Settings(props: { tab?: string; path?: string }) {
 // ---- General ----
 
 type InstanceSettings = Record<string, any>;
-const str = (v: unknown) => (v == null ? "" : String(v));
 
 function toForm(s: InstanceSettings) {
   return {
@@ -104,9 +125,7 @@ function General() {
 }
 
 function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceSettings) => void }) {
-  const [f, setF] = useState(() => toForm(props.settings));
-  const set = (p: Partial<GeneralForm>) => setF((x) => ({ ...x, ...p }));
-  const text = (k: keyof GeneralForm) => ({ value: f[k] as string, onInput: (e: { currentTarget: { value: string } }) => set({ [k]: e.currentTarget.value }) });
+  const { f, set, bind, reset } = useForm(toForm(props.settings));
   const usage = useApi<{ total_bytes: number }>("/logs/usage");
   const changes = mergePatch(props.settings, toSettings(props.settings, f));
   const dirty = Object.keys(changes).length > 0;
@@ -118,9 +137,13 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
     <form class="space-y-6" onSubmit={s.submit}>
       <Card title="Panel">
         <div class="space-y-4">
-          <Field label="Panel domain" hint="Point the domain's DNS at this server first. Tugport then serves the panel there with HTTPS, and Git hosts send webhooks to it.">
-            <input class="input font-mono" placeholder="deploy.example.com" spellcheck={false} {...text("panelDomain")} />
-          </Field>
+          <Input
+            label="Panel domain"
+            hint="Point the domain's DNS at this server first. Tugport then serves the panel there with HTTPS, and Git hosts send webhooks to it."
+            mono
+            placeholder="deploy.example.com"
+            {...bind("panelDomain")}
+          />
           {"panel_public" in props.settings && (
             <Check
               checked={f.panelPublic}
@@ -129,18 +152,20 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
               hint="Turn this off to keep the panel private. The panel domain then answers only Git and deploy webhooks, and you open the panel through the address below, such as a tailnet IP."
             />
           )}
-          <Field
+          <Input
             label="Panel address"
             hint="The address and port the panel itself listens on, like 100.64.0.5:8484 for a tailnet address. A change takes effect when Tugport restarts, so make sure you can reach the new address first."
-          >
-            <input class="input font-mono" spellcheck={false} {...text("panelListen")} />
-          </Field>
-          <Field label="Email for Let's Encrypt" hint="Let's Encrypt writes here about certificate problems.">
-            <input class="input" type="email" {...text("acmeEmail")} />
-          </Field>
-          <Field label="Trusted proxies" hint="Only these addresses may set the client IP through X-Forwarded-For, like Cloudflare or a load balancer; write one range per line.">
-            <textarea class="input h-20" spellcheck={false} placeholder="173.245.48.0/20" {...text("trusted")} />
-          </Field>
+            mono
+            {...bind("panelListen")}
+          />
+          <Input label="Email for Let's Encrypt" hint="Let's Encrypt writes here about certificate problems." type="email" {...bind("acmeEmail")} />
+          <TextArea
+            label="Trusted proxies"
+            hint="Only these addresses may set the client IP through X-Forwarded-For, like Cloudflare or a load balancer; write one range per line."
+            class="h-20"
+            placeholder="173.245.48.0/20"
+            {...bind("trusted")}
+          />
         </div>
       </Card>
       <Card title="Deploys and builds">
@@ -156,15 +181,9 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
             />
           </Field>
           <div class="grid gap-4 sm:grid-cols-3">
-            <Field label="Parallel builds">
-              <input class="input" type="number" min={1} {...text("maxParallel")} />
-            </Field>
-            <Field label="Build CPU cap (cores)" hint="Empty means half of the machine.">
-              <input class="input" type="number" min={0} step="0.5" {...text("bCpus")} />
-            </Field>
-            <Field label="Build memory cap (MB)" hint="Empty means half of the memory.">
-              <input class="input" type="number" min={0} {...text("bMem")} />
-            </Field>
+            <Input label="Parallel builds" type="number" min={1} {...bind("maxParallel")} />
+            <Input label="Build CPU cap (cores)" hint="Empty means half of the machine." type="number" min={0} step="0.5" {...bind("bCpus")} />
+            <Input label="Build memory cap (MB)" hint="Empty means half of the memory." type="number" min={0} {...bind("bMem")} />
           </div>
         </div>
       </Card>
@@ -178,28 +197,24 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
           />
           {f.dcEnabled && (
             <div class="grid gap-4 sm:grid-cols-2">
-              <Field label="Every (hours)">
-                <input class="input" type="number" min={1} {...text("dcHours")} />
-              </Field>
-              <Field label="Build cache to keep (GB)">
-                <input class="input" type="number" min={0} {...text("dcCache")} />
-              </Field>
+              <Input label="Every (hours)" type="number" min={1} {...bind("dcHours")} />
+              <Input label="Build cache to keep (GB)" type="number" min={0} {...bind("dcCache")} />
             </div>
           )}
           <Check
             checked={f.lcEnabled}
             onChange={(lcEnabled) => set({ lcEnabled })}
             label="Delete old logs automatically"
-            hint={usage.data ? `Logs use ${bytes(usage.data.total_bytes)} right now. The oldest are deleted first.` : "The oldest logs are deleted first once they pass the size or age below."}
+            hint={
+              usage.data
+                ? `Logs use ${bytes(usage.data.total_bytes)} right now. The oldest are deleted first.`
+                : "The oldest logs are deleted first once they pass the size or age below."
+            }
           />
           {f.lcEnabled && (
             <div class="grid gap-4 sm:grid-cols-2">
-              <Field label="Keep at most (GB)">
-                <input class="input" type="number" min={0} step="0.5" {...text("lcGb")} />
-              </Field>
-              <Field label="Keep at most (days)" hint="Empty means no age limit.">
-                <input class="input" type="number" min={1} {...text("lcDays")} />
-              </Field>
+              <Input label="Keep at most (GB)" type="number" min={0} step="0.5" {...bind("lcGb")} />
+              <Input label="Keep at most (days)" hint="Empty means no age limit." type="number" min={1} {...bind("lcDays")} />
             </div>
           )}
         </div>
@@ -207,49 +222,27 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
       <Card title="Alert thresholds">
         <p class="mb-4 text-xs text-muted">Alerts go to the channels set up under Notifications once a condition lasts for the time below.</p>
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-5">
-          <Field label="CPU (%)">
-            <input class="input" type="number" min={1} max={100} {...text("aCpu")} />
-          </Field>
-          <Field label="Memory (%)">
-            <input class="input" type="number" min={1} max={100} {...text("aMem")} />
-          </Field>
-          <Field label="Disk (%)">
-            <input class="input" type="number" min={1} max={100} {...text("aDisk")} />
-          </Field>
-          <Field label="GPU (°C)">
-            <input class="input" type="number" min={1} {...text("aGpu")} />
-          </Field>
-          <Field label="For (minutes)">
-            <input class="input" type="number" min={1} {...text("aFor")} />
-          </Field>
+          <Input label="CPU (%)" type="number" min={1} max={100} {...bind("aCpu")} />
+          <Input label="Memory (%)" type="number" min={1} max={100} {...bind("aMem")} />
+          <Input label="Disk (%)" type="number" min={1} max={100} {...bind("aDisk")} />
+          <Input label="GPU (°C)" type="number" min={1} {...bind("aGpu")} />
+          <Input label="For (minutes)" type="number" min={1} {...bind("aFor")} />
         </div>
       </Card>
       <Card title="Updates">
         <div class="space-y-4">
-          <Check checked={f.upAuto} onChange={(upAuto) => set({ upAuto })} label="Install new Tugport releases automatically" hint="Updates restart Tugport without dropping traffic." />
+          <Check
+            checked={f.upAuto}
+            onChange={(upAuto) => set({ upAuto })}
+            label="Install new Tugport releases automatically"
+            hint="Updates restart Tugport without dropping traffic."
+          />
           <Field label="Channel">
             <Select value={f.upChannel} onChange={(upChannel) => set({ upChannel })} options={["stable", "beta"]} />
           </Field>
         </div>
       </Card>
-      {dirty && (
-        <div class="sticky bottom-0 z-10 -mx-4 flex flex-wrap items-center justify-between gap-2 border-t border-line bg-surface px-4 py-3 md:mx-0 md:rounded-lg md:border">
-          <span class="text-dim">You have unsaved changes.</span>
-          <span class="flex gap-2">
-            <button type="button" class="btn" onClick={() => setF(toForm(props.settings))}>
-              Discard
-            </button>
-            <button class="btn btn-primary" disabled={s.busy}>
-              Save settings
-            </button>
-          </span>
-          {s.error && (
-            <div class="w-full">
-              <ErrorBox error={s.error} />
-            </div>
-          )}
-        </div>
-      )}
+      {dirty && <UnsavedBar s={s} onDiscard={reset} />}
     </form>
   );
 }
@@ -284,13 +277,11 @@ function Git(props: { owner: boolean }) {
   const r = useApi<{ providers: Provider[] }>("/git/providers");
   const settings = useApi<InstanceSettings>(props.owner ? "/settings" : null);
   const [org, setOrg] = useState("");
-  const [f, setF] = useState({ kind: "forgejo", name: "", base_url: "", token: "" });
-  // Functional updates: autofill fires several input events before the next render.
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+  const { f, set, bind } = useForm({ kind: "forgejo", name: "", base_url: "", token: "" });
   const needsBase = f.kind === "forgejo" || f.kind === "gitea";
   const s = useSubmit(async () => {
     await post("/git/providers", { kind: f.kind, name: f.name.trim() || undefined, base_url: f.base_url.trim() || undefined, token: f.token.trim() });
-    setF({ kind: f.kind, name: "", base_url: "", token: "" });
+    set({ name: "", base_url: "", token: "" });
     toast("Connected.");
     await r.reload();
   });
@@ -298,31 +289,25 @@ function Git(props: { owner: boolean }) {
     <>
       <Card title="Connected Git hosts" pad={false}>
         <Loaded r={r}>
-          {(d) =>
-            d.providers.length === 0 ? (
-              <div class="p-4">
-                <Empty>Nothing is connected yet. Connected hosts let you pick repositories and deploy on every push.</Empty>
-              </div>
-            ) : (
-              <ul class="divide-y divide-line">
-                {d.providers.map((p) => (
-                  <li key={p.id} class="flex flex-wrap items-center gap-3 px-4 py-3">
-                    <div class="min-w-0 flex-1">
-                      <span class="font-medium">{p.name}</span> <span class="chip">{PROVIDER_KINDS[p.kind] ?? p.kind}</span>
-                      <p class="truncate text-xs text-muted">
-                        {p.base_url} · connected {ago(p.created_at)}
-                      </p>
-                    </div>
-                    {props.owner && (
-                      <Action class="btn btn-ghost text-bad" confirm={`Disconnect ${p.name}?`} run={() => del(`/git/providers/${p.id}`).then(r.reload)} done="Disconnected.">
-                        Disconnect
-                      </Action>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )
-          }
+          {(d) => (
+            <Rows items={d.providers} empty="Nothing is connected yet. Connected hosts let you pick repositories and deploy on every push.">
+              {(p) => (
+                <li key={p.id} class="row">
+                  <div class="min-w-0 flex-1">
+                    <span class="font-medium">{p.name}</span> <span class="chip">{PROVIDER_KINDS[p.kind] ?? p.kind}</span>
+                    <p class="truncate text-xs text-muted">
+                      {p.base_url} · connected {ago(p.created_at)}
+                    </p>
+                  </div>
+                  {props.owner && (
+                    <Action class="btn btn-ghost text-bad" confirm={`Disconnect ${p.name}?`} run={() => del(`/git/providers/${p.id}`).then(r.reload)} done="Disconnected.">
+                      Disconnect
+                    </Action>
+                  )}
+                </li>
+              )}
+            </Rows>
+          )}
         </Loaded>
       </Card>
       {props.owner && (
@@ -335,9 +320,13 @@ function Git(props: { owner: boolean }) {
               {settings.data && !settings.data.panel_domain && (
                 <Note tone="warn">GitHub must reach this panel to deliver pushes, so set a panel domain under General before connecting.</Note>
               )}
-              <Field label="Organization (optional)" hint="Leave this empty to create the app on your personal account.">
-                <input class="input" placeholder="my-org" value={org} onInput={(e) => setOrg(e.currentTarget.value.trim())} />
-              </Field>
+              <Input
+                label="Organization (optional)"
+                hint="Leave this empty to create the app on your personal account."
+                placeholder="my-org"
+                value={org}
+                onInput={(e) => setOrg(e.currentTarget.value.trim())}
+              />
               <Action class="btn btn-primary" run={() => startGithubApp(org)}>
                 Connect GitHub
               </Action>
@@ -350,7 +339,7 @@ function Git(props: { owner: boolean }) {
                 <Field label="Host">
                   <Select
                     value={f.kind}
-                    onChange={(kind) => upd({kind })}
+                    onChange={(kind) => set({ kind })}
                     options={[
                       ["forgejo", "Forgejo"],
                       ["gitea", "Gitea"],
@@ -359,16 +348,26 @@ function Git(props: { owner: boolean }) {
                     ]}
                   />
                 </Field>
-                <Field label="Name (optional)">
-                  <input class="input" value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
-                </Field>
+                <Input label="Name (optional)" {...bind("name")} />
               </div>
-              <Field label={needsBase ? "Address" : "Address (optional)"} hint={needsBase ? undefined : `Leave this empty for ${f.kind === "gitlab" ? "gitlab.com" : "github.com"}.`}>
-                <input class="input font-mono" type="url" required={needsBase} placeholder="https://git.example.com" value={f.base_url} onInput={(e) => upd({base_url: e.currentTarget.value })} />
-              </Field>
-              <Field label="Access token" hint="It needs read access to repositories and permission to manage their webhooks.">
-                <input class="input font-mono" type="password" required autoComplete="off" value={f.token} onInput={(e) => upd({token: e.currentTarget.value })} />
-              </Field>
+              <Input
+                label={needsBase ? "Address" : "Address (optional)"}
+                hint={needsBase ? undefined : `Leave this empty for ${f.kind === "gitlab" ? "gitlab.com" : "github.com"}.`}
+                class="font-mono"
+                type="url"
+                required={needsBase}
+                placeholder="https://git.example.com"
+                {...bind("base_url")}
+              />
+              <Input
+                label="Access token"
+                hint="It needs read access to repositories and permission to manage their webhooks."
+                class="font-mono"
+                type="password"
+                required
+                autoComplete="off"
+                {...bind("token")}
+              />
               <ErrorBox error={s.error} />
               <button class="btn btn-primary" disabled={s.busy}>
                 {s.busy ? "Checking the token…" : "Connect"}
@@ -381,7 +380,21 @@ function Git(props: { owner: boolean }) {
   );
 }
 
-// ---- Planned sections ----
+// ---- Notifications and registries ----
+
+/** One setting of a channel or a backup target; labels that say "optional" mark the optional ones. */
+function ConfigInput(props: { label: string; type?: string; value: string | undefined; onChange: (v: string) => void }) {
+  return (
+    <Input
+      label={props.label}
+      type={props.type ?? "text"}
+      required={!props.label.includes("optional")}
+      autoComplete="off"
+      value={props.value ?? ""}
+      onInput={(e) => props.onChange(e.currentTarget.value)}
+    />
+  );
+}
 
 interface Channel {
   id: string;
@@ -411,24 +424,16 @@ const CHANNEL_FIELDS: Record<string, [string, string, string?][]> = {
 function Notifications() {
   const r = useApi<{ channels: Channel[] }>("/notifications");
   const [open, setOpen] = useState(false);
-  const [f, setF] = useState<{ kind: string; name: string; events: string; tls: boolean; config: Record<string, string> }>({
-    kind: "telegram",
-    name: "",
-    events: "*",
-    tls: true,
-    config: {},
-  });
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+  const { f, set, bind } = useForm({ kind: "telegram", name: "", events: "*", tls: true, config: {} as Record<string, string> });
   const s = useSubmit(async () => {
     const config: Record<string, unknown> = Object.fromEntries(Object.entries(f.config).filter(([, v]) => v.trim() !== ""));
     if (config.port) config.port = Number(config.port);
     if (f.kind === "email") config.tls = f.tls;
     await post("/notifications", { kind: f.kind, name: f.name.trim(), config, events: words(f.events) });
     setOpen(false);
-    setF({ kind: f.kind, name: "", events: "*", tls: true, config: {} });
+    set({ name: "", events: "*", tls: true, config: {} });
     await r.reload();
   });
-  if (isPlanned(r.error)) return <Planned />;
   return (
     <Card
       title="Notification channels"
@@ -440,30 +445,24 @@ function Notifications() {
       }
     >
       <Loaded r={r}>
-        {(d) =>
-          d.channels.length === 0 ? (
-            <div class="p-4">
-              <Empty>No channels yet. Tugport can report deploys, certificate problems and alerts to Telegram, email or a webhook.</Empty>
-            </div>
-          ) : (
-            <ul class="divide-y divide-line">
-              {d.channels.map((c) => (
-                <li key={c.id} class="flex flex-wrap items-center gap-3 px-4 py-3">
-                  <div class="min-w-0 flex-1">
-                    <span class="font-medium">{c.name}</span> <span class="chip">{c.kind}</span>
-                    <p class="text-xs text-muted">{c.events.includes("*") ? "All events" : c.events.join(", ")}</p>
-                  </div>
-                  <Action run={() => post(`/notifications/${c.id}/test`)} done="Test message sent.">
-                    Send test
-                  </Action>
-                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${c.name}?`} run={() => del(`/notifications/${c.id}`).then(r.reload)}>
-                    Remove
-                  </Action>
-                </li>
-              ))}
-            </ul>
-          )
-        }
+        {(d) => (
+          <Rows items={d.channels} empty="No channels yet. Tugport can report deploys, certificate problems and alerts to Telegram, email or a webhook.">
+            {(c) => (
+              <li key={c.id} class="row">
+                <div class="min-w-0 flex-1">
+                  <span class="font-medium">{c.name}</span> <span class="chip">{c.kind}</span>
+                  <p class="text-xs text-muted">{c.events.includes("*") ? "All events" : c.events.join(", ")}</p>
+                </div>
+                <Action run={() => post(`/notifications/${c.id}/test`)} done="Test message sent.">
+                  Send test
+                </Action>
+                <Action class="btn btn-ghost text-bad" confirm={`Remove ${c.name}?`} run={() => del(`/notifications/${c.id}`).then(r.reload)}>
+                  Remove
+                </Action>
+              </li>
+            )}
+          </Rows>
+        )}
       </Loaded>
       <Modal open={open} onClose={() => setOpen(false)} title="Add notification channel">
         <form class="space-y-4" onSubmit={s.submit}>
@@ -471,7 +470,7 @@ function Notifications() {
             <Field label="Kind">
               <Select
                 value={f.kind}
-                onChange={(kind) => upd({kind, config: {} })}
+                onChange={(kind) => set({ kind, config: {} })}
                 options={[
                   ["telegram", "Telegram"],
                   ["email", "Email"],
@@ -479,35 +478,14 @@ function Notifications() {
                 ]}
               />
             </Field>
-            <Field label="Name">
-              <input class="input" required value={f.name} onInput={(e) => upd({name: e.currentTarget.value })} />
-            </Field>
+            <Input label="Name" required {...bind("name")} />
           </div>
           {(CHANNEL_FIELDS[f.kind] ?? []).map(([key, label, type]) => (
-            <Field key={key} label={label}>
-              <input
-                class="input"
-                type={type ?? "text"}
-                required={!label.includes("optional")}
-                autoComplete="off"
-                value={f.config[key] ?? ""}
-                onInput={(e) => ((v) => setF((s) => ({ ...s, config: { ...s.config, [key]: v } })))(e.currentTarget.value)}
-              />
-            </Field>
+            <ConfigInput key={key} label={label} type={type} value={f.config[key]} onChange={(v) => set((s) => ({ config: { ...s.config, [key]: v } }))} />
           ))}
-          {f.kind === "email" && <Check checked={f.tls} onChange={(tls) => upd({tls })} label="Use TLS" />}
-          <Field label="Events" hint="Use * for everything, or list events such as deploy.failed, deploy.succeeded and certificate.failed.">
-            <input class="input font-mono" value={f.events} onInput={(e) => upd({events: e.currentTarget.value })} />
-          </Field>
-          <ErrorBox error={s.error} />
-          <div class="flex justify-end gap-2">
-            <button type="button" class="btn" onClick={() => setOpen(false)}>
-              Cancel
-            </button>
-            <button class="btn btn-primary" disabled={s.busy}>
-              Add channel
-            </button>
-          </div>
+          {f.kind === "email" && <Check checked={f.tls} onChange={(tls) => set({ tls })} label="Use TLS" />}
+          <Input label="Events" hint="Use * for everything, or list events such as deploy.failed, deploy.succeeded and certificate.failed." class="font-mono" {...bind("events")} />
+          <FormButtons s={s} submit="Add channel" onCancel={() => setOpen(false)} />
         </form>
       </Modal>
     </Card>
@@ -516,52 +494,38 @@ function Notifications() {
 
 function Registries() {
   const r = useApi<{ registries: { id: string; host: string; username: string }[] }>("/registries");
-  const [f, setF] = useState({ host: "", username: "", password: "" });
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+  const { f, set, bind, reset } = useForm({ host: "", username: "", password: "" });
   const s = useSubmit(async () => {
     await post("/registries", f);
-    setF({ host: "", username: "", password: "" });
+    reset();
     await r.reload();
   });
-  if (isPlanned(r.error)) return <Planned />;
   return (
     <>
       <Card title="Registries" pad={false}>
         <Loaded r={r}>
-          {(d) =>
-            d.registries.length === 0 ? (
-              <div class="p-4">
-                <Empty>Add a registry to deploy private images from it. Public images need nothing here.</Empty>
-              </div>
-            ) : (
-              <ul class="divide-y divide-line">
-                {d.registries.map((g) => (
-                  <li key={g.id} class="flex items-center gap-3 px-4 py-3">
-                    <span class="min-w-0 flex-1 truncate">
-                      <span class="font-mono">{g.host}</span> <span class="text-muted">as {g.username}</span>
-                    </span>
-                    <Action class="btn btn-ghost text-bad" confirm={`Remove ${g.host}?`} run={() => del(`/registries/${g.id}`).then(r.reload)}>
-                      Remove
-                    </Action>
-                  </li>
-                ))}
-              </ul>
-            )
-          }
+          {(d) => (
+            <Rows items={d.registries} empty="Add a registry to deploy private images from it. Public images need nothing here.">
+              {(g) => (
+                <li key={g.id} class="row flex-nowrap">
+                  <span class="min-w-0 flex-1 truncate">
+                    <span class="font-mono">{g.host}</span> <span class="text-muted">as {g.username}</span>
+                  </span>
+                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${g.host}?`} run={() => del(`/registries/${g.id}`).then(r.reload)}>
+                    Remove
+                  </Action>
+                </li>
+              )}
+            </Rows>
+          )}
         </Loaded>
       </Card>
       <Card title="Add a registry">
         <form class="space-y-4" onSubmit={s.submit}>
-          <Field label="Registry host">
-            <input class="input font-mono" required placeholder="ghcr.io" value={f.host} onInput={(e) => upd({host: e.currentTarget.value.trim() })} />
-          </Field>
+          <Input label="Registry host" class="font-mono" required placeholder="ghcr.io" value={f.host} onInput={(e) => set({ host: e.currentTarget.value.trim() })} />
           <div class="grid gap-4 sm:grid-cols-2">
-            <Field label="User name">
-              <input class="input" required autoComplete="off" value={f.username} onInput={(e) => upd({username: e.currentTarget.value })} />
-            </Field>
-            <Field label="Password or token">
-              <input class="input" type="password" required autoComplete="off" value={f.password} onInput={(e) => upd({password: e.currentTarget.value })} />
-            </Field>
+            <Input label="User name" required autoComplete="off" {...bind("username")} />
+            <Input label="Password or token" type="password" required autoComplete="off" {...bind("password")} />
           </div>
           <ErrorBox error={s.error} />
           <button class="btn btn-primary" disabled={s.busy}>
@@ -607,14 +571,17 @@ function Backups() {
   const [addJob, setAddJob] = useState(false);
   const [runsOf, setRunsOf] = useState<Job | null>(null);
   const services = useServices();
-  if (isPlanned(targets.error) || isPlanned(jobs.error)) return <Planned />;
   const targetName = (id: string) => targets.data?.targets.find((t) => t.id === id)?.name ?? id;
   const serviceName = (id: string | null) => {
     const s = services?.find((x) => x.id === id);
     return s ? `${s.project}.${s.name}` : "a deleted service";
   };
   const what = (j: Job) =>
-    j.kind === "state" ? "Tugport's own state" : j.kind === "database" ? `Database dump of ${serviceName(j.service_id)}` : `Volume ${j.volume ?? ""} of ${serviceName(j.service_id)}`;
+    j.kind === "state"
+      ? "Tugport's own state"
+      : j.kind === "database"
+        ? `Database dump of ${serviceName(j.service_id)}`
+        : `Volume ${j.volume ?? ""} of ${serviceName(j.service_id)}`;
   return (
     <>
       <Card
@@ -627,26 +594,20 @@ function Backups() {
         }
       >
         <Loaded r={targets}>
-          {(d) =>
-            d.targets.length === 0 ? (
-              <div class="p-4">
-                <Empty>Backups go to S3-compatible storage or a folder on this server, so add one of those first.</Empty>
-              </div>
-            ) : (
-              <ul class="divide-y divide-line">
-                {d.targets.map((t) => (
-                  <li key={t.id} class="flex items-center gap-3 px-4 py-3">
-                    <span class="min-w-0 flex-1">
-                      <span class="font-medium">{t.name}</span> <span class="chip">{t.kind}</span>
-                    </span>
-                    <Action class="btn btn-ghost text-bad" confirm={`Remove ${t.name}?`} run={() => del(`/backups/targets/${t.id}`).then(targets.reload)}>
-                      Remove
-                    </Action>
-                  </li>
-                ))}
-              </ul>
-            )
-          }
+          {(d) => (
+            <Rows items={d.targets} empty="Backups go to S3-compatible storage or a folder on this server, so add one of those first.">
+              {(t) => (
+                <li key={t.id} class="row flex-nowrap">
+                  <span class="min-w-0 flex-1">
+                    <span class="font-medium">{t.name}</span> <span class="chip">{t.kind}</span>
+                  </span>
+                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${t.name}?`} run={() => del(`/backups/targets/${t.id}`).then(targets.reload)}>
+                    Remove
+                  </Action>
+                </li>
+              )}
+            </Rows>
+          )}
         </Loaded>
       </Card>
       <Card
@@ -659,44 +620,36 @@ function Backups() {
         }
       >
         <Loaded r={jobs}>
-          {(d) =>
-            d.jobs.length === 0 ? (
-              <div class="p-4">
-                <Empty>No scheduled backups yet. Jobs back up databases, volumes or Tugport's own state on a schedule.</Empty>
-              </div>
-            ) : (
-              <ul class="divide-y divide-line">
-                {d.jobs.map((j) => (
-                  <li key={j.id} class="flex flex-wrap items-center gap-3 px-4 py-3">
-                    <div class="min-w-0 flex-1">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <span class="font-medium">{what(j)}</span>
-                        {j.enabled === false && <span class="chip">paused</span>}
-                        {j.last_run && <Pill state={j.last_run.status} />}
-                      </div>
-                      <p class="text-xs text-muted">
-                        <code>{j.schedule}</code> to {targetName(j.target_id)}, keeping the last {j.keep_last}
-                        {j.last_run?.finished_at ? `, last finished ${ago(j.last_run.finished_at)}` : ""}
-                      </p>
-                      {j.last_run?.error && <p class="text-xs text-bad">{j.last_run.error}</p>}
+          {(d) => (
+            <Rows items={d.jobs} empty="No scheduled backups yet. Jobs back up databases, volumes or Tugport's own state on a schedule.">
+              {(j) => (
+                <li key={j.id} class="row">
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="font-medium">{what(j)}</span>
+                      {j.enabled === false && <span class="chip">paused</span>}
+                      {j.last_run && <Pill state={j.last_run.status} />}
                     </div>
-                    <button class="btn" onClick={() => setRunsOf(j)}>
-                      Runs
-                    </button>
-                    <Action run={() => patch(`/backups/jobs/${j.id}`, { enabled: j.enabled === false }).then(jobs.reload)}>
-                      {j.enabled === false ? "Resume" : "Pause"}
-                    </Action>
-                    <Action run={() => post(`/backups/jobs/${j.id}/run`).then(jobs.reload)} done="Backup started.">
-                      Run now
-                    </Action>
-                    <Action class="btn btn-ghost text-bad" confirm="Remove this job? Existing backups stay in the target." run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}>
-                      Remove
-                    </Action>
-                  </li>
-                ))}
-              </ul>
-            )
-          }
+                    <p class="text-xs text-muted">
+                      <code>{j.schedule}</code> to {targetName(j.target_id)}, keeping the last {j.keep_last}
+                      {j.last_run?.finished_at ? `, last finished ${ago(j.last_run.finished_at)}` : ""}
+                    </p>
+                    {j.last_run?.error && <p class="text-xs text-bad">{j.last_run.error}</p>}
+                  </div>
+                  <button class="btn" onClick={() => setRunsOf(j)}>
+                    Runs
+                  </button>
+                  <Action run={() => patch(`/backups/jobs/${j.id}`, { enabled: j.enabled === false }).then(jobs.reload)}>{j.enabled === false ? "Resume" : "Pause"}</Action>
+                  <Action run={() => post(`/backups/jobs/${j.id}/run`).then(jobs.reload)} done="Backup started.">
+                    Run now
+                  </Action>
+                  <Action class="btn btn-ghost text-bad" confirm="Remove this job? Existing backups stay in the target." run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}>
+                    Remove
+                  </Action>
+                </li>
+              )}
+            </Rows>
+          )}
         </Loaded>
       </Card>
       {addTarget && <TargetForm onClose={() => setAddTarget(false)} onSaved={targets.reload} />}
@@ -707,8 +660,7 @@ function Backups() {
 }
 
 function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
-  const [f, setF] = useState<Record<string, string>>({ name: "", kind: "s3" });
-  const upd = (p: Record<string, string>) => setF((s) => ({ ...s, ...p }));
+  const { f, set } = useForm<Record<string, string>>({ name: "", kind: "s3" });
   const s3: [string, string, string?][] = [
     ["endpoint", "Endpoint (optional, empty for AWS)", "url"],
     ["bucket", "Bucket"],
@@ -724,11 +676,7 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
     props.onSaved();
     props.onClose();
   });
-  const input = (k: string, label: string, type = "text") => (
-    <Field key={k} label={label}>
-      <input class="input" type={type} required={!label.includes("optional")} autoComplete="off" value={f[k] ?? ""} onInput={(e) => upd({[k]: e.currentTarget.value })} />
-    </Field>
-  );
+  const input = (k: string, label: string, type?: string) => <ConfigInput key={k} label={label} type={type} value={f[k]} onChange={(v) => set({ [k]: v })} />;
   return (
     <Modal open onClose={props.onClose} title="Add backup target">
       <form class="space-y-4" onSubmit={s.submit}>
@@ -737,7 +685,7 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
           <Field label="Kind">
             <Select
               value={f.kind}
-              onChange={(kind) => upd({kind })}
+              onChange={(kind) => set({ kind })}
               options={[
                 ["s3", "S3-compatible storage"],
                 ["local", "Folder on this server"],
@@ -746,15 +694,7 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
           </Field>
         </div>
         {f.kind === "s3" ? s3.map(([k, label, type]) => input(k, label, type)) : input("path", "Folder")}
-        <ErrorBox error={s.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={s.busy}>
-            Add target
-          </button>
-        </div>
+        <FormButtons s={s} submit="Add target" onCancel={props.onClose} />
       </form>
     </Modal>
   );
@@ -768,8 +708,7 @@ function useServices() {
 }
 
 function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onClose: () => void; onSaved: () => void }) {
-  const [f, setF] = useState({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+  const { f, set, bind } = useForm({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
   const s = useSubmit(async () => {
     await post("/backups/jobs", {
       kind: f.kind,
@@ -788,7 +727,7 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
         <Field label="What to back up">
           <Select
             value={f.kind}
-            onChange={(kind) => upd({ kind, service: "" })}
+            onChange={(kind) => set({ kind, service: "" })}
             options={[
               ["database", "A database (consistent dump)"],
               ["volume", "A volume"],
@@ -800,41 +739,23 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
           <Field label="Service">
             <Select
               value={f.service}
-              onChange={(service) => upd({ service })}
+              onChange={(service) => set({ service })}
               options={[
                 ["", props.services ? "Choose…" : "Loading…"],
-                ...(props.services ?? [])
-                  .filter((x) => f.kind !== "database" || x.kind === "database")
-                  .map((x): [string, string] => [x.id, `${x.project}.${x.name}`]),
+                ...(props.services ?? []).filter((x) => f.kind !== "database" || x.kind === "database").map((x): [string, string] => [x.id, `${x.project}.${x.name}`]),
               ]}
             />
           </Field>
         )}
-        {f.kind === "volume" && (
-          <Field label="Volume name">
-            <input class="input font-mono" required value={f.volume} onInput={(e) => upd({volume: e.currentTarget.value })} />
-          </Field>
-        )}
+        {f.kind === "volume" && <Input label="Volume name" class="font-mono" required {...bind("volume")} />}
         <div class="grid gap-4 sm:grid-cols-3">
           <Field label="Target">
-            <Select value={f.target} onChange={(target) => upd({target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
+            <Select value={f.target} onChange={(target) => set({ target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
           </Field>
-          <Field label="Schedule" hint="Use cron format in the server's time zone.">
-            <input class="input font-mono" required value={f.schedule} onInput={(e) => upd({schedule: e.currentTarget.value })} />
-          </Field>
-          <Field label="Keep the last">
-            <input class="input" type="number" min={1} value={f.keep} onInput={(e) => upd({keep: e.currentTarget.value })} />
-          </Field>
+          <Input label="Schedule" hint="Use cron format in the server's time zone." class="font-mono" required {...bind("schedule")} />
+          <Input label="Keep the last" type="number" min={1} {...bind("keep")} />
         </div>
-        <ErrorBox error={s.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={s.busy || (f.kind !== "state" && !f.service)}>
-            Add job
-          </button>
-        </div>
+        <FormButtons s={s} submit="Add job" onCancel={props.onClose} disabled={f.kind !== "state" && !f.service} />
       </form>
     </Modal>
   );
@@ -849,12 +770,12 @@ function Runs(props: { job: Job; onClose: () => void }) {
   };
   return (
     <Modal open onClose={props.onClose} title="Backup runs" wide>
-      <Loaded r={r} planned>
+      <Loaded r={r}>
         {(d) =>
           d.runs.length === 0 ? (
             <Empty>This job has not run yet.</Empty>
           ) : (
-            <ul class="divide-y divide-line rounded-md border border-line">
+            <ul class="inset-list">
               {d.runs.map((run) => (
                 <li key={run.id} class="flex flex-wrap items-center gap-3 px-3 py-2">
                   <div class="min-w-0 flex-1">
@@ -893,7 +814,7 @@ function Tunnel() {
   });
   return (
     <Card title="Cloudflare Tunnel">
-      <Loaded r={r} planned>
+      <Loaded r={r}>
         {(t) =>
           t.enabled ? (
             <div class="space-y-3">
@@ -905,18 +826,27 @@ function Tunnel() {
               <p class="text-dim">
                 {t.domains?.length ? `Routed through it: ${t.domains.join(", ")}.` : "No domain uses the tunnel yet; turn on the tunnel switch in a domain's settings."}
               </p>
-              <Action class="btn btn-danger" confirm="Disconnect the tunnel? Domains routed through it stop working until you connect again." run={() => del("/tunnel").then(r.reload)}>
+              <Action
+                class="btn btn-danger"
+                confirm="Disconnect the tunnel? Domains routed through it stop working until you connect again."
+                run={() => del("/tunnel").then(r.reload)}
+              >
                 Disconnect
               </Action>
             </div>
           ) : (
             <form class="space-y-4" onSubmit={s.submit}>
-              <p class="text-dim">
-                With an API token, Tugport creates a tunnel, runs cloudflared and adds the DNS records for every domain that uses the tunnel.
-              </p>
-              <Field label="Cloudflare API token" hint="It needs the Cloudflare Tunnel edit and DNS edit permissions for your zones.">
-                <input class="input font-mono" type="password" required autoComplete="off" value={token} onInput={(e) => setToken(e.currentTarget.value)} />
-              </Field>
+              <p class="text-dim">With an API token, Tugport creates a tunnel, runs cloudflared and adds the DNS records for every domain that uses the tunnel.</p>
+              <Input
+                label="Cloudflare API token"
+                hint="It needs the Cloudflare Tunnel edit and DNS edit permissions for your zones."
+                class="font-mono"
+                type="password"
+                required
+                autoComplete="off"
+                value={token}
+                onInput={(e) => setToken(e.currentTarget.value)}
+              />
               <ErrorBox error={s.error} />
               <button class="btn btn-primary" disabled={s.busy}>
                 Connect
@@ -943,7 +873,7 @@ function Updates() {
   const r = useApi<{ current: string; latest: { version: string; notes: string } | null; available: boolean }>("/updates");
   return (
     <Card title="Updates" actions={<Action run={r.reload}>Check again</Action>}>
-      <Loaded r={r} planned>
+      <Loaded r={r}>
         {(u) =>
           !u.latest ? (
             <p class="text-dim">Tugport could not look up the newest release on GitHub just now, so check again later.</p>

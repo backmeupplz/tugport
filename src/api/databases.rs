@@ -1,6 +1,7 @@
 //! Database read replicas: add, list, promote.
 
-use super::projects::service_or_404;
+use super::service_or_404;
+use super::{bad, detached};
 use super::{ApiError, ApiResult, Auth};
 use crate::app::AppState;
 use crate::auth::Role;
@@ -29,8 +30,7 @@ pub async fn add(State(app): State<AppState>, a: Auth, Path(id): Path<String>, b
     let placement = body.map(|b| b.0.placement).unwrap_or_default();
     let (app2, s2) = (app.clone(), s.clone());
     // Finishes even if the caller goes away (it may restart the primary).
-    let added = tokio::spawn(async move { replicas::add(&app2, &s2, placement).await }).await.map_err(anyhow::Error::from)?;
-    let (replica, deploy_id) = added.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    let (replica, deploy_id) = detached(async move { replicas::add(&app2, &s2, placement).await }).await?.map_err(bad)?;
     app.audit(Some(&a.0), "database.replica_add", Some(&s.project_id), Some(&s.id), Some(&replica.name), None);
     Ok(Json(json!({ "replica": { "id": replica.id, "name": replica.name }, "deploy_id": deploy_id })))
 }
@@ -51,9 +51,8 @@ pub async fn list(State(app): State<AppState>, a: Auth, Path(id): Path<String>) 
 pub async fn promote(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Admin)?;
     let (app2, s2) = (app.clone(), s.clone());
-    let var = tokio::spawn(async move { replicas::promote(&app2, &s2).await }).await.map_err(anyhow::Error::from)?;
-    let var = var.map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-    app.audit(Some(&a.0), "database.promote", Some(&s.project_id), Some(&s.id), Some(&s.name), Some(&var));
+    let var = detached(async move { replicas::promote(&app2, &s2).await }).await?.map_err(bad)?;
+    a.audit_service(&app, "database.promote", &s, Some(&var));
     Ok(Json(json!({
         "ok": true,
         "variable": var,

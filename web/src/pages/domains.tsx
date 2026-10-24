@@ -1,7 +1,8 @@
+import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { atLeast, del, patch, post, type Domain } from "../api";
-import { Action, Card, Check, Empty, ErrorBox, Field, Modal, Select, useSubmit } from "../ui";
-import { lines, num } from "../util";
+import { Action, Card, Check, Empty, Field, FormButtons, Input, Modal, Select, TextArea, useForm, useSubmit } from "../ui";
+import { lines, num, patchAt, removeAt, str } from "../util";
 import type { Ctx } from "./service";
 
 interface Form {
@@ -48,8 +49,8 @@ function toForm(d?: Domain): Form {
     rwTo: o.rewrite?.to ?? "",
     maint: o.maintenance != null,
     maintHtml: o.maintenance ?? MAINTENANCE,
-    timeout: o.timeout_s == null ? "" : String(o.timeout_s),
-    maxBody: o.max_body_mb == null ? "" : String(o.max_body_mb),
+    timeout: str(o.timeout_s),
+    maxBody: str(o.max_body_mb),
     errorPages: o.error_pages ?? {},
   };
 }
@@ -103,7 +104,7 @@ export function Domains({ c }: { c: Ctx }) {
       {list.length === 0 ? (
         <Empty>This service has no domains yet.</Empty>
       ) : (
-        <ul class="divide-y divide-line rounded-md border border-line">
+        <ul class="inset-list">
           {list.map((d) => {
             const o = d.options ?? {};
             const url = `${d.https ? "https" : "http"}://${d.host}${d.path}`;
@@ -147,10 +148,20 @@ export function Domains({ c }: { c: Ctx }) {
   );
 }
 
+/** A collapsible group of advanced options, open when it holds settings. */
+function Fold(props: { title: string; open: boolean; class?: string; children: ComponentChildren }) {
+  return (
+    <details open={props.open} class="rounded-md border border-line px-3 py-2">
+      <summary class="font-medium">{props.title}</summary>
+      <div class={`mt-3 ${props.class ?? "space-y-3"}`}>{props.children}</div>
+    </details>
+  );
+}
+
 function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => void }) {
-  const [f, setF] = useState(props.init);
-  const set = (p: Partial<Form>) => setF((s) => ({ ...s, ...p }));
-  const text = (k: keyof Form) => ({ value: f[k] as string, onInput: (e: { currentTarget: { value: string } }) => set({ [k]: e.currentTarget.value }) });
+  const { f, set, bind } = useForm(props.init);
+  const redirect = (i: number, p: Partial<Form["redirects"][number]>) => set({ redirects: patchAt(f.redirects, i, p) });
+  const basic = (i: number, p: Partial<Form["basic"][number]>) => set({ basic: patchAt(f.basic, i, p) });
   const s = useSubmit(async () => {
     if (props.id) await patch(`/domains/${props.id}`, toBody(f));
     else await post(`/services/${props.c.d.service.id}/domains`, toBody(f));
@@ -168,15 +179,9 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
     <Modal open onClose={props.onClose} title={props.id ? `Edit ${props.init.host}` : "Add domain"} wide>
       <form class="space-y-4" onSubmit={s.submit}>
         <div class="grid gap-4 sm:grid-cols-[1fr_8rem_8rem]">
-          <Field label="Domain">
-            <input class="input font-mono" required autoFocus={!props.id} placeholder="app.example.com" spellcheck={false} autoComplete="off" {...text("host")} />
-          </Field>
-          <Field label="Path">
-            <input class="input font-mono" required pattern="/.*" {...text("path")} />
-          </Field>
-          <Field label="Container port">
-            <input class="input font-mono" required type="number" min={1} max={65535} placeholder="3000" {...text("port")} />
-          </Field>
+          <Input label="Domain" mono required autoFocus={!props.id} placeholder="app.example.com" autoComplete="off" {...bind("host")} />
+          <Input label="Path" class="font-mono" required pattern="/.*" {...bind("path")} />
+          <Input label="Container port" class="font-mono" required type="number" min={1} max={65535} placeholder="3000" {...bind("port")} />
           {(props.c.d.exposed_ports?.length ?? 0) > 0 && (
             <p class="-mt-2 text-xs text-muted sm:col-span-3">
               The image exposes {props.c.d.exposed_ports?.length === 1 ? "port" : "ports"} {props.c.d.exposed_ports?.join(", ")}.
@@ -196,149 +201,104 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
           hint="Traffic for this domain arrives through the tunnel from Settings instead of the server's public address."
         />
 
-        <details open={advanced} class="rounded-md border border-line px-3 py-2">
-          <summary class="font-medium">Redirects</summary>
-          <div class="mt-3 space-y-3">
-            <Field label="www">
-              <Select
-                value={f.www}
-                onChange={(www) => set({ www })}
-                options={[
-                  ["", "No www redirect"],
-                  ["to_www", "Redirect the bare domain to www"],
-                  ["to_apex", "Redirect www to the bare domain"],
-                ]}
+        <Fold title="Redirects" open={advanced}>
+          <Field label="www">
+            <Select
+              value={f.www}
+              onChange={(www) => set({ www })}
+              options={[
+                ["", "No www redirect"],
+                ["to_www", "Redirect the bare domain to www"],
+                ["to_apex", "Redirect www to the bare domain"],
+              ]}
+            />
+          </Field>
+          {f.redirects.map((r, i) => (
+            <div key={i} class="grid items-end gap-2 sm:grid-cols-[1fr_1fr_auto_auto]">
+              <Input
+                label="From (regular expression)"
+                class="font-mono"
+                value={r.from}
+                placeholder="^https://old\.example\.com/(.*)"
+                onInput={(e) => redirect(i, { from: e.currentTarget.value })}
               />
-            </Field>
-            {f.redirects.map((r, i) => (
-              <div key={i} class="grid items-end gap-2 sm:grid-cols-[1fr_1fr_auto_auto]">
-                <Field label="From (regular expression)">
-                  <input
-                    class="input font-mono"
-                    value={r.from}
-                    placeholder="^https://old\.example\.com/(.*)"
-                    onInput={(e) => set({ redirects: f.redirects.map((x, j) => (j === i ? { ...x, from: e.currentTarget.value } : x)) })}
-                  />
-                </Field>
-                <Field label="To">
-                  <input
-                    class="input font-mono"
-                    value={r.to}
-                    placeholder="https://example.com/$1"
-                    onInput={(e) => set({ redirects: f.redirects.map((x, j) => (j === i ? { ...x, to: e.currentTarget.value } : x)) })}
-                  />
-                </Field>
-                <label class="flex items-center gap-2 pb-2">
-                  <input
-                    type="checkbox"
-                    checked={r.permanent}
-                    onChange={(e) => set({ redirects: f.redirects.map((x, j) => (j === i ? { ...x, permanent: e.currentTarget.checked } : x)) })}
-                  />
-                  Permanent
-                </label>
-                <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ redirects: f.redirects.filter((_, j) => j !== i) })}>
-                  Remove
-                </button>
-              </div>
-            ))}
-            <button type="button" class="btn" onClick={() => set({ redirects: [...f.redirects, { from: "", to: "", permanent: false }] })}>
-              Add redirect
-            </button>
-          </div>
-        </details>
-
-        <details open={guarded} class="rounded-md border border-line px-3 py-2">
-          <summary class="font-medium">Access control</summary>
-          <div class="mt-3 space-y-3">
-            <p class="text-xs text-muted">Basic auth asks visitors for a user name and password. Tugport stores only a hash of each password.</p>
-            {f.basic.map((b, i) => (
-              <div key={i} class="grid items-end gap-2 sm:grid-cols-[1fr_1fr_auto]">
-                <Field label="User">
-                  <input
-                    class="input"
-                    autoComplete="off"
-                    value={b.user}
-                    onInput={(e) => set({ basic: f.basic.map((x, j) => (j === i ? { ...x, user: e.currentTarget.value } : x)) })}
-                  />
-                </Field>
-                <Field label="Password">
-                  <input
-                    class="input"
-                    type="password"
-                    autoComplete="new-password"
-                    required={!!b.user && b.user !== b.saved}
-                    placeholder={b.user && b.user === b.saved ? "Unchanged" : ""}
-                    value={b.password}
-                    onInput={(e) => set({ basic: f.basic.map((x, j) => (j === i ? { ...x, password: e.currentTarget.value } : x)) })}
-                  />
-                </Field>
-                <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ basic: f.basic.filter((_, j) => j !== i) })}>
-                  Remove
-                </button>
-              </div>
-            ))}
-            <button type="button" class="btn" onClick={() => set({ basic: [...f.basic, { user: "", password: "" }] })}>
-              Add basic auth user
-            </button>
-            <Field label="Forward auth URL" hint="Every request is first sent to this URL, and only a 2xx answer lets it through.">
-              <input class="input font-mono" type="url" placeholder="http://auth:4181/verify" {...text("faUrl")} />
-            </Field>
-            {f.faUrl && (
-              <Field label="Headers to copy from the auth response" hint="Write one header per line, like X-Forwarded-User.">
-                <textarea class="input h-20" spellcheck={false} {...text("faHeaders")} />
-              </Field>
-            )}
-          </div>
-        </details>
-
-        <details open={routing} class="rounded-md border border-line px-3 py-2">
-          <summary class="font-medium">Path handling</summary>
-          <div class="mt-3 space-y-3">
-            <Check checked={f.strip} onChange={(strip) => set({ strip })} label="Strip the path prefix" hint={`The app sees /users instead of ${f.path.replace(/\/$/, "") || ""}/users.`} />
-            <div class="grid gap-2 sm:grid-cols-2">
-              <Field label="Rewrite from (regular expression)">
-                <input class="input font-mono" placeholder="^/api/v1/(.*)" {...text("rwFrom")} />
-              </Field>
-              <Field label="Rewrite to">
-                <input class="input font-mono" placeholder="/v1/$1" {...text("rwTo")} />
-              </Field>
+              <Input label="To" class="font-mono" value={r.to} placeholder="https://example.com/$1" onInput={(e) => redirect(i, { to: e.currentTarget.value })} />
+              <label class="flex items-center gap-2 pb-2">
+                <input type="checkbox" checked={r.permanent} onChange={(e) => redirect(i, { permanent: e.currentTarget.checked })} />
+                Permanent
+              </label>
+              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ redirects: removeAt(f.redirects, i) })}>
+                Remove
+              </button>
             </div>
-          </div>
-        </details>
-
-        <details open={f.maint} class="rounded-md border border-line px-3 py-2">
-          <summary class="font-medium">Maintenance page</summary>
-          <div class="mt-3 space-y-3">
-            <Check checked={f.maint} onChange={(maint) => set({ maint })} label="Show the maintenance page" hint="Every request gets this page with status 503 until you turn it off." />
-            {f.maint && (
-              <Field label="Page HTML">
-                <textarea class="input h-40" spellcheck={false} {...text("maintHtml")} />
-              </Field>
-            )}
-          </div>
-        </details>
-
-        <details open={limits} class="rounded-md border border-line px-3 py-2">
-          <summary class="font-medium">Limits</summary>
-          <div class="mt-3 grid gap-3 sm:grid-cols-2">
-            <Field label="Timeout in seconds" hint="Leave this empty for the default.">
-              <input class="input" type="number" min={1} {...text("timeout")} />
-            </Field>
-            <Field label="Largest request body in MB" hint="Leave this empty for the default.">
-              <input class="input" type="number" min={1} {...text("maxBody")} />
-            </Field>
-          </div>
-        </details>
-
-        <ErrorBox error={s.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
+          ))}
+          <button type="button" class="btn" onClick={() => set({ redirects: [...f.redirects, { from: "", to: "", permanent: false }] })}>
+            Add redirect
           </button>
-          <button class="btn btn-primary" disabled={s.busy}>
-            {props.id ? "Save domain" : "Add domain"}
+        </Fold>
+
+        <Fold title="Access control" open={guarded}>
+          <p class="text-xs text-muted">Basic auth asks visitors for a user name and password. Tugport stores only a hash of each password.</p>
+          {f.basic.map((b, i) => (
+            <div key={i} class="grid items-end gap-2 sm:grid-cols-[1fr_1fr_auto]">
+              <Input label="User" autoComplete="off" value={b.user} onInput={(e) => basic(i, { user: e.currentTarget.value })} />
+              <Input
+                label="Password"
+                type="password"
+                autoComplete="new-password"
+                required={!!b.user && b.user !== b.saved}
+                placeholder={b.user && b.user === b.saved ? "Unchanged" : ""}
+                value={b.password}
+                onInput={(e) => basic(i, { password: e.currentTarget.value })}
+              />
+              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ basic: removeAt(f.basic, i) })}>
+                Remove
+              </button>
+            </div>
+          ))}
+          <button type="button" class="btn" onClick={() => set({ basic: [...f.basic, { user: "", password: "" }] })}>
+            Add basic auth user
           </button>
-        </div>
+          <Input
+            label="Forward auth URL"
+            hint="Every request is first sent to this URL, and only a 2xx answer lets it through."
+            class="font-mono"
+            type="url"
+            placeholder="http://auth:4181/verify"
+            {...bind("faUrl")}
+          />
+          {f.faUrl && <TextArea label="Headers to copy from the auth response" hint="Write one header per line, like X-Forwarded-User." class="h-20" {...bind("faHeaders")} />}
+        </Fold>
+
+        <Fold title="Path handling" open={routing}>
+          <Check
+            checked={f.strip}
+            onChange={(strip) => set({ strip })}
+            label="Strip the path prefix"
+            hint={`The app sees /users instead of ${f.path.replace(/\/$/, "") || ""}/users.`}
+          />
+          <div class="grid gap-2 sm:grid-cols-2">
+            <Input label="Rewrite from (regular expression)" class="font-mono" placeholder="^/api/v1/(.*)" {...bind("rwFrom")} />
+            <Input label="Rewrite to" class="font-mono" placeholder="/v1/$1" {...bind("rwTo")} />
+          </div>
+        </Fold>
+
+        <Fold title="Maintenance page" open={f.maint}>
+          <Check
+            checked={f.maint}
+            onChange={(maint) => set({ maint })}
+            label="Show the maintenance page"
+            hint="Every request gets this page with status 503 until you turn it off."
+          />
+          {f.maint && <TextArea label="Page HTML" class="h-40" {...bind("maintHtml")} />}
+        </Fold>
+
+        <Fold title="Limits" open={limits} class="grid gap-3 sm:grid-cols-2">
+          <Input label="Timeout in seconds" hint="Leave this empty for the default." type="number" min={1} {...bind("timeout")} />
+          <Input label="Largest request body in MB" hint="Leave this empty for the default." type="number" min={1} {...bind("maxBody")} />
+        </Fold>
+
+        <FormButtons s={s} submit={props.id ? "Save domain" : "Add domain"} onCancel={props.onClose} />
       </form>
     </Modal>
   );

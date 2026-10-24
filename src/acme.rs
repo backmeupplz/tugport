@@ -5,7 +5,7 @@ use crate::app::{App, AppState};
 use crate::util;
 use anyhow::{Context, Result, anyhow, bail};
 use instant_acme::{Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use std::time::Duration;
 
 const RENEW_BEFORE: i64 = 30 * 86400;
@@ -21,17 +21,26 @@ pub async fn run(app: AppState) {
     }
 }
 
+/// The sealing context of a certificate's private key.
+pub fn key_context(host: &str) -> String {
+    format!("cert:{host}")
+}
+
+/// Every stored certificate: (host, certificate PEM, sealed key).
+pub fn stored(app: &App) -> Result<Vec<(String, String, Vec<u8>)>> {
+    Ok(app.db.rows("SELECT host, cert_pem, key_pem FROM certificates WHERE cert_pem IS NOT NULL", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
+}
+
 pub fn load_stored(app: &App) {
-    let rows: Vec<(String, String, Vec<u8>)> = {
-        let conn = app.db.conn();
-        let mut stmt = match conn.prepare("SELECT host, cert_pem, key_pem FROM certificates WHERE cert_pem IS NOT NULL") {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    let rows = match stored(app) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("reading stored certificates: {e}");
+            return;
+        }
     };
     for (host, cert, key) in rows.into_iter().filter(|(h, _, _)| !app.proxy.has_cert(h)) {
-        match app.keys.open_str(&format!("cert:{host}"), &key).and_then(|k| crate::proxy::certified_key(&cert, &k)) {
+        match app.keys.open_str(&key_context(&host), &key).and_then(|k| crate::proxy::certified_key(&cert, &k)) {
             Ok(ck) => app.proxy.set_cert(&host, ck),
             Err(e) => tracing::warn!("stored certificate for {host} is unusable: {e:#}"),
         }
@@ -52,31 +61,28 @@ fn wanted(app: &App) -> Result<Vec<String>> {
 async fn tick(app: &AppState) -> Result<()> {
     let now = util::now();
     for host in wanted(app)? {
-        let row: Option<(Option<i64>, Option<i64>)> = app
-            .db
-            .conn()
-            .query_row("SELECT not_after, next_attempt_at FROM certificates WHERE host = ?1", [&host], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
+        let row = app.db.row("SELECT not_after, next_attempt_at FROM certificates WHERE host = ?1", [&host], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)))?;
         let (not_after, next_attempt) = row.unwrap_or((None, None));
+        let attempts_key = format!("acme_attempts:{host}");
         if not_after.is_some_and(|na| na - now > RENEW_BEFORE) || next_attempt.is_some_and(|t| t > now) {
             continue;
         }
         match issue(app, &host).await {
             Ok((cert, key)) => {
                 let expires = first_cert_not_after(&cert).unwrap_or(now + 90 * 86400);
-                app.db.conn().execute(
+                app.db.exec(
                     "INSERT INTO certificates (host, cert_pem, key_pem, not_after, source, last_error, next_attempt_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'acme', NULL, NULL, ?5)
                      ON CONFLICT(host) DO UPDATE SET cert_pem = excluded.cert_pem, key_pem = excluded.key_pem, not_after = excluded.not_after, last_error = NULL, next_attempt_at = NULL, updated_at = excluded.updated_at",
-                    params![host, cert, app.keys.seal_str(&format!("cert:{host}"), &key)?, expires, now],
+                    params![host, cert, app.keys.seal_str(&key_context(&host), &key)?, expires, now],
                 )?;
-                app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("acme_attempts:{host}")])?;
+                app.db.del_state(&attempts_key)?;
                 app.proxy.set_cert(&host, crate::proxy::certified_key(&cert, &key)?);
                 tracing::info!("certificate issued for {host}");
                 app.emit("certificate", None, None, serde_json::json!({ "host": host, "ok": true }));
                 crate::proxy::reload(app);
             }
             Err(e) => {
-                let attempts: i64 = app.db.get_state(&format!("acme_attempts:{host}"))?.and_then(|v| v.parse().ok()).unwrap_or(0) + 1;
+                let attempts: i64 = app.db.get_state(&attempts_key)?.and_then(|v| v.parse().ok()).unwrap_or(0) + 1;
                 let wait = match attempts {
                     1 => 300,
                     2 => 1800,
@@ -85,8 +91,8 @@ async fn tick(app: &AppState) -> Result<()> {
                     _ => 86400,
                 };
                 let msg = format!("{e:#}");
-                app.db.set_state(&format!("acme_attempts:{host}"), &attempts.to_string())?;
-                app.db.conn().execute(
+                app.db.set_state(&attempts_key, &attempts.to_string())?;
+                app.db.exec(
                     "INSERT INTO certificates (host, last_error, next_attempt_at, updated_at) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(host) DO UPDATE SET last_error = excluded.last_error, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
                     params![host, msg, now + wait, now],
@@ -103,8 +109,8 @@ async fn tick(app: &AppState) -> Result<()> {
 }
 
 async fn account(app: &App) -> Result<Account> {
-    if let Some(sealed) = app.db.get_state("acme_account")? {
-        let creds: AccountCredentials = serde_json::from_str(&app.keys.open_str("acme", &crate::crypto::unb64(&sealed)?)?)?;
+    if let Some(creds) = app.sealed_state("acme_account", "acme")? {
+        let creds: AccountCredentials = serde_json::from_str(&creds)?;
         return Ok(Account::builder()?.from_credentials(creds).await?);
     }
     let email = app.settings().acme_email.map(|e| format!("mailto:{e}"));
@@ -113,8 +119,7 @@ async fn account(app: &App) -> Result<Account> {
     let (acc, creds) = Account::builder()?
         .create(&NewAccount { contact: &contact, terms_of_service_agreed: true, only_return_existing: false }, directory.to_owned(), None)
         .await?;
-    let sealed = app.keys.seal_str("acme", &serde_json::to_string(&creds)?)?;
-    app.db.set_state("acme_account", &crate::crypto::b64(&sealed))?;
+    app.set_sealed_state("acme_account", "acme", &serde_json::to_string(&creds)?)?;
     Ok(acc)
 }
 
@@ -185,8 +190,8 @@ fn tlv(d: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         }
         (len, 2 + n)
     };
-    let body = d.get(hdr..hdr + len)?;
-    Some((tag, body, &d[hdr + len..]))
+    let end = hdr.checked_add(len)?;
+    Some((tag, d.get(hdr..end)?, d.get(end..)?))
 }
 
 fn not_after(der: &[u8]) -> Option<i64> {

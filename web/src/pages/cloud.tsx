@@ -1,8 +1,29 @@
 // Cloud accounts, the machines Tugport creates in them, and server pools. Owner only: these spend money.
 import { useRef, useState } from "preact/hooks";
 import { del, patch, post, useApi, useMe, type Event } from "../api";
-import { Action, Card, Empty, ErrorBox, Field, Loaded, Loading, Modal, NameInput, Note, Page, Pill, Select, Tabs, toast, useSubmit } from "../ui";
-import { ago, labelsText, parseLabels, sentence, sizeLabel, sizesIn, type MachineSize } from "../util";
+import {
+  Action,
+  Card,
+  ErrorBox,
+  Field,
+  FormButtons,
+  Input,
+  Loaded,
+  Loading,
+  Modal,
+  NameInput,
+  Note,
+  Page,
+  Pill,
+  Rows,
+  Select,
+  Tabs,
+  TextArea,
+  toast,
+  useForm,
+  useSubmit,
+} from "../ui";
+import { ago, labelsText, requireLabels, sentence, sizeLabel, sizesIn, type MachineSize } from "../util";
 
 export interface Account {
   id: string;
@@ -37,6 +58,18 @@ export interface Pool {
 type Options = { regions: { id: string; name: string }[]; sizes: MachineSize[] };
 
 export const PROVIDERS: Record<string, string> = { hetzner: "Hetzner", aws: "AWS" };
+const providerName = (a: Account) => PROVIDERS[a.kind] ?? a.kind;
+/** The provider of an account, by its id. */
+export const providerOf = (accounts: Account[] | undefined, id: string | undefined) => {
+  const a = accounts?.find((x) => x.id === id);
+  return a ? providerName(a) : "the provider";
+};
+const accountOptions = (accounts: Account[]) => accounts.map((a): [string, string] => [a.id, `${a.name} (${providerName(a)})`]);
+/** "at Hetzner in the account main" */
+const accountText = (accounts: Account[] | undefined, id: string) => {
+  const a = accounts?.find((x) => x.id === id);
+  return a ? `at ${providerName(a)} in the account ${a.name}` : "in an account that was removed";
+};
 
 /** The tabs over the servers pages; the Cloud tab is the owner's alone. */
 export function ServerTabs(props: { current: "list" | "cloud" }) {
@@ -68,12 +101,9 @@ export function useCloud() {
 }
 
 /** "a cx22 in fsn1, at Hetzner in the account main" */
-export const machineText = (m: Machine, accounts: Account[] | undefined) => {
-  const a = accounts?.find((x) => x.id === m.account_id);
-  return `a ${m.size} in ${m.region}, ${a ? `at ${PROVIDERS[a.kind] ?? a.kind} in the account ${a.name}` : "in an account that was removed"}`;
-};
+export const machineText = (m: Machine, accounts: Account[] | undefined) => `a ${m.size} in ${m.region}, ${accountText(accounts, m.account_id)}`;
 
-export function CloudPage(_: { path?: string }) {
+export function CloudPage() {
   const me = useMe();
   const { machines, accounts } = useCloud();
   const pools = useApi<{ pools: Pool[] }>(me.principal.is_owner ? "/cloud/pools" : null);
@@ -104,32 +134,26 @@ export function CloudPage(_: { path?: string }) {
           }
         >
           <Loaded r={accounts}>
-            {(d) =>
-              d.accounts.length === 0 ? (
-                <div class="p-4">
-                  <Empty>Add a Hetzner or AWS account, and Tugport can create servers in it that join this panel by themselves.</Empty>
-                </div>
-              ) : (
-                <ul class="divide-y divide-line">
-                  {d.accounts.map((a) => (
-                    <li key={a.id} class="flex flex-wrap items-center gap-3 px-4 py-3">
-                      <span class="min-w-0 flex-1">
-                        <span class="font-medium">{a.name}</span> <span class="chip">{PROVIDERS[a.kind] ?? a.kind}</span>
-                        <span class="block text-xs text-muted">Added {ago(a.created_at)}</span>
-                      </span>
-                      <Action
-                        class="btn btn-ghost text-bad"
-                        confirm={`Remove the account ${a.name}? Tugport forgets its credentials. An account that still has machines or pools cannot be removed.`}
-                        run={() => del(`/cloud/accounts/${a.id}`).then(accounts.reload)}
-                        done="Removed the account."
-                      >
-                        Remove
-                      </Action>
-                    </li>
-                  ))}
-                </ul>
-              )
-            }
+            {(d) => (
+              <Rows items={d.accounts} empty="Add a Hetzner or AWS account, and Tugport can create servers in it that join this panel by themselves.">
+                {(a) => (
+                  <li key={a.id} class="row">
+                    <span class="min-w-0 flex-1">
+                      <span class="font-medium">{a.name}</span> <span class="chip">{providerName(a)}</span>
+                      <span class="block text-xs text-muted">Added {ago(a.created_at)}</span>
+                    </span>
+                    <Action
+                      class="btn btn-ghost text-bad"
+                      confirm={`Remove the account ${a.name}? Tugport forgets its credentials. An account that still has machines or pools cannot be removed.`}
+                      run={() => del(`/cloud/accounts/${a.id}`).then(accounts.reload)}
+                      done="Removed the account."
+                    >
+                      Remove
+                    </Action>
+                  </li>
+                )}
+              </Rows>
+            )}
           </Loaded>
         </Card>
 
@@ -146,19 +170,15 @@ export function CloudPage(_: { path?: string }) {
             These are the machines Tugport created. Once one joins, it is a server like any other, and removing it from its server page deletes the machine as well.
           </p>
           <Loaded r={machines}>
-            {(d) =>
-              d.servers.length === 0 ? (
-                <div class="p-4">
-                  <Empty>{accs.length ? "Tugport has not created any machines yet." : "Add a cloud account first, and then Tugport can create servers in it."}</Empty>
-                </div>
-              ) : (
-                <ul class="mt-3 divide-y divide-line border-t border-line">
-                  {d.servers.map((m) => (
-                    <MachineRow key={m.id} m={m} accounts={accs} pools={pools.data?.pools} onChanged={machines.reload} />
-                  ))}
-                </ul>
-              )
-            }
+            {(d) => (
+              <Rows
+                items={d.servers}
+                class="mt-3 border-t border-line"
+                empty={accs.length ? "Tugport has not created any machines yet." : "Add a cloud account first, and then Tugport can create servers in it."}
+              >
+                {(m) => <MachineRow key={m.id} m={m} accounts={accs} pools={pools.data?.pools} onChanged={machines.reload} />}
+              </Rows>
+            )}
           </Loaded>
         </Card>
 
@@ -175,53 +195,45 @@ export function CloudPage(_: { path?: string }) {
             A pool adds servers when the load is high and removes them when it is low, within limits you set. Every server it adds costs money at the provider.
           </p>
           <Loaded r={pools}>
-            {(d) =>
-              d.pools.length === 0 ? (
-                <div class="p-4">
-                  <Empty>There are no pools yet.</Empty>
-                </div>
-              ) : (
-                <ul class="mt-3 divide-y divide-line border-t border-line">
-                  {d.pools.map((p) => {
-                    const members = (machines.data?.servers ?? []).filter((m) => m.pool_id === p.id && m.status !== "failed").length;
-                    const a = accs.find((x) => x.id === p.account_id);
-                    return (
-                      <li key={p.id} class="flex flex-wrap items-center gap-3 px-4 py-3">
-                        <div class="min-w-0 flex-1 space-y-1">
-                          <div class="flex flex-wrap items-center gap-2">
-                            <span class="font-medium">{p.name}</span>
-                            <span class="chip">
-                              {members} {members === 1 ? "server" : "servers"} now
-                            </span>
-                            {Object.entries(p.labels ?? {}).map(([k, v]) => (
-                              <span key={k} class="chip font-mono">{`${k}=${v}`}</span>
-                            ))}
-                          </div>
-                          <p class="text-xs text-muted">
-                            It keeps {p.min_servers} to {p.max_servers} servers of size {p.size} in {p.region},{" "}
-                            {a ? `at ${PROVIDERS[a.kind] ?? a.kind} in the account ${a.name}` : "in an account that was removed"}, and it grows above {p.scale_up_cpu}% CPU and
-                            shrinks below {p.scale_down_cpu}%.
-                          </p>
+            {(d) => (
+              <Rows items={d.pools} class="mt-3 border-t border-line" empty="There are no pools yet.">
+                {(p) => {
+                  const members = (machines.data?.servers ?? []).filter((m) => m.pool_id === p.id && m.status !== "failed").length;
+                  return (
+                    <li key={p.id} class="row">
+                      <div class="min-w-0 flex-1 space-y-1">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <span class="font-medium">{p.name}</span>
+                          <span class="chip">
+                            {members} {members === 1 ? "server" : "servers"} now
+                          </span>
+                          {Object.entries(p.labels ?? {}).map(([k, v]) => (
+                            <span key={k} class="chip font-mono">{`${k}=${v}`}</span>
+                          ))}
                         </div>
-                        <span class="flex gap-2">
-                          <button class="btn" onClick={() => setDialog({ pool: p })}>
-                            Edit
-                          </button>
-                          <Action
-                            class="btn btn-ghost text-bad"
-                            confirm={`Delete the pool ${p.name}? Its servers stay and keep costing money, and Tugport stops adding or removing servers for it. To remove the servers as well, set the fewest and most servers to 0 first and wait until the pool has shrunk.`}
-                            run={() => del(`/cloud/pools/${p.id}`).then(pools.reload)}
-                            done="Deleted the pool. Its servers stay."
-                          >
-                            Delete
-                          </Action>
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )
-            }
+                        <p class="text-xs text-muted">
+                          It keeps {p.min_servers} to {p.max_servers} servers of size {p.size} in {p.region}, {accountText(accs, p.account_id)}, and it grows above {p.scale_up_cpu}
+                          % CPU and shrinks below {p.scale_down_cpu}%.
+                        </p>
+                      </div>
+                      <span class="flex gap-2">
+                        <button class="btn" onClick={() => setDialog({ pool: p })}>
+                          Edit
+                        </button>
+                        <Action
+                          class="btn btn-ghost text-bad"
+                          confirm={`Delete the pool ${p.name}? Its servers stay and keep costing money, and Tugport stops adding or removing servers for it. To remove the servers as well, set the fewest and most servers to 0 first and wait until the pool has shrunk.`}
+                          run={() => del(`/cloud/pools/${p.id}`).then(pools.reload)}
+                          done="Deleted the pool. Its servers stay."
+                        >
+                          Delete
+                        </Action>
+                      </span>
+                    </li>
+                  );
+                }}
+              </Rows>
+            )}
           </Loaded>
         </Card>
       </div>
@@ -237,9 +249,9 @@ const STATUS: Record<Machine["status"], string> = { creating: "setting up", join
 function MachineRow(props: { m: Machine; accounts: Account[]; pools: Pool[] | undefined; onChanged: () => void }) {
   const { m } = props;
   const pool = props.pools?.find((p) => p.id === m.pool_id);
-  const provider = PROVIDERS[props.accounts.find((a) => a.id === m.account_id)?.kind ?? ""] ?? "the provider";
+  const provider = providerOf(props.accounts, m.account_id);
   return (
-    <li class="flex flex-wrap items-center gap-3 px-4 py-3">
+    <li class="row">
       <div class="min-w-0 flex-1 space-y-1">
         <div class="flex flex-wrap items-center gap-2">
           {m.node_id ? (
@@ -273,8 +285,7 @@ function MachineRow(props: { m: Machine; accounts: Account[]; pools: Pool[] | un
 }
 
 function AddAccount(props: { onClose: () => void; onSaved: () => void }) {
-  const [f, setF] = useState({ kind: "hetzner", name: "", token: "", access: "", secret: "" });
-  const upd = (p: Partial<typeof f>) => setF((s) => ({ ...s, ...p }));
+  const { f, set, bind } = useForm({ kind: "hetzner", name: "", token: "", access: "", secret: "" });
   const sub = useSubmit(async () => {
     const creds = f.kind === "hetzner" ? { token: f.token.trim() } : { access_key: f.access.trim(), secret_key: f.secret.trim() };
     await post("/cloud/accounts", { kind: f.kind, name: f.name.trim(), ...creds });
@@ -283,9 +294,7 @@ function AddAccount(props: { onClose: () => void; onSaved: () => void }) {
     props.onClose();
   });
   const secret = (label: string, k: "token" | "access" | "secret", hint?: string) => (
-    <Field label={label} hint={hint}>
-      <input class="input font-mono" type="password" required autoComplete="off" spellcheck={false} value={f[k]} onInput={(e) => upd({ [k]: e.currentTarget.value })} />
-    </Field>
+    <Input label={label} hint={hint} mono type="password" required autoComplete="off" {...bind(k)} />
   );
   return (
     <Modal open onClose={props.onClose} title="Add a cloud account">
@@ -294,16 +303,14 @@ function AddAccount(props: { onClose: () => void; onSaved: () => void }) {
           <Field label="Provider">
             <Select
               value={f.kind}
-              onChange={(kind) => upd({ kind })}
+              onChange={(kind) => set({ kind })}
               options={[
                 ["hetzner", "Hetzner Cloud"],
                 ["aws", "Amazon Web Services"],
               ]}
             />
           </Field>
-          <Field label="Name" hint="A name helps you tell accounts apart.">
-            <input class="input" required placeholder={f.kind === "aws" ? "aws-main" : "hetzner-main"} value={f.name} onInput={(e) => upd({ name: e.currentTarget.value })} />
-          </Field>
+          <Input label="Name" hint="A name helps you tell accounts apart." required placeholder={f.kind === "aws" ? "aws-main" : "hetzner-main"} {...bind("name")} />
         </div>
         {f.kind === "hetzner" ? (
           secret("API token", "token", "Create a token with read and write access in the Hetzner Cloud console, under Security.")
@@ -314,15 +321,7 @@ function AddAccount(props: { onClose: () => void; onSaved: () => void }) {
           </>
         )}
         <p class="text-xs text-muted">Tugport checks the credentials with the provider before it saves them, and it stores them encrypted.</p>
-        <ErrorBox error={sub.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={sub.busy}>
-            {sub.busy ? "Checking the credentials…" : "Add the account"}
-          </button>
-        </div>
+        <FormButtons s={sub} submit={sub.busy ? "Checking the credentials…" : "Add the account"} onCancel={props.onClose} />
       </form>
     </Modal>
   );
@@ -362,7 +361,7 @@ function CreateServer(props: { accounts: Account[]; onClose: () => void; onCreat
   const [account, setAccount] = useState(props.accounts[0]?.id ?? "");
   const [url, setUrl] = useState("");
   const choice = useMachineChoice(account);
-  const provider = PROVIDERS[props.accounts.find((a) => a.id === account)?.kind ?? ""] ?? "the provider";
+  const provider = providerOf(props.accounts, account);
   const sub = useSubmit(async () => {
     if (!choice.region || !choice.size) throw new Error("Pick a region and a size first.");
     await post("/cloud/servers", { account_id: account, region: choice.region, size: choice.size, panel_url: url.trim().replace(/\/+$/, "") || undefined });
@@ -381,28 +380,23 @@ function CreateServer(props: { accounts: Account[]; onClose: () => void; onCreat
               setAccount(a);
               choice.reset();
             }}
-            options={props.accounts.map((a): [string, string] => [a.id, `${a.name} (${PROVIDERS[a.kind] ?? a.kind})`])}
+            options={accountOptions(props.accounts)}
           />
         </Field>
         <MachineFields choice={choice} />
-        <Field
+        <Input
           label="Panel address (optional)"
           hint="The machine calls the panel at this address over the internet to join. Leave this empty to use the panel domain, or this server's public address when there is no domain."
-        >
-          <input class="input font-mono" type="url" spellcheck={false} placeholder="https://deploy.example.com" value={url} onInput={(e) => setUrl(e.currentTarget.value)} />
-        </Field>
+          mono
+          type="url"
+          placeholder="https://deploy.example.com"
+          value={url}
+          onInput={(e) => setUrl(e.currentTarget.value)}
+        />
         <Note tone="warn">
           This creates a machine at {provider} that costs money there, by the hour, until you remove it. If it has not joined within 20 minutes, Tugport deletes it.
         </Note>
-        <ErrorBox error={sub.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={sub.busy}>
-            {sub.busy ? "Creating the machine…" : "Create the server"}
-          </button>
-        </div>
+        <FormButtons s={sub} submit={sub.busy ? "Creating the machine…" : "Create the server"} onCancel={props.onClose} />
       </form>
     </Modal>
   );
@@ -410,7 +404,7 @@ function CreateServer(props: { accounts: Account[]; onClose: () => void; onCreat
 
 function PoolForm(props: { pool?: Pool; accounts: Account[]; onClose: () => void; onSaved: () => void }) {
   const p = props.pool;
-  const [f, setF] = useState({
+  const { f, set, bind } = useForm({
     name: p?.name ?? "",
     account: p?.account_id ?? props.accounts[0]?.id ?? "",
     labels: labelsText(p?.labels),
@@ -419,12 +413,10 @@ function PoolForm(props: { pool?: Pool; accounts: Account[]; onClose: () => void
     up: String(p?.scale_up_cpu ?? 75),
     down: String(p?.scale_down_cpu ?? 25),
   });
-  const upd = (x: Partial<typeof f>) => setF((s) => ({ ...s, ...x }));
   const choice = useMachineChoice(f.account, p && { region: p.region, size: p.size });
-  const provider = PROVIDERS[props.accounts.find((a) => a.id === f.account)?.kind ?? ""] ?? "the provider";
+  const provider = providerOf(props.accounts, f.account);
   const sub = useSubmit(async () => {
-    const labels = parseLabels(f.labels);
-    if (!labels) throw new Error("Write each label as key=value, separated by commas or new lines.");
+    const labels = requireLabels(f.labels);
     const body = {
       region: choice.region,
       size: choice.size,
@@ -440,40 +432,40 @@ function PoolForm(props: { pool?: Pool; accounts: Account[]; onClose: () => void
     props.onSaved();
     props.onClose();
   });
-  const num = (label: string, k: "min" | "max" | "up" | "down", max: number) => (
-    <Field label={label}>
-      <input class="input" type="number" required min={0} max={max} step="any" value={f[k]} onInput={(e) => upd({ [k]: e.currentTarget.value })} />
-    </Field>
-  );
+  const num = (label: string, k: "min" | "max" | "up" | "down") => <Input label={label} type="number" required min={0} max={100} step="any" {...bind(k)} />;
   return (
     <Modal open onClose={props.onClose} title={p ? `Edit the pool ${p.name}` : "New server pool"} wide>
       <form class="space-y-4" onSubmit={sub.submit}>
         {!p && (
           <div class="grid gap-4 sm:grid-cols-2">
             <Field label="Name" hint="Use lowercase letters, digits and dashes.">
-              <NameInput value={f.name} onChange={(name) => upd({ name })} />
+              <NameInput value={f.name} onChange={(name) => set({ name })} />
             </Field>
             <Field label="Account">
               <Select
                 value={f.account}
                 onChange={(account) => {
-                  upd({ account });
+                  set({ account });
                   choice.reset();
                 }}
-                options={props.accounts.map((a): [string, string] => [a.id, `${a.name} (${PROVIDERS[a.kind] ?? a.kind})`])}
+                options={accountOptions(props.accounts)}
               />
             </Field>
           </div>
         )}
         <MachineFields choice={choice} />
-        <Field label="Labels (optional)" hint="Every server in the pool gets these labels when it joins, so services can ask for pool servers in their placement.">
-          <textarea class="input h-16" spellcheck={false} placeholder="pool=web" value={f.labels} onInput={(e) => upd({ labels: e.currentTarget.value })} />
-        </Field>
+        <TextArea
+          label="Labels (optional)"
+          hint="Every server in the pool gets these labels when it joins, so services can ask for pool servers in their placement."
+          class="h-16"
+          placeholder="pool=web"
+          {...bind("labels")}
+        />
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
-          {num("Fewest servers", "min", 100)}
-          {num("Most servers", "max", 100)}
-          {num("Grow above CPU (%)", "up", 100)}
-          {num("Shrink below CPU (%)", "down", 100)}
+          {num("Fewest servers", "min")}
+          {num("Most servers", "max")}
+          {num("Grow above CPU (%)", "up")}
+          {num("Shrink below CPU (%)", "down")}
         </div>
         <p class="text-dim">
           {Number(f.min) > 0 ? `The pool keeps at least ${f.min} ${Number(f.min) === 1 ? "server" : "servers"}.` : "The pool can shrink to no servers at all."} While the average
@@ -481,15 +473,7 @@ function PoolForm(props: { pool?: Pool; accounts: Account[]; onClose: () => void
           {f.down || 0}% for 30 minutes, it removes one, newest first. It never removes a server that keeps data, such as one running a database.
         </p>
         <Note tone="warn">Every server the pool adds costs money at {provider} until the pool or you remove it.</Note>
-        <ErrorBox error={sub.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={sub.busy}>
-            {p ? "Save the pool" : "Create the pool"}
-          </button>
-        </div>
+        <FormButtons s={sub} submit={p ? "Save the pool" : "Create the pool"} onCancel={props.onClose} />
       </form>
     </Modal>
   );

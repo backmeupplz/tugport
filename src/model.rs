@@ -155,9 +155,10 @@ fn default_builder() -> String {
     "heroku/builder:24".into()
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
+    #[default]
     Tcp,
     Udp,
 }
@@ -166,12 +167,8 @@ pub enum Protocol {
 pub struct Port {
     pub container: u16,
     pub host: u16,
-    #[serde(default = "tcp")]
+    #[serde(default)]
     pub protocol: Protocol,
-}
-
-fn tcp() -> Protocol {
-    Protocol::Tcp
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

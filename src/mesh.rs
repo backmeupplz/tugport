@@ -3,11 +3,13 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use crate::proc::{run_sync, succeeds};
 use std::process::Command;
 
 pub const IFACE: &str = "tugport0";
 pub const PORT: u16 = 51820;
 pub const PANEL_IP: &str = "10.99.0.1";
+pub const SUBNET: &str = "10.99.0.0/16";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Peer {
@@ -22,17 +24,9 @@ pub fn mesh_ip(index: u32) -> String {
     format!("10.99.{}.{}", index / 250, index % 250 + if index / 250 == 0 { 0 } else { 1 })
 }
 
-fn run(cmd: &mut Command) -> Result<String> {
-    let out = cmd.output().with_context(|| format!("running {:?}", cmd.get_program()))?;
-    if !out.status.success() {
-        bail!("{:?} failed: {}", cmd.get_program(), String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 /// New private key and its public key.
 pub fn keypair() -> Result<(String, String)> {
-    let private = run(Command::new("wg").arg("genkey"))?;
+    let private = run_sync(Command::new("wg").arg("genkey"))?;
     let mut child = Command::new("wg").arg("pubkey").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn()?;
     {
         use std::io::Write;
@@ -47,26 +41,26 @@ pub fn keypair() -> Result<(String, String)> {
 
 /// Bring the interface up with our address and private key (idempotent).
 pub fn up(private_key_file: &std::path::Path, own_ip: &str) -> Result<()> {
-    let exists = Command::new("ip").args(["link", "show", IFACE]).output().map(|o| o.status.success()).unwrap_or(false);
+    let exists = succeeds(Command::new("ip").args(["link", "show", IFACE]));
     if !exists {
-        run(Command::new("ip").args(["link", "add", IFACE, "type", "wireguard"]))?;
+        run_sync(Command::new("ip").args(["link", "add", IFACE, "type", "wireguard"]))?;
     }
-    run(Command::new("wg").args(["set", IFACE, "listen-port", &PORT.to_string(), "private-key"]).arg(private_key_file))?;
-    let addrs = run(Command::new("ip").args(["-o", "addr", "show", "dev", IFACE]))?;
+    run_sync(Command::new("wg").args(["set", IFACE, "listen-port", &PORT.to_string(), "private-key"]).arg(private_key_file))?;
+    let addrs = run_sync(Command::new("ip").args(["-o", "addr", "show", "dev", IFACE]))?;
     if !addrs.contains(&format!("{own_ip}/16")) {
-        run(Command::new("ip").args(["addr", "add", &format!("{own_ip}/16"), "dev", IFACE]))?;
+        run_sync(Command::new("ip").args(["addr", "add", &format!("{own_ip}/16"), "dev", IFACE]))?;
     }
     // VXLAN (Docker overlay) runs inside WireGuard, so leave room for both headers.
-    run(Command::new("ip").args(["link", "set", "mtu", "1420", "up", "dev", IFACE]))?;
+    run_sync(Command::new("ip").args(["link", "set", "mtu", "1420", "up", "dev", IFACE]))?;
     Ok(())
 }
 
 /// Make the interface's peers exactly `peers` (adds, updates and removes).
 pub fn set_peers(peers: &[Peer]) -> Result<()> {
-    let current = run(Command::new("wg").args(["show", IFACE, "peers"])).unwrap_or_default();
+    let current = run_sync(Command::new("wg").args(["show", IFACE, "peers"])).unwrap_or_default();
     for key in current.lines().filter(|k| !k.is_empty()) {
         if !peers.iter().any(|p| p.public_key == key) {
-            run(Command::new("wg").args(["set", IFACE, "peer", key, "remove"]))?;
+            run_sync(Command::new("wg").args(["set", IFACE, "peer", key, "remove"]))?;
         }
     }
     for p in peers {
@@ -75,7 +69,7 @@ pub fn set_peers(peers: &[Peer]) -> Result<()> {
         if let Some(ep) = &p.endpoint {
             cmd.args(["endpoint", ep]);
         }
-        run(&mut cmd)?;
+        run_sync(&mut cmd)?;
     }
     Ok(())
 }
@@ -85,28 +79,18 @@ pub fn set_peers(peers: &[Peer]) -> Result<()> {
 /// arriving over WireGuard itself, or from this host, may start a mesh connection.
 pub fn guard() -> Result<()> {
     const CHAIN: &str = "TUGPORT-MESH";
-    // At boot Docker, firewalls and Tugport may all hold the xtables lock for a moment. Bounded,
-    // since a hung holder would otherwise keep Docker from starting (it runs this first).
-    let ok = |args: &[&str]| Command::new("iptables").args(["-w", "10"]).args(args).output().map(|o| o.status.success()).unwrap_or(false);
-    if !ok(&["-n", "-L", CHAIN]) {
-        run(Command::new("iptables").args(["-w", "10", "-N", CHAIN])).context("blocking containers from the mesh")?;
-    }
-    // In FORWARD the rule would end up below the ACCEPT rules Docker inserts when it starts.
-    let forward = if docker_user_chain().is_ok() { "DOCKER-USER" } else { "FORWARD" };
-    // Published ports are DNAT-ed before filtering, so match the original destination.
-    let rules: [(&str, &str, &[&str]); 5] = [
-        ("-A", CHAIN, &["-i", IFACE, "-j", "RETURN"]),
-        ("-A", CHAIN, &["-i", "lo", "-j", "RETURN"]),
-        ("-A", CHAIN, &["-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"]),
-        ("-I", forward, &["-m", "conntrack", "--ctorigdst", "10.99.0.0/16", "-j", CHAIN]),
-        ("-I", "INPUT", &["-d", "10.99.0.0/16", "-j", CHAIN]),
-    ];
-    for (op, chain, rule) in rules {
-        if !ok(&[&["-C", chain], rule].concat()) {
-            run(Command::new("iptables").args([&["-w", "10", op, chain], rule].concat())).context("blocking containers from the mesh")?;
-        }
-    }
-    Ok(())
+    (|| {
+        new_chain("iptables", CHAIN)?;
+        // In FORWARD the rule would end up below the ACCEPT rules Docker inserts when it starts.
+        let forward = if docker_user_chain().is_ok() { "DOCKER-USER" } else { "FORWARD" };
+        ensure("iptables", "-A", CHAIN, &["-i", IFACE, "-j", "RETURN"])?;
+        ensure("iptables", "-A", CHAIN, &["-i", "lo", "-j", "RETURN"])?;
+        ensure("iptables", "-A", CHAIN, &["-m", "conntrack", "--ctstate", "NEW", "-j", "DROP"])?;
+        // Published ports are DNAT-ed before filtering, so match the original destination.
+        ensure("iptables", "-I", forward, &["-m", "conntrack", "--ctorigdst", SUBNET, "-j", CHAIN])?;
+        ensure("iptables", "-I", "INPUT", &["-d", SUBNET, "-j", CHAIN])
+    })()
+    .context("blocking containers from the mesh")
 }
 
 /// Swarm's ports carry overlay traffic without authentication: VXLAN (4789/udp), gossip
@@ -119,28 +103,21 @@ pub fn guard_swarm(node_addr: Option<&str>) -> Result<()> {
         return Ok(());
     }
     // The mesh is IPv4 only, so over IPv6 these ports answer nobody but this host.
-    for (tool, own) in [("iptables", &["-i", IFACE, "-j", "RETURN"][..]), ("ip6tables", &[][..])] {
-        let ok = |args: &[&str]| Command::new(tool).args(["-w", "10"]).args(args).output().map(|o| o.status.success()).unwrap_or(false);
-        if !ok(&["-n", "-L", "INPUT"]) {
+    for (bin, mesh) in [("iptables", true), ("ip6tables", false)] {
+        if !has(bin, &["-n", "-L", "INPUT"]) {
             continue;
         }
-        if !ok(&["-n", "-L", CHAIN]) {
-            run(Command::new(tool).args(["-w", "10", "-N", CHAIN])).context("guarding swarm's ports")?;
-        }
-        let mut rules: Vec<(&str, &[&str])> = vec![];
-        if !own.is_empty() {
-            rules.push((CHAIN, own));
-        }
-        rules.push((CHAIN, &["-i", "lo", "-j", "RETURN"]));
-        rules.push((CHAIN, &["-j", "DROP"]));
-        rules.push(("INPUT", &["-p", "udp", "-m", "multiport", "--dports", "4789,7946", "-j", CHAIN]));
-        rules.push(("INPUT", &["-p", "tcp", "-m", "multiport", "--dports", "2377,7946", "-j", CHAIN]));
-        for (chain, rule) in rules {
-            if !ok(&[&["-C", chain], rule].concat()) {
-                let op = if chain == "INPUT" { "-I" } else { "-A" };
-                run(Command::new(tool).args([&["-w", "10", op, chain], rule].concat())).context("guarding swarm's ports")?;
+        (|| {
+            new_chain(bin, CHAIN)?;
+            if mesh {
+                ensure(bin, "-A", CHAIN, &["-i", IFACE, "-j", "RETURN"])?;
             }
-        }
+            ensure(bin, "-A", CHAIN, &["-i", "lo", "-j", "RETURN"])?;
+            ensure(bin, "-A", CHAIN, &["-j", "DROP"])?;
+            ensure(bin, "-I", "INPUT", &["-p", "udp", "-m", "multiport", "--dports", "4789,7946", "-j", CHAIN])?;
+            ensure(bin, "-I", "INPUT", &["-p", "tcp", "-m", "multiport", "--dports", "2377,7946", "-j", CHAIN])
+        })()
+        .context("guarding swarm's ports")?;
     }
     Ok(())
 }
@@ -162,12 +139,38 @@ pub fn boot(private_key_file: &std::path::Path, own_ip: &str, peers: &[Peer]) ->
 /// also covers a Docker that never sets up the chain (iptables off, or its nftables backend).
 fn docker_user_chain() -> Result<()> {
     const CHAIN: &str = "DOCKER-USER";
-    let ok = |args: &[&str]| Command::new("iptables").args(["-w", "10"]).args(args).output().map(|o| o.status.success()).unwrap_or(false);
-    if !ok(&["-n", "-L", CHAIN]) {
-        run(Command::new("iptables").args(["-w", "10", "-N", CHAIN])).context("creating DOCKER-USER")?;
+    new_chain("iptables", CHAIN).and_then(|_| ensure("iptables", "-I", "FORWARD", &["-j", CHAIN])).context("creating DOCKER-USER")
+}
+
+/// `iptables` or `ip6tables` with `args`. At boot Docker, firewalls and Tugport may all hold
+/// the xtables lock for a moment, so wait for it, but bounded: a hung holder would otherwise
+/// keep Docker from starting (it runs the guards first).
+fn xtables(bin: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.args(["-w", "10"]).args(args);
+    cmd
+}
+
+fn has(bin: &str, args: &[&str]) -> bool {
+    succeeds(&mut xtables(bin, args))
+}
+
+fn run(bin: &str, args: &[&str]) -> Result<String> {
+    run_sync(&mut xtables(bin, args))
+}
+
+/// Create `chain` unless it exists.
+fn new_chain(bin: &str, chain: &str) -> Result<()> {
+    if !has(bin, &["-n", "-L", chain]) {
+        run(bin, &["-N", chain])?;
     }
-    if !ok(&["-C", "FORWARD", "-j", CHAIN]) {
-        run(Command::new("iptables").args(["-w", "10", "-I", "FORWARD", "-j", CHAIN])).context("creating DOCKER-USER")?;
+    Ok(())
+}
+
+/// Add `rule` to `chain` (`op` is `-A` or `-I`) unless it is there already.
+fn ensure(bin: &str, op: &str, chain: &str, rule: &[&str]) -> Result<()> {
+    if !has(bin, &[&["-C", chain], rule].concat()) {
+        run(bin, &[&[op, chain], rule].concat())?;
     }
     Ok(())
 }
@@ -191,7 +194,7 @@ pub fn install_boot_hook() -> Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(path, DROPIN).with_context(|| format!("writing {DOCKER_DROPIN}"))?;
-    run(Command::new("systemctl").arg("daemon-reload"))?;
+    run_sync(Command::new("systemctl").arg("daemon-reload"))?;
     Ok(())
 }
 
@@ -214,7 +217,7 @@ pub fn guard_panel(ports: &[u16], host_ifaces: &[String], docker_bridges: Option
     let keep = docker_bridges.is_none();
     let v4 = guard_panel_with("iptables", &rules, keep);
     // Only containers on IPv6-enabled networks reach a panel listening on `[::]`.
-    let v6 = if Command::new("ip6tables").args(["-w", "10", "-n", "-L", "INPUT"]).output().map(|o| o.status.success()).unwrap_or(false) {
+    let v6 = if has("ip6tables", &["-n", "-L", "INPUT"]) {
         guard_panel_with("ip6tables", &rules, keep)
     } else {
         Ok(())
@@ -261,31 +264,24 @@ fn panel_rules(ports: &[u16], docker_bridges: &[String], host_ifaces: &[String])
 
 /// `keep`: leave a chain that has rules alone, only making sure INPUT still jumps to it.
 fn guard_panel_with(bin: &str, rules: &[Vec<String>], keep: bool) -> Result<()> {
-    fn args<'a>(op: &'a str, chain: &'a str, rule: &'a [String]) -> Vec<&'a str> {
-        [&[op, chain][..], &rule.iter().map(String::as_str).collect::<Vec<_>>()].concat()
-    }
-    let ok = |a: &[&str]| Command::new(bin).args(["-w", "10"]).args(a).output().map(|o| o.status.success()).unwrap_or(false);
-    let iptables = |a: &[&str]| run(Command::new(bin).args(["-w", "10"]).args(a)).context("blocking containers from the panel");
-    if !ok(&["-n", "-L", PANEL_CHAIN]) {
-        iptables(&["-N", PANEL_CHAIN])?;
-    }
-    // Ports and bridges change, so rebuild the chain whenever it holds anything else.
-    let present = iptables(&["-S", PANEL_CHAIN])?.lines().filter(|l| l.starts_with("-A ")).count();
-    if !(keep && present > 0) && (present != rules.len() || !rules.iter().all(|r| ok(&args("-C", PANEL_CHAIN, r)))) {
-        iptables(&["-F", PANEL_CHAIN])?;
-        for r in rules {
-            iptables(&args("-A", PANEL_CHAIN, r))?;
+    let rules: Vec<Vec<&str>> = rules.iter().map(|r| r.iter().map(String::as_str).collect()).collect();
+    (|| {
+        new_chain(bin, PANEL_CHAIN)?;
+        // Ports and bridges change, so rebuild the chain whenever it holds anything else.
+        let present = run(bin, &["-S", PANEL_CHAIN])?.lines().filter(|l| l.starts_with("-A ")).count();
+        if !(keep && present > 0) && (present != rules.len() || !rules.iter().all(|r| has(bin, &[&["-C", PANEL_CHAIN], &r[..]].concat()))) {
+            run(bin, &["-F", PANEL_CHAIN])?;
+            for r in &rules {
+                run(bin, &[&["-A", PANEL_CHAIN], &r[..]].concat())?;
+            }
         }
-    }
-    let jump = ["-p", "tcp", "-j", PANEL_CHAIN].map(String::from);
-    if !ok(&args("-C", "INPUT", &jump)) {
-        iptables(&args("-I", "INPUT", &jump))?;
-    }
-    Ok(())
+        ensure(bin, "-I", "INPUT", &["-p", "tcp", "-j", PANEL_CHAIN])
+    })()
+    .context("blocking containers from the panel")
 }
 
 pub fn available() -> bool {
-    Command::new("wg").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    succeeds(Command::new("wg").arg("--version"))
 }
 
 #[cfg(test)]

@@ -28,20 +28,15 @@ pub struct Tunnel {
 }
 
 pub fn load(app: &App) -> Result<Option<Tunnel>> {
-    match app.db.get_state("tunnel")? {
-        Some(sealed) => Ok(Some(serde_json::from_str(&app.keys.open_str("tunnel", &crate::crypto::unb64(&sealed)?)?)?)),
-        None => Ok(None),
-    }
+    Ok(app.sealed_state("tunnel", "tunnel")?.map(|t| serde_json::from_str(&t)).transpose()?)
 }
 
 fn save(app: &App, t: &Tunnel) -> Result<()> {
-    let sealed = app.keys.seal_str("tunnel", &serde_json::to_string(t)?)?;
-    app.db.set_state("tunnel", &crate::crypto::b64(&sealed))
+    app.set_sealed_state("tunnel", "tunnel", &serde_json::to_string(t)?)
 }
 
 /// Re-sync tunnel ingress rules and DNS records in the background.
-pub fn sync_soon(app: &AppState) {
-    let _ = app;
+pub fn sync_soon() {
     KICK.notify_one();
 }
 
@@ -67,17 +62,12 @@ pub async fn run(app: AppState) {
     }
 }
 
-fn client(token: &str) -> Result<(reqwest::Client, String)> {
-    Ok((reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?, format!("Bearer {token}")))
-}
-
 async fn cf(token: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
-    let (c, auth) = client(token)?;
-    let mut req = c.request(method, format!("{API}{path}")).header("Authorization", auth);
+    let mut req = util::http(30).build()?.request(method, format!("{API}{path}")).bearer_auth(token);
     if let Some(b) = body {
         req = req.json(&b);
     }
-    let v: Value = req.send().await?.json().await?;
+    let v: Value = serde_json::from_slice(&util::read_capped(req.send().await?, 8 << 20).await?)?;
     if v["success"].as_bool() != Some(true) {
         let msg = v["errors"].as_array().and_then(|e| e.first()).and_then(|e| e["message"].as_str()).unwrap_or("request failed");
         bail!("Cloudflare: {msg}");
@@ -89,8 +79,8 @@ async fn cf(token: &str, method: reqwest::Method, path: &str, body: Option<Value
 pub async fn connect(app: &AppState, api_token: &str) -> Result<Tunnel> {
     let accounts = cf(api_token, reqwest::Method::GET, "/accounts?per_page=5", None).await.context("the token cannot list accounts")?;
     let account_id = accounts.as_array().and_then(|a| a.first()).and_then(|a| a["id"].as_str()).ok_or_else(|| anyhow!("the token sees no Cloudflare account"))?.to_string();
-    let host: String = app.db.conn().query_row("SELECT name FROM nodes WHERE id = 'local'", [], |r| r.get(0)).unwrap_or_else(|_| "server".into());
-    let name = format!("tugport-{}-{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "-"), &util::id()[..4]);
+    let host: String = app.db.row("SELECT name FROM nodes WHERE id = 'local'", [], |r| r.get(0)).ok().flatten().unwrap_or_else(|| "server".into());
+    let name = format!("tugport-{}-{}", host.replace(|c: char| !c.is_ascii_alphanumeric(), "-"), util::random_string(4));
     let created = cf(api_token, reqwest::Method::POST, &format!("/accounts/{account_id}/cfd_tunnel"), Some(json!({ "name": name, "config_src": "cloudflare" })))
         .await
         .context("creating the tunnel (the token needs Account > Cloudflare Tunnel > Edit)")?;
@@ -114,7 +104,7 @@ pub async fn connect(app: &AppState, api_token: &str) -> Result<Tunnel> {
 
 /// Stop cloudflared and remove what Tugport made at Cloudflare: its DNS records and the tunnel.
 pub async fn disconnect(app: &App) -> Result<()> {
-    let _ = app.docker.remove_container(CONTAINER, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+    remove_container(app).await;
     let mut left = Vec::new();
     if let Some(t) = load(app)? {
         for (host, rec) in dns_records(app) {
@@ -140,7 +130,7 @@ pub async fn disconnect(app: &App) -> Result<()> {
             left.push(format!("tunnel {} ({e:#})", t.tunnel_id));
         }
     }
-    app.db.conn().execute("DELETE FROM state WHERE key IN ('tunnel', 'tunnel_dns')", [])?;
+    app.db.exec("DELETE FROM state WHERE key IN ('tunnel', 'tunnel_dns')", [])?;
     let _ = std::fs::remove_file(token_path(app));
     if !left.is_empty() {
         bail!("the tunnel is disconnected, but remove these in the Cloudflare dashboard: {}", left.join("; "));
@@ -156,7 +146,7 @@ struct DnsRecord {
 }
 
 fn dns_records(app: &App) -> std::collections::BTreeMap<String, DnsRecord> {
-    app.db.get_state("tunnel_dns").ok().flatten().and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+    app.db.state::<String>("tunnel_dns").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
 }
 
 /// Delete a record Tugport made, unless it is already gone or someone has pointed it elsewhere since.
@@ -176,14 +166,7 @@ fn token_path(app: &App) -> std::path::PathBuf {
 
 pub async fn status(app: &App) -> Result<Value> {
     let Some(t) = load(app)? else { return Ok(json!({ "enabled": false })) };
-    let running = app
-        .docker
-        .inspect_container(CONTAINER, None::<bollard::query_parameters::InspectContainerOptions>)
-        .await
-        .ok()
-        .and_then(|i| i.state)
-        .and_then(|s| s.running)
-        .unwrap_or(false);
+    let running = container(app).await.and_then(|i| i.state?.running).unwrap_or(false);
     let domains: Vec<String> = store::domains(app, None)?.into_iter().filter(|d| d.via_tunnel).map(|d| d.host).collect();
     Ok(json!({ "enabled": true, "account": t.account_id, "tunnel_id": t.tunnel_id, "running": running, "domains": domains }))
 }
@@ -199,13 +182,13 @@ async fn ensure_running(app: &App, t: &Tunnel) -> Result<()> {
         runtime::pull(app, IMAGE, &|_| {}).await?;
     }
     let cmd: Vec<String> = CMD.map(String::from).to_vec();
-    if let Ok(i) = app.docker.inspect_container(CONTAINER, None::<bollard::query_parameters::InspectContainerOptions>).await {
+    if let Some(i) = container(app).await {
         // A container from an older Tugport (another image or command) is replaced.
         let current = i.config.is_some_and(|c| c.image.as_deref() == Some(IMAGE) && c.cmd.as_ref() == Some(&cmd));
         if current && i.state.and_then(|s| s.running).unwrap_or(false) {
             return Ok(());
         }
-        let _ = app.docker.remove_container(CONTAINER, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+        remove_container(app).await;
     }
     let labels = HashMap::from([(runtime::L_MANAGED.to_string(), "true".to_string()), ("tugport.system".to_string(), "tunnel".to_string())]);
     let config = ContainerCreateBody {
@@ -228,6 +211,14 @@ async fn ensure_running(app: &App, t: &Tunnel) -> Result<()> {
     };
     app.docker.create_container(Some(CreateContainerOptions { name: Some(CONTAINER.into()), ..Default::default() }), config).await?;
     runtime::start(app, "local", CONTAINER).await
+}
+
+async fn container(app: &App) -> Option<bollard::models::ContainerInspectResponse> {
+    app.docker.inspect_container(CONTAINER, None::<bollard::query_parameters::InspectContainerOptions>).await.ok()
+}
+
+async fn remove_container(app: &App) {
+    let _ = app.docker.remove_container(CONTAINER, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
 }
 
 /// Point every tunnel domain at our proxy, and make each hostname's DNS a proxied CNAME to the tunnel.
@@ -278,36 +269,38 @@ async fn sync(app: &App, t: &Tunnel) -> Result<()> {
 /// Make `host` a proxied CNAME to the tunnel, returning the record.
 async fn point_at(token: &str, host: &str, target: &str) -> Result<DnsRecord> {
     let zone = zone_for(token, host).await?;
-    let records = cf(token, reqwest::Method::GET, &format!("/zones/{zone}/dns_records?name={host}"), None).await?;
-    let existing = records.as_array().cloned().unwrap_or_default();
+    let records = cf(token, reqwest::Method::GET, &format!("/zones/{zone}/dns_records?name={}", util::urlencode(host)), None).await?;
+    let existing = records.as_array().map(Vec::as_slice).unwrap_or_default();
     let body = json!({ "type": "CNAME", "name": host, "content": target, "proxied": true, "comment": "managed by Tugport" });
+    let id_of = |r: &Value| r["id"].as_str().map(String::from).ok_or_else(|| anyhow!("Cloudflare returned a DNS record without an id"));
     let id = match existing.iter().find(|r| r["type"] == "CNAME") {
-        Some(r) if r["content"].as_str() == Some(target) => r["id"].as_str().unwrap_or_default().to_string(),
+        Some(r) if r["content"].as_str() == Some(target) => id_of(r)?,
         // Someone else's record (a SaaS CNAME, say) is left alone, like A/AAAA records.
         Some(r) if r["comment"].as_str() != Some("managed by Tugport") => {
             bail!("it has a CNAME record to {}; remove it so the tunnel can take over the name", r["content"].as_str().unwrap_or("somewhere else"));
         }
         Some(r) => {
-            let id = r["id"].as_str().unwrap_or_default();
+            let id = id_of(r)?;
             cf(token, reqwest::Method::PUT, &format!("/zones/{zone}/dns_records/{id}"), Some(body)).await?;
-            id.to_string()
+            id
         }
         None if existing.iter().any(|r| r["type"] == "A" || r["type"] == "AAAA") => {
             bail!("it has A/AAAA records; remove them so the tunnel can take over the name");
         }
-        None => cf(token, reqwest::Method::POST, &format!("/zones/{zone}/dns_records"), Some(body)).await?["id"].as_str().unwrap_or_default().to_string(),
+        None => id_of(&cf(token, reqwest::Method::POST, &format!("/zones/{zone}/dns_records"), Some(body)).await?)?,
     };
     Ok(DnsRecord { zone, id })
 }
 
 async fn zone_for(token: &str, host: &str) -> Result<String> {
-    let labels: Vec<&str> = host.split('.').collect();
-    for i in 0..labels.len().saturating_sub(1) {
-        let name = labels[i..].join(".");
-        let zones = cf(token, reqwest::Method::GET, &format!("/zones?name={name}"), None).await?;
+    // The host itself, then each parent down to (not including) the top-level domain.
+    let mut name = host;
+    while let Some((_, parent)) = name.split_once('.') {
+        let zones = cf(token, reqwest::Method::GET, &format!("/zones?name={}", util::urlencode(name)), None).await?;
         if let Some(id) = zones.as_array().and_then(|z| z.first()).and_then(|z| z["id"].as_str()) {
             return Ok(id.to_string());
         }
+        name = parent;
     }
     bail!("no Cloudflare zone in this account covers {host}")
 }

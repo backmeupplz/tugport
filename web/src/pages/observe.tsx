@@ -1,9 +1,57 @@
 // Logs, charts and the console of services, and the charts of servers.
+import type { JSX } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { get, isPlanned, useApi, type Replica, type Service } from "../api";
+import { get, useApi, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
-import { Card, Empty, ErrorBox, Field, Loaded, Loading, Note, Planned, Select, errText } from "../ui";
+import { Card, Empty, ErrorBox, Field, Input, Loaded, Loading, Note, Select, errText } from "../ui";
 import { ago, bytes, clock, qs, sentence, toMs } from "../util";
+
+/** A log box that stays scrolled to the newest line, unless the reader scrolled up. `lines` changes as lines arrive. */
+export function useStickToBottom<T extends HTMLElement>(lines: unknown) {
+  const ref = useRef<T>(null);
+  const stick = useRef(true);
+  useLayoutEffect(() => {
+    const b = ref.current;
+    if (b && stick.current) b.scrollTop = b.scrollHeight;
+  }, [lines]);
+  const onScroll = (e: JSX.TargetedEvent<T>) => {
+    const b = e.currentTarget;
+    stick.current = b.scrollHeight - b.scrollTop - b.clientHeight < 40;
+  };
+  return { ref, stick, onScroll };
+}
+
+/** Parses the "line" events of a log stream and hands the kept ones over once per frame, so a burst renders once. */
+export function tailLines<T>(es: EventSource, flush: (chunk: T[]) => void, keep: (l: T) => boolean = () => true) {
+  let buf: T[] = [];
+  let frame = 0;
+  es.addEventListener("line", (m) => {
+    let l: T;
+    try {
+      l = JSON.parse(m.data);
+    } catch {
+      return;
+    }
+    if (!keep(l)) return;
+    buf.push(l);
+    if (!frame)
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const chunk = buf;
+        buf = [];
+        flush(chunk);
+      });
+  });
+  return {
+    clear: () => {
+      buf = [];
+    },
+    stop: () => {
+      es.close();
+      cancelAnimationFrame(frame);
+    },
+  };
+}
 
 interface LogLine {
   ts: number;
@@ -29,8 +77,7 @@ export function Logs(props: { service: Service; replicas: Replica[]; label: (r: 
   const [live, setLive] = useState(true);
   const [lines, setLines] = useState<LogLine[] | null>(null);
   const [error, setError] = useState<unknown>(null);
-  const box = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
+  const box = useStickToBottom<HTMLDivElement>(lines);
 
   useEffect(() => {
     const t = setTimeout(() => setQuery(q.trim()), 300);
@@ -54,46 +101,19 @@ export function Logs(props: { service: Service; replicas: Replica[]; label: (r: 
   const ready = lines !== null;
   useEffect(() => {
     if (!live || !ready) return;
-    const es = new EventSource(`/api/services/${id}/logs/stream`);
     const needle = query.toLowerCase();
-    let buf: LogLine[] = [];
-    let frame = 0;
-    es.addEventListener("line", (m) => {
-      let l: LogLine;
-      try {
-        l = JSON.parse(m.data);
-      } catch {
-        return;
-      }
-      if ((replica && l.replica !== replica) || (needle && !l.line.toLowerCase().includes(needle))) return;
-      buf.push(l);
-      if (!frame)
-        frame = requestAnimationFrame(() => {
-          frame = 0;
-          const chunk = buf;
-          buf = [];
-          setLines((cur) => (cur ?? []).concat(chunk).slice(-MAX_LINES));
-        });
-    });
-    return () => {
-      es.close();
-      cancelAnimationFrame(frame);
-    };
+    return tailLines<LogLine>(
+      new EventSource(`/api/services/${id}/logs/stream`),
+      (chunk) => setLines((cur) => (cur ?? []).concat(chunk).slice(-MAX_LINES)),
+      (l) => (!replica || l.replica === replica) && (!needle || l.line.toLowerCase().includes(needle)),
+    ).stop;
   }, [id, live, ready, query, replica]);
 
-  useLayoutEffect(() => {
-    const b = box.current;
-    if (b && stick.current) b.scrollTop = b.scrollHeight;
-  }, [lines]);
-
-  if (isPlanned(error)) return <Planned />;
   const many = new Set(props.replicas.map((r) => r.name)).size > 1;
   return (
     <div class="space-y-4">
       <div class="flex flex-wrap items-end gap-3">
-        <Field label="Search" class="min-w-48 flex-1">
-          <input class="input" type="search" placeholder="Text to find, any case" value={q} onInput={(e) => setQ(e.currentTarget.value)} />
-        </Field>
+        <Input label="Search" fieldClass="min-w-48 flex-1" type="search" placeholder="Text to find, any case" value={q} onInput={(e) => setQ(e.currentTarget.value)} />
         <Field label="Time range">
           <Select value={range} onChange={setRange} options={LOG_RANGES.map(([v, l]): [string, string] => [v, l])} />
         </Field>
@@ -113,14 +133,11 @@ export function Logs(props: { service: Service; replicas: Replica[]; label: (r: 
         <Loading />
       ) : (
         <div
-          ref={box}
+          ref={box.ref}
           tabIndex={0}
           role="log"
           aria-label="Service logs"
-          onScroll={(e) => {
-            const b = e.currentTarget;
-            stick.current = b.scrollHeight - b.scrollTop - b.clientHeight < 40;
-          }}
+          onScroll={box.onScroll}
           class="h-[65vh] overflow-auto rounded-lg border border-line bg-bg p-3 font-mono text-xs leading-relaxed"
         >
           {lines.length === 0 ? (
@@ -141,6 +158,8 @@ export function Logs(props: { service: Service; replicas: Replica[]; label: (r: 
 }
 
 type Series = { step: number; series: Record<string, Points> };
+/** Chart lines from series names: pick(d, ["Sent", "net_tx"]). */
+const pick = (d: Series, ...lines: [string, string][]) => lines.map(([label, name]) => ({ label, points: d.series[name] ?? [] }));
 
 /** Metrics refresh with each 10-second sample; people other than the owner do not get that event and poll. */
 const useMetrics = <T,>(path: string | null) => useApi<T>(path, (e) => e.kind === "metrics", 15000);
@@ -151,20 +170,13 @@ export function ServiceMetrics(props: { service: Service }) {
   return (
     <div class="space-y-4">
       <RangeSelect value={range} onChange={setRange} />
-      <Loaded r={r} planned>
+      <Loaded r={r}>
         {(d) => (
           <div class="grid gap-4 lg:grid-cols-2">
-            <Chart title="CPU (percent of one core)" lines={[{ label: "CPU", points: d.series.cpu ?? [] }]} fmt={fmt.pct} />
-            <Chart title="Memory" lines={[{ label: "Memory", points: d.series.memory ?? [] }]} fmt={fmt.bytes} />
-            <Chart
-              title="Network"
-              lines={[
-                { label: "Received", points: d.series.net_rx ?? [] },
-                { label: "Sent", points: d.series.net_tx ?? [] },
-              ]}
-              fmt={fmt.rate}
-            />
-            {d.series.restarts?.some((p) => p[1] > 0) && <Chart title="Crashes (per 10 seconds)" lines={[{ label: "Crashes", points: d.series.restarts }]} fmt={fmt.count} />}
+            <Chart title="CPU (percent of one core)" lines={pick(d, ["CPU", "cpu"])} fmt={fmt.pct} />
+            <Chart title="Memory" lines={pick(d, ["Memory", "memory"])} fmt={fmt.bytes} />
+            <Chart title="Network" lines={pick(d, ["Received", "net_rx"], ["Sent", "net_tx"])} fmt={fmt.rate} />
+            {d.series.restarts?.some((p) => p[1] > 0) && <Chart title="Crashes (per 10 seconds)" lines={pick(d, ["Crashes", "restarts"])} fmt={fmt.count} />}
           </div>
         )}
       </Loaded>
@@ -324,34 +336,13 @@ export function ServerCharts(props: { node: string }) {
             <Loaded r={host}>
               {(h) => (
                 <div class="grid gap-4 lg:grid-cols-2">
-                  <Chart title="CPU" lines={[{ label: "CPU", points: h.series.cpu ?? [] }]} fmt={fmt.pct} max={100} />
-                  <Chart title="Load (1 minute)" lines={[{ label: "Load", points: h.series.load1 ?? [] }]} fmt={fmt.count} />
-                  <Chart
-                    title="Memory"
-                    lines={[
-                      { label: "Memory", points: h.series.memory ?? [] },
-                      { label: "Swap", points: h.series.swap ?? [] },
-                    ]}
-                    fmt={fmt.bytes}
-                  />
-                  <Chart title="Disk space used" lines={disks.map((d) => ({ label: d.mount, points: h.series[`disk:${d.mount}`] ?? [] }))} fmt={fmt.pct} max={100} />
-                  <Chart
-                    title="Disk I/O"
-                    lines={[
-                      { label: "Read", points: h.series.disk_read ?? [] },
-                      { label: "Write", points: h.series.disk_write ?? [] },
-                    ]}
-                    fmt={fmt.rate}
-                  />
-                  <Chart
-                    title="Network"
-                    lines={[
-                      { label: "Received", points: h.series.net_rx ?? [] },
-                      { label: "Sent", points: h.series.net_tx ?? [] },
-                    ]}
-                    fmt={fmt.rate}
-                  />
-                  {(h.series.temp?.length ?? 0) > 0 && <Chart title="Temperature" lines={[{ label: "Temperature", points: h.series.temp ?? [] }]} fmt={fmt.celsius} />}
+                  <Chart title="CPU" lines={pick(h, ["CPU", "cpu"])} fmt={fmt.pct} max={100} />
+                  <Chart title="Load (1 minute)" lines={pick(h, ["Load", "load1"])} fmt={fmt.count} />
+                  <Chart title="Memory" lines={pick(h, ["Memory", "memory"], ["Swap", "swap"])} fmt={fmt.bytes} />
+                  <Chart title="Disk space used" lines={pick(h, ...disks.map((d): [string, string] => [d.mount, `disk:${d.mount}`]))} fmt={fmt.pct} max={100} />
+                  <Chart title="Disk I/O" lines={pick(h, ["Read", "disk_read"], ["Write", "disk_write"])} fmt={fmt.rate} />
+                  <Chart title="Network" lines={pick(h, ["Received", "net_rx"], ["Sent", "net_tx"])} fmt={fmt.rate} />
+                  {(h.series.temp?.length ?? 0) > 0 && <Chart title="Temperature" lines={pick(h, ["Temperature", "temp"])} fmt={fmt.celsius} />}
                 </div>
               )}
             </Loaded>
@@ -388,10 +379,10 @@ function Gpu(props: { gpu: Now["gpus"][number]; range: string; node: string | nu
       <Loaded r={r}>
         {(d) => (
           <div class="grid gap-4 lg:grid-cols-2">
-            <Chart title="Utilization" lines={[{ label: "Utilization", points: d.series.util ?? [] }]} fmt={fmt.pct} max={100} />
-            <Chart title="VRAM" lines={[{ label: "VRAM", points: d.series.memory ?? [] }]} fmt={fmt.bytes} />
-            <Chart title="Temperature" lines={[{ label: "Temperature", points: d.series.temp ?? [] }]} fmt={fmt.celsius} />
-            <Chart title="Power" lines={[{ label: "Power", points: d.series.power ?? [] }]} fmt={fmt.watts} />
+            <Chart title="Utilization" lines={pick(d, ["Utilization", "util"])} fmt={fmt.pct} max={100} />
+            <Chart title="VRAM" lines={pick(d, ["VRAM", "memory"])} fmt={fmt.bytes} />
+            <Chart title="Temperature" lines={pick(d, ["Temperature", "temp"])} fmt={fmt.celsius} />
+            <Chart title="Power" lines={pick(d, ["Power", "power"])} fmt={fmt.watts} />
           </div>
         )}
       </Loaded>
@@ -455,7 +446,7 @@ export function TugportLog() {
         />
       }
     >
-      <Loaded r={r} planned>
+      <Loaded r={r}>
         {(d) => (
           <div class="h-80 overflow-auto rounded-md border border-line bg-bg p-2 font-mono text-xs leading-relaxed">
             {d.lines.length === 0 && <p class="text-muted">There is nothing at this level yet.</p>}

@@ -4,12 +4,9 @@
 use crate::app::{App, AppState};
 use crate::util;
 use anyhow::{Context, Result, anyhow, bail};
-use hmac::{Hmac, Mac};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::time::Duration;
 
 /// A machine that has not joined after this long is deleted (it would only cost money).
 const JOIN_DEADLINE_S: i64 = 20 * 60;
@@ -26,39 +23,33 @@ pub enum Credentials {
 }
 
 pub struct Account {
-    pub id: String,
-    pub name: String,
-    pub creds: Credentials,
+    id: String,
+    name: String,
+    creds: Credentials,
 }
 
 pub fn account(app: &App, id: &str) -> Result<Account> {
-    let (name, sealed): (String, Vec<u8>) = app
-        .db
-        .conn()
-        .query_row("SELECT name, config FROM cloud_accounts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?
-        .ok_or_else(|| anyhow!("no such cloud account"))?;
+    let (name, sealed): (String, Vec<u8>) =
+        app.db.row("SELECT name, config FROM cloud_accounts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?.ok_or_else(|| anyhow!("no such cloud account"))?;
     let creds = serde_json::from_str(&app.keys.open_str(&format!("cloud:{id}"), &sealed)?)?;
     Ok(Account { id: id.into(), name, creds })
 }
 
 /// Check the credentials work, then keep them sealed.
 pub async fn add_account(app: &App, name: &str, creds: Credentials) -> Result<String> {
-    match &creds {
+    let kind = match &creds {
         Credentials::Hetzner { token } => {
             hetzner(token, reqwest::Method::GET, "/locations", None).await.context("checking the Hetzner token")?;
+            "hetzner"
         }
         Credentials::Aws { .. } => {
             aws_query(&creds, "us-east-1", &[("Action", "DescribeRegions")]).await.context("checking the AWS keys")?;
+            "aws"
         }
-    }
-    let id = util::id();
-    let kind = match creds {
-        Credentials::Hetzner { .. } => "hetzner",
-        Credentials::Aws { .. } => "aws",
     };
+    let id = util::id();
     let sealed = app.keys.seal_str(&format!("cloud:{id}"), &serde_json::to_string(&creds)?)?;
-    app.db.conn().execute("INSERT INTO cloud_accounts (id, kind, name, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, kind, name, sealed, util::now()])?;
+    app.db.exec("INSERT INTO cloud_accounts (id, kind, name, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, kind, name, sealed, util::now()])?;
     Ok(id)
 }
 
@@ -148,8 +139,8 @@ pub async fn create_server(app: &AppState, account_id: &str, region: &str, size:
     }
     let acc = account(app, account_id)?;
     let id = util::id();
-    let name = format!("tugport-{}-{}", region.to_lowercase().replace('_', "-"), &id[..id.len().min(6)]);
-    app.db.conn().execute(
+    let name = format!("tugport-{}-{}", region.to_lowercase(), id.get(..6).unwrap_or(&id));
+    app.db.exec(
         "INSERT INTO cloud_servers (id, account_id, pool_id, name, region, size, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'creating', ?7)",
         params![id, acc.id, pool, name, region, size, util::now()],
     )?;
@@ -175,45 +166,50 @@ pub async fn create_server(app: &AppState, account_id: &str, region: &str, size:
     };
     match created.await {
         Ok(cloud_id) => {
-            app.db.conn().execute("UPDATE cloud_servers SET cloud_id = ?1 WHERE id = ?2", params![cloud_id, id])?;
+            app.db.exec("UPDATE cloud_servers SET cloud_id = ?1 WHERE id = ?2", params![cloud_id, id])?;
             tracing::info!("created {name} ({size} in {region}) at {}", acc.name);
             app.emit("nodes", None, None, json!({ "creating": name }));
             Ok(id)
         }
         Err(e) => {
-            app.db.conn().execute("UPDATE cloud_servers SET status = 'failed', error = ?1 WHERE id = ?2", params![format!("{e:#}"), id])?;
+            mark_failed(app, &id, &e)?;
             app.emit("nodes", None, None, json!({ "failed": name }));
             Err(e)
         }
     }
 }
 
+fn mark_failed(app: &App, id: &str, e: &anyhow::Error) -> Result<()> {
+    app.db.exec("UPDATE cloud_servers SET status = 'failed', error = ?1 WHERE id = ?2", params![format!("{e:#}"), id])?;
+    Ok(())
+}
+
 /// Delete a machine at its provider and forget it.
 pub async fn destroy(app: &App, cloud_server_id: &str) -> Result<()> {
     let (account_id, cloud_id, region): (String, Option<String>, String) = app
         .db
-        .conn()
-        .query_row("SELECT account_id, cloud_id, region FROM cloud_servers WHERE id = ?1", [cloud_server_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        .row("SELECT account_id, cloud_id, region FROM cloud_servers WHERE id = ?1", [cloud_server_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .ok_or_else(|| anyhow!("no such cloud server"))?;
     if let Some(cloud_id) = cloud_id {
         let acc = account(app, &account_id)?;
-        match &acc.creds {
-            Credentials::Hetzner { token } => match hetzner(token, reqwest::Method::DELETE, &format!("/servers/{cloud_id}"), None).await {
-                Ok(_) => {}
-                Err(e) if format!("{e:#}").contains("not found") => {}
-                Err(e) => return Err(e),
-            },
-            Credentials::Aws { .. } => {
-                aws_query(&acc.creds, &region, &[("Action", "TerminateInstances"), ("InstanceId.1", &cloud_id)]).await?;
-            }
+        // What each provider says about a machine that is already gone (deleted by hand).
+        let (deleted, gone) = match &acc.creds {
+            Credentials::Hetzner { token } => (hetzner(token, reqwest::Method::DELETE, &format!("/servers/{cloud_id}"), None).await.map(drop), "not found"),
+            Credentials::Aws { .. } => (aws_query(&acc.creds, &region, &[("Action", "TerminateInstances"), ("InstanceId.1", &cloud_id)]).await.map(drop), "does not exist"),
+        };
+        if let Err(e) = deleted
+            && !format!("{e:#}").contains(gone)
+        {
+            return Err(e);
         }
     }
-    app.db.conn().execute("DELETE FROM cloud_servers WHERE id = ?1", [cloud_server_id])?;
+    app.db.exec("DELETE FROM cloud_servers WHERE id = ?1", [cloud_server_id])?;
     Ok(())
 }
 
 /// The cloud machine behind a server, if Tugport created it.
 pub fn machine_of(app: &App, node_id: &str) -> Option<String> {
-    app.db.conn().query_row("SELECT id FROM cloud_servers WHERE node_id = ?1", [node_id], |r| r.get(0)).optional().ok().flatten()
+    app.db.row("SELECT id FROM cloud_servers WHERE node_id = ?1", [node_id], |r| r.get(0)).ok().flatten()
 }
 
 /// Where new servers reach the panel: its domain, or this server's address.
@@ -230,26 +226,19 @@ pub fn panel_url(app: &App) -> String {
 
 /// Every minute: delete machines that never joined, keep pools at their size.
 pub async fn run(app: AppState) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        if let Err(e) = tick(&app).await {
-            tracing::warn!("cloud servers: {e:#}");
-        }
-    }
+    crate::util::every(60, "cloud servers", || tick(app.clone())).await
 }
 
-async fn tick(app: &AppState) -> Result<()> {
-    let stuck: Vec<(String, String)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT id, name FROM cloud_servers WHERE status = 'creating' AND created_at < ?1")?;
-        stmt.query_map([util::now() - JOIN_DEADLINE_S], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-    };
+async fn tick(app: AppState) -> Result<()> {
+    let app = &app;
+    let stuck: Vec<(String, String)> =
+        app.db.rows("SELECT id, name FROM cloud_servers WHERE status = 'creating' AND created_at < ?1", [util::now() - JOIN_DEADLINE_S], |r| Ok((r.get(0)?, r.get(1)?)))?;
     for (id, name) in stuck {
         tracing::warn!("{name} did not join within {} minutes; deleting it", JOIN_DEADLINE_S / 60);
         let msg = format!("{name} was created but never joined, so Tugport deleted it. Check that it can reach the panel at {}.", panel_url(app));
         crate::notify::event(app, "node.failed", &format!("Server {name} did not join"), &msg, None).await;
         if let Err(e) = destroy(app, &id).await {
-            app.db.conn().execute("UPDATE cloud_servers SET status = 'failed', error = ?1 WHERE id = ?2", params![format!("{e:#}"), id])?;
+            mark_failed(app, &id, &e)?;
         }
         app.emit("nodes", None, None, json!({ "deleted": name }));
     }
@@ -276,9 +265,7 @@ pub struct Pool {
 }
 
 pub fn pools(app: &App) -> Result<Vec<Pool>> {
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT id, name, account_id, region, size, labels, min_servers, max_servers, scale_up_cpu, scale_down_cpu FROM server_pools ORDER BY name")?;
-    let rows = stmt.query_map([], |r| {
+    let pools = app.db.rows("SELECT id, name, account_id, region, size, labels, min_servers, max_servers, scale_up_cpu, scale_down_cpu FROM server_pools ORDER BY name", [], |r| {
         Ok(Pool {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -292,18 +279,18 @@ pub fn pools(app: &App) -> Result<Vec<Pool>> {
             scale_down_cpu: r.get(9)?,
         })
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    Ok(pools)
 }
 
 /// What a pool should do next, given its machines and the cluster's CPU.
 #[derive(Debug, PartialEq)]
-pub enum PoolStep {
+enum PoolStep {
     Wait,
     Grow,
     Shrink,
 }
 
-pub fn pool_step(p: &Pool, machines: u32, creating: bool, cpu: Option<f64>, low_for_s: i64, since_growth_s: i64) -> PoolStep {
+fn pool_step(p: &Pool, machines: u32, creating: bool, cpu: Option<f64>, low_for_s: i64, since_growth_s: i64) -> PoolStep {
     if creating {
         PoolStep::Wait
     } else if machines < p.min_servers || (machines < p.max_servers && cpu.is_some_and(|c| c > p.scale_up_cpu) && since_growth_s >= GROW_COOLDOWN_S) {
@@ -316,11 +303,8 @@ pub fn pool_step(p: &Pool, machines: u32, creating: bool, cpu: Option<f64>, low_
 }
 
 async fn keep_pool(app: &AppState, p: &Pool) -> Result<()> {
-    let members: Vec<(String, String, Option<String>)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT id, status, node_id FROM cloud_servers WHERE pool_id = ?1 AND status IN ('creating', 'joined') ORDER BY created_at")?;
-        stmt.query_map([&p.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
-    };
+    let members: Vec<(String, String, Option<String>)> =
+        app.db.rows("SELECT id, status, node_id FROM cloud_servers WHERE pool_id = ?1 AND status IN ('creating', 'joined') ORDER BY created_at", [&p.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     let creating = members.iter().any(|(_, status, _)| status == "creating");
     let cpu = crate::metrics::cluster_cpu(app, 300);
     let now = util::now();
@@ -334,7 +318,7 @@ async fn keep_pool(app: &AppState, p: &Pool) -> Result<()> {
             }
         },
         _ => {
-            app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&low_key])?;
+            app.db.del_state(&low_key)?;
             now
         }
     };
@@ -354,7 +338,7 @@ async fn keep_pool(app: &AppState, p: &Pool) -> Result<()> {
                     continue;
                 }
                 tracing::info!("server pool {} removes a server (CPU {:.0}%)", p.name, cpu.unwrap_or(0.0));
-                app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&low_key])?;
+                app.db.del_state(&low_key)?;
                 crate::nodes::drain(app, node).await?;
                 crate::nodes::remove(app, node).await?;
                 return destroy(app, id).await;
@@ -365,7 +349,7 @@ async fn keep_pool(app: &AppState, p: &Pool) -> Result<()> {
 }
 
 async fn hetzner(token: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
+    let client = util::http(60).build()?;
     let mut req = client.request(method, format!("https://api.hetzner.cloud/v1{path}")).bearer_auth(token);
     if let Some(b) = body {
         req = req.json(&b);
@@ -383,7 +367,8 @@ async fn hetzner(token: &str, method: reqwest::Method, path: &str, body: Option<
 async fn aws_run_instance(creds: &Credentials, region: &str, size: &str, name: &str, script: &str) -> Result<String> {
     let arch = if aws_arm(size) { "arm64" } else { "amd64" };
     let param = format!("/aws/service/canonical/ubuntu/server/24.04/stable/current/{arch}/hvm/ebs-gp3/ami-id");
-    let ami: Value = serde_json::from_str(&aws_json(creds, region, "ssm", "AmazonSSM.GetParameter", &json!({ "Name": param })).await?)?;
+    let ami = aws_call(creds, region, "ssm", "application/x-amz-json-1.1", Some("AmazonSSM.GetParameter"), json!({ "Name": param }).to_string()).await?;
+    let ami: Value = serde_json::from_str(&ami)?;
     let ami = ami["Parameter"]["Value"].as_str().ok_or_else(|| anyhow!("no Ubuntu image for {arch} in {region}"))?.to_string();
     let group = aws_security_group(creds, region).await?;
     let user_data = crate::crypto::b64(script.as_bytes());
@@ -426,12 +411,10 @@ async fn aws_security_group(creds: &Credentials, region: &str) -> Result<String>
         .context("creating the tugport security group (the account needs a default VPC)")?;
     let id = xml_tag(&created, "groupId").ok_or_else(|| anyhow!("AWS did not return a security group id"))?;
     let mut rules: Vec<(String, String)> = vec![("Action".into(), "AuthorizeSecurityGroupIngress".into()), ("GroupId".into(), id.clone())];
-    for (i, (proto, port)) in [("udp", "51820"), ("tcp", "80"), ("tcp", "443")].iter().enumerate() {
-        let n = i + 1;
-        rules.push((format!("IpPermissions.{n}.IpProtocol"), proto.to_string()));
-        rules.push((format!("IpPermissions.{n}.FromPort"), port.to_string()));
-        rules.push((format!("IpPermissions.{n}.ToPort"), port.to_string()));
-        rules.push((format!("IpPermissions.{n}.IpRanges.1.CidrIp"), "0.0.0.0/0".into()));
+    for (n, (proto, port)) in (1..).zip([("udp", "51820"), ("tcp", "80"), ("tcp", "443")]) {
+        for (k, v) in [("IpProtocol", proto), ("FromPort", port), ("ToPort", port), ("IpRanges.1.CidrIp", "0.0.0.0/0")] {
+            rules.push((format!("IpPermissions.{n}.{k}"), v.into()));
+        }
     }
     let rules: Vec<(&str, &str)> = rules.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     aws_query(creds, region, &rules).await?;
@@ -442,15 +425,11 @@ async fn aws_security_group(creds: &Credentials, region: &str) -> Result<String>
 async fn aws_query(creds: &Credentials, region: &str, params: &[(&str, &str)]) -> Result<String> {
     let mut all: Vec<(&str, &str)> = params.to_vec();
     all.push(("Version", "2016-11-15"));
-    let body = all.iter().map(|(k, v)| format!("{}={}", aws_encode(k), aws_encode(v))).collect::<Vec<_>>().join("&");
+    let body = all.iter().map(|(k, v)| format!("{}={}", util::urlencode(k), util::urlencode(v))).collect::<Vec<_>>().join("&");
     aws_call(creds, region, "ec2", "application/x-www-form-urlencoded; charset=utf-8", None, body).await
 }
 
-/// A JSON API call (SSM and friends).
-async fn aws_json(creds: &Credentials, region: &str, service: &str, target: &str, body: &Value) -> Result<String> {
-    aws_call(creds, region, service, "application/x-amz-json-1.1", Some(target), body.to_string()).await
-}
-
+/// A signed AWS API call; JSON APIs (SSM) name their operation in `target`.
 async fn aws_call(creds: &Credentials, region: &str, service: &str, content_type: &str, target: Option<&str>, body: String) -> Result<String> {
     let Credentials::Aws { access_key, secret_key } = creds else { bail!("not an AWS account") };
     let host = format!("{service}.{region}.amazonaws.com");
@@ -460,7 +439,7 @@ async fn aws_call(creds: &Credentials, region: &str, service: &str, content_type
         headers.push(("x-amz-target", t.to_string()));
     }
     let auth = sigv4(&Request { method: "POST", path: "/", query: "", headers: &headers, body: body.as_bytes() }, access_key, secret_key, region, service, &date)?;
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
+    let client = util::http(60).build()?;
     let mut req = client.post(format!("https://{host}/")).header("authorization", auth).body(body);
     for (k, v) in &headers {
         if *k != "host" {
@@ -491,35 +470,22 @@ fn sigv4(r: &Request, access_key: &str, secret_key: &str, region: &str, service:
     headers.sort();
     let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
     let signed: String = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
-    let canonical = format!("{}\n{}\n{}\n{canonical_headers}\n{signed}\n{}", r.method, r.path, r.query, hex::encode(Sha256::digest(r.body)));
+    let canonical = format!("{}\n{}\n{}\n{canonical_headers}\n{signed}\n{}", r.method, r.path, r.query, util::sha256_hex(r.body));
     let day = amz_date.get(..8).ok_or_else(|| anyhow!("bad date"))?;
     let scope = format!("{day}/{region}/{service}/aws4_request");
-    let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", hex::encode(Sha256::digest(canonical.as_bytes())));
+    let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", util::sha256_hex(&canonical));
     let mut key = format!("AWS4{secret_key}").into_bytes();
     for part in [day, region, service, "aws4_request"] {
-        key = hmac(&key, part.as_bytes())?;
+        key = util::hmac_sha256(&key, part).to_vec();
     }
-    let signature = hex::encode(hmac(&key, to_sign.as_bytes())?);
+    let signature = hex::encode(util::hmac_sha256(&key, to_sign));
     Ok(format!("AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed}, Signature={signature}"))
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|e| anyhow!("{e}"))?;
-    m.update(data);
-    Ok(m.finalize().into_bytes().to_vec())
-}
-
-/// Percent-encoding as AWS wants it: everything but A-Z a-z 0-9 - _ . ~.
-fn aws_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect()
-}
-
 fn xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let start = xml.find(&format!("<{tag}>"))? + tag.len() + 2;
-    let end = xml[start..].find(&format!("</{tag}>"))? + start;
-    Some(xml[start..end].to_string())
+    let (_, rest) = xml.split_once(&format!("<{tag}>"))?;
+    let (value, _) = rest.split_once(&format!("</{tag}>"))?;
+    Some(value.to_string())
 }
 
 #[cfg(test)]
@@ -544,7 +510,7 @@ mod tests {
 
     #[test]
     fn encoding_and_xml() {
-        assert_eq!(aws_encode("a b+c/=~"), "a%20b%2Bc%2F%3D~");
+        assert_eq!(util::urlencode("a b+c/=~"), "a%20b%2Bc%2F%3D~");
         assert_eq!(xml_tag("<x><instanceId>i-123</instanceId></x>", "instanceId").as_deref(), Some("i-123"));
         assert!(aws_arm("t4g.small") && aws_arm("m7gd.large") && !aws_arm("t3.small") && !aws_arm("m7i.large"));
     }

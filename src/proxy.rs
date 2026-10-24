@@ -72,26 +72,25 @@ pub enum Upstream {
 /// Requests one proxy forwards to another carry this header.
 const HOP: &str = "x-tugport-hop";
 
-pub struct Route {
-    pub port: u16,
-    pub service_id: Option<String>,
-    pub project_id: Option<String>,
-    pub path: String,
-    pub upstreams: Vec<Upstream>,
-    pub https: bool,
-    pub via_tunnel: bool,
-    pub options: DomainOptions,
+struct Route {
+    port: u16,
+    service_id: Option<String>,
+    path: String,
+    upstreams: Vec<Upstream>,
+    https: bool,
+    via_tunnel: bool,
+    options: DomainOptions,
     redirects: Vec<(regex::Regex, String, bool)>,
     rewrite: Option<(regex::Regex, String)>,
     /// Service is scaled to zero; the first request wakes it.
-    pub asleep: bool,
+    asleep: bool,
 }
 
 #[derive(Default)]
-pub struct Routes {
-    pub hosts: HashMap<String, Vec<Arc<Route>>>,
-    pub trusted: Vec<ipnet::IpNet>,
-    pub worker: bool,
+struct Routes {
+    hosts: HashMap<String, Vec<Arc<Route>>>,
+    trusted: Vec<ipnet::IpNet>,
+    worker: bool,
 }
 
 /// What a non-ingress server is given: only the routes it hosts a replica of, with its own
@@ -118,7 +117,7 @@ pub fn reduce_for_worker(table: &Table, node: &str) -> Table {
 }
 
 /// Turn a table into routes as seen from node `me`.
-pub fn compile(table: &Table, me: &str) -> Routes {
+fn compile(table: &Table, me: &str) -> Routes {
     let mut hosts: HashMap<String, Vec<Arc<Route>>> = HashMap::new();
     for spec in &table.routes {
         let mut upstreams: Vec<Upstream> = vec![];
@@ -143,7 +142,6 @@ pub fn compile(table: &Table, me: &str) -> Routes {
         hosts.entry(spec.host.clone()).or_default().push(Arc::new(Route {
             port: spec.port,
             service_id: spec.service_id.clone(),
-            project_id: spec.project_id.clone(),
             path: spec.path.clone(),
             upstreams,
             https: spec.https,
@@ -158,20 +156,20 @@ pub fn compile(table: &Table, me: &str) -> Routes {
         routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
     }
     let mut trusted = table.trusted_proxies.clone();
-    if let Ok(mesh) = "10.99.0.0/16".parse() {
+    if let Ok(mesh) = crate::mesh::SUBNET.parse() {
         trusted.push(mesh);
     }
     Routes { hosts, trusted, worker: table.worker }
 }
 
 impl Routes {
-    pub fn find(&self, host: &str, path: &str) -> Option<Arc<Route>> {
+    fn find(&self, host: &str, path: &str) -> Option<Arc<Route>> {
         self.hosts.get(host)?.iter().find(|r| path_under(path, &r.path)).cloned()
     }
 }
 
 fn path_under(path: &str, prefix: &str) -> bool {
-    prefix == "/" || path == prefix || path.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+    prefix == "/" || path == prefix || path.strip_prefix(prefix.trim_end_matches('/')).is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -228,7 +226,7 @@ impl Proxy {
         })
     }
 
-    pub fn routes(&self) -> Arc<Routes> {
+    fn routes(&self) -> Arc<Routes> {
         crate::util::read(&self.routes).clone()
     }
 
@@ -304,7 +302,7 @@ pub fn reload(app: &App) {
 async fn build_table(app: &App) -> Result<Table> {
     let mut routes = vec![];
     let services: HashMap<String, store::Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
-    let mut replicas = runtime::all_replicas(app).await.unwrap_or_default();
+    let replicas = runtime::all_replicas(app).await.unwrap_or_default();
     let draining = crate::util::lock(&app.proxy.draining).clone();
     let settings = app.settings();
     for d in store::domains(app, None)? {
@@ -317,9 +315,9 @@ async fn build_table(app: &App) -> Result<Table> {
         let live = runtime::live_deploy(app, &s.id);
         let asleep = crate::sleep::is_asleep(app, &s.id);
         let targets = replicas
-            .entry(s.id.clone())
-            .or_default()
-            .iter()
+            .get(&s.id)
+            .into_iter()
+            .flatten()
             // A sleeping service's requests wait for its wake-up, even while it is still stopping.
             .filter(|r| r.state == "running" && !asleep && !draining.contains(&r.id))
             .filter(|r| match (&d.container, s.kind.as_str()) {
@@ -366,34 +364,34 @@ async fn build_table(app: &App) -> Result<Table> {
     Ok(Table { routes, nodes: crate::nodes::proxy_addresses(app), trusted_proxies: settings.trusted_proxies, worker: false })
 }
 
-async fn rebuild(app: &App) {
-    match build_table(app).await {
-        Ok(t) => {
-            let changed = *app.proxy.table() != t;
-            app.proxy.set_table(t);
-            if changed {
-                crate::nodes::push_routes(app);
-            }
+/// Build and install the routing table; other servers get it when it changed. With `wait`,
+/// they get it anyway and this returns once they have it.
+async fn rebuild(app: &App, wait: bool) {
+    let t = match build_table(app).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("building routes: {e:#}");
+            return;
         }
-        Err(e) => tracing::error!("building routes: {e:#}"),
+    };
+    let changed = *app.proxy.table() != t;
+    app.proxy.set_table(t);
+    if wait {
+        crate::nodes::push_routes_now(app).await;
+    } else if changed {
+        crate::nodes::push_routes(app);
     }
 }
 
 /// Rebuild now and wait until every server has the new table (a woken service's
 /// requests may be forwarded to another server right away).
 pub async fn rebuild_now(app: &App) {
-    match build_table(app).await {
-        Ok(t) => {
-            app.proxy.set_table(t);
-            crate::nodes::push_routes_now(app).await;
-        }
-        Err(e) => tracing::error!("building routes: {e:#}"),
-    }
+    rebuild(app, true).await;
 }
 
 /// Build the routing table once; call before serving so the first request already routes.
 pub async fn initial_routes(app: &App) {
-    rebuild(app).await;
+    rebuild(app, false).await;
 }
 
 /// Keep the routing table fresh: on demand, on container events on any server, and every 30 seconds.
@@ -409,7 +407,7 @@ pub async fn watch(app: AppState) {
         }
     }));
     loop {
-        rebuild(&app).await;
+        rebuild(&app, false).await;
         tokio::select! {
             _ = app.proxy.reload.notified() => tokio::time::sleep(Duration::from_millis(150)).await,
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
@@ -427,45 +425,50 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
     let (http, https) = tokio::try_join!(crate::handoff::listener(&http_key, bind(http_port)), crate::handoff::listener(&https_key, bind(https_port)))?;
     tracing::info!("proxy listening on :{http_port} and :{https_port}");
     let a = app.clone();
-    tokio::spawn(async move {
-        while !crate::handoff::draining() {
-            let accepted = tokio::select! {
-                r = http.accept() => r,
-                _ = crate::handoff::DRAIN.notified() => break,
-            };
-            let Ok((stream, peer)) = accepted else { continue };
-            let app = a.clone();
-            tokio::spawn(async move { serve_conn(app, TokioIo::new(stream), peer, false).await });
-        }
-    });
-    while !crate::handoff::draining() {
-        let accepted = tokio::select! {
-            r = https.accept() => r,
-            _ = crate::handoff::DRAIN.notified() => break,
-        };
-        let Ok((stream, peer)) = accepted else { continue };
+    tokio::spawn(accept(http, move |stream, peer| {
+        tokio::spawn(serve_conn(a.clone(), TokioIo::new(stream), peer, false));
+    }));
+    accept(https, |stream, peer| {
         let (app, tls) = (app.clone(), tls.clone());
         tokio::spawn(async move {
             if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
                 serve_conn(app, TokioIo::new(s), peer, true).await
             }
         });
-    }
+    })
+    .await;
     Ok(())
+}
+
+/// Hand each connection to `on` until the process hands its listeners over.
+async fn accept(listener: tokio::net::TcpListener, on: impl Fn(tokio::net::TcpStream, SocketAddr)) {
+    while !crate::handoff::draining() {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            _ = crate::handoff::DRAIN.notified() => break,
+        };
+        match accepted {
+            Ok((stream, peer)) => on(stream, peer),
+            // Out of file descriptors, say: back off instead of spinning.
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
 }
 
 /// Bind, waiting while another proxy (Traefik during a migration) still holds the port.
 async fn bind(port: u16) -> Result<tokio::net::TcpListener> {
+    let in_use = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AddrInUse;
     let mut warned = false;
     loop {
-        match tokio::net::TcpListener::bind(("::", port)).await {
+        // IPv6 (dual-stack) first; hosts without IPv6 get IPv4 only.
+        let bound = match tokio::net::TcpListener::bind(("::", port)).await {
+            Err(e) if !in_use(&e) => tokio::net::TcpListener::bind(("0.0.0.0", port)).await,
+            r => r,
+        };
+        match bound {
             Ok(l) => return Ok(l),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-            Err(_) => match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
-                Ok(l) => return Ok(l),
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
-                Err(e) => return Err(e.into()),
-            },
+            Err(e) if !in_use(&e) => return Err(e.into()),
+            Err(_) => {}
         }
         if !warned {
             tracing::warn!("port {port} is in use; the proxy will take it over as soon as it is free");
@@ -499,8 +502,12 @@ where
     }
 }
 
-fn full(status: StatusCode, content_type: &'static str, body: impl Into<Bytes>) -> Response<Body> {
-    let mut r = Response::new(Full::new(body.into()).map_err(|e| match e {}).boxed());
+fn full_body(data: impl Into<Bytes>) -> Body {
+    Full::new(data.into()).map_err(|e| match e {}).boxed()
+}
+
+fn full(status: StatusCode, content_type: &'static str, data: impl Into<Bytes>) -> Response<Body> {
+    let mut r = Response::new(full_body(data));
     *r.status_mut() = status;
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -522,21 +529,26 @@ pub fn page(status: StatusCode, title: &str, text: &str) -> Response<Body> {
          main{{max-width:30em;padding:24px}}h1{{font-size:22px;margin:0 0 8px}}p{{color:#a3afc0;margin:0}}</style>\
          <main><h1>{title}</h1><p>{text}</p></main>"
     );
+    html_page(status, html)
+}
+
+fn html_page(status: StatusCode, html: impl Into<Bytes>) -> Response<Body> {
     full(status, "text/html; charset=utf-8", html)
 }
 
-fn error_page(route: Option<&Route>, status: StatusCode, title: &str, text: &str) -> Response<Body> {
-    match route.and_then(|r| r.options.error_pages.get(&status.as_u16())) {
-        Some(custom) => full(status, "text/html; charset=utf-8", custom.clone()),
+fn error_page(route: &Route, status: StatusCode, title: &str, text: &str) -> Response<Body> {
+    match route.options.error_pages.get(&status.as_u16()) {
+        Some(custom) => html_page(status, custom.clone()),
         None => page(status, title, text),
     }
 }
 
-fn host_of(req: &Request<Incoming>) -> String {
-    let raw = req.uri().authority().map(|a| a.as_str().to_string()).or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).map(String::from)).unwrap_or_default();
-    let host = match raw.rsplit_once(':') {
-        Some((h, port)) if port.bytes().all(|c| c.is_ascii_digit()) && !h.ends_with(']') || raw.starts_with('[') => h.trim_matches(['[', ']']).to_string(),
-        _ => raw,
+/// The requested host, lowercase, without port, brackets or a trailing dot.
+fn host_of<B>(req: &Request<B>) -> String {
+    let raw = req.uri().authority().map(|a| a.as_str()).or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok())).unwrap_or_default();
+    let host = match raw.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or(v6, |(h, _)| h),
+        None => raw.rsplit_once(':').filter(|(_, port)| port.bytes().all(|c| c.is_ascii_digit())).map_or(raw, |(h, _)| h),
     };
     host.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -561,21 +573,17 @@ fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted: &[ipnet::IpNet]) -> (Ip
 
 async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls: bool) -> Response<Body> {
     let host = host_of(&req);
-    let path = req.uri().path().to_string();
+    let path = req.uri().path();
 
-    if !tls
-        && let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-            let known = crate::util::lock(&app.proxy.challenges).get(token).cloned();
-            return match known {
-                Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth),
-                // The panel runs ACME; DNS may point at any server.
-                None if *crate::util::read(&app.proxy.me) != "local" => panel_challenge(&host, &path).await,
-                None => full(StatusCode::NOT_FOUND, "text/plain", "unknown challenge"),
-            };
-        }
+    if !tls && let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+        return match acme_answer(&app, &host, path, token).await {
+            Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth),
+            None => full(StatusCode::NOT_FOUND, "text/plain", "unknown challenge"),
+        };
+    }
 
     let routes = app.proxy.routes();
-    let Some(route) = routes.find(&host, &path) else {
+    let Some(route) = routes.find(&host, path) else {
         return page(StatusCode::NOT_FOUND, "Nothing here yet", &format!("No service is set up for {host}."));
     };
     let (client, via_trusted) = client_ip(req.headers(), peer.ip(), &routes.trusted);
@@ -586,32 +594,27 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     // (hop) requests. A direct public request means DNS points at it by mistake, and serving
     // it would skip the site's basic auth, so refuse.
     if routes.worker && !hop && route.service_id.is_some() {
-        return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Not an entry point", "This server does not serve this site directly; point its DNS at the panel or mark this server as an ingress.");
+        return error_page(&route, StatusCode::SERVICE_UNAVAILABLE, "Not an entry point", "This server does not serve this site directly; point its DNS at the panel or mark this server as an ingress.");
     }
     let forwarded_https = via_trusted && req.headers().get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https");
     let scheme = if tls || forwarded_https { "https" } else { "http" };
-    let path_and_query = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+    let path_and_query = req.uri().path_and_query().map_or("/", |p| p.as_str());
 
     if route.https && scheme == "http" && !route.via_tunnel && app.proxy.has_cert(&host) {
         return redirect(StatusCode::PERMANENT_REDIRECT, &format!("https://{host}{path_and_query}"));
     }
     if let Some(html) = &route.options.maintenance {
-        return full(StatusCode::SERVICE_UNAVAILABLE, "text/html; charset=utf-8", html.clone());
+        return html_page(StatusCode::SERVICE_UNAVAILABLE, html.clone());
     }
-    match route.options.www_redirect {
-        Some(WwwRedirect::ToWww) if !host.starts_with("www.") => {
-            return redirect(StatusCode::MOVED_PERMANENTLY, &format!("{scheme}://www.{host}{path_and_query}"));
-        }
-        Some(WwwRedirect::ToApex) if host.starts_with("www.") => {
-            return redirect(StatusCode::MOVED_PERMANENTLY, &format!("{scheme}://{}{path_and_query}", &host[4..]));
-        }
+    match (&route.options.www_redirect, host.strip_prefix("www.")) {
+        (Some(WwwRedirect::ToWww), None) => return redirect(StatusCode::MOVED_PERMANENTLY, &format!("{scheme}://www.{host}{path_and_query}")),
+        (Some(WwwRedirect::ToApex), Some(apex)) => return redirect(StatusCode::MOVED_PERMANENTLY, &format!("{scheme}://{apex}{path_and_query}")),
         _ => {}
     }
-    let full_url = format!("{scheme}://{host}{path_and_query}");
-    for (re, to, permanent) in &route.redirects {
-        if re.is_match(&full_url) {
-            let target = re.replace(&full_url, to.as_str()).to_string();
-            return redirect(if *permanent { StatusCode::PERMANENT_REDIRECT } else { StatusCode::FOUND }, &target);
+    if !route.redirects.is_empty() {
+        let full_url = format!("{scheme}://{host}{path_and_query}");
+        if let Some((re, to, permanent)) = route.redirects.iter().find(|(re, _, _)| re.is_match(&full_url)) {
+            return redirect(if *permanent { StatusCode::PERMANENT_REDIRECT } else { StatusCode::FOUND }, &re.replace(&full_url, to.as_str()));
         }
     }
     if !hop && !route.options.basic_auth.is_empty() && !basic_auth_ok(&app, &route, req.headers()).await {
@@ -621,85 +624,58 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     }
     let mut extra_headers = vec![];
     if let Some(fa) = route.options.forward_auth.as_ref().filter(|_| !hop) {
-        match forward_auth(&app, fa, &req, scheme, &host, client).await {
+        match forward_auth(fa, &req, scheme, &host, client).await {
             Ok(h) => extra_headers = h,
             Err(resp) => return resp,
         }
     }
 
     // Counted once, by the first proxy (scale-to-zero and autoscaling read these).
-    if !hop
-        && let Some(sid) = &route.service_id
-    {
+    if !hop && let Some(sid) = &route.service_id {
+        let now = crate::util::now();
         let mut t = crate::util::lock(&app.proxy.traffic);
-        let e = t.entry(sid.clone()).or_default();
-        e.requests += 1;
-        e.last_at = crate::util::now();
-    }
-    let mut upstreams: Vec<Upstream> = route.upstreams.iter().filter(|u| !hop || matches!(u, Upstream::Local(_))).copied().collect();
-    if upstreams.is_empty() && route.asleep && *crate::util::read(&app.proxy.me) == "local" {
-        match crate::sleep::wake(&app, route.service_id.as_deref().unwrap_or_default(), route.port).await {
-            Ok(woken) => upstreams = woken,
-            Err(e) => {
-                tracing::warn!("waking {host}: {e:#}");
-                return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Waking up failed", &e.to_string());
+        match t.get_mut(sid) {
+            Some(e) => {
+                e.requests += 1;
+                e.last_at = now;
+            }
+            None => {
+                t.insert(sid.clone(), Traffic { requests: 1, last_at: now });
             }
         }
     }
-    if upstreams.is_empty() {
-        return error_page(Some(&route), StatusCode::SERVICE_UNAVAILABLE, "Service unavailable", "The service is not running right now.");
-    }
-    // Skip servers that just failed, unless nothing else is left.
-    {
-        let now = std::time::Instant::now();
-        let mut down = crate::util::lock(&app.proxy.down);
-        down.retain(|_, until| *until > now);
-        let up: Vec<Upstream> = upstreams.iter().filter(|u| !matches!(u, Upstream::Node(a) if down.contains_key(a))).copied().collect();
-        if !up.is_empty() {
-            upstreams = up;
-        }
-    }
-    let upstream = upstreams[app.proxy.rr.fetch_add(1, Ordering::Relaxed) % upstreams.len()];
-    let (upstream, via_node) = match upstream {
-        Upstream::Local(a) => (a, false),
-        Upstream::Node(a) => (a, true),
+    let (upstream, via_node) = match choose_upstream(&app, &route, hop, &host).await {
+        Ok(Upstream::Local(a)) => (a, false),
+        Ok(Upstream::Node(a)) => (a, true),
+        Err(resp) => return resp,
     };
-
-    // Path handling: strip the route prefix, then apply a rewrite.
-    let mut new_pq = path_and_query.clone();
-    if route.options.strip_prefix && route.path != "/" && !via_node {
-        let prefix = route.path.trim_end_matches('/');
-        new_pq = new_pq.strip_prefix(prefix).map(|r| if r.starts_with('/') { r.to_string() } else { format!("/{r}") }).unwrap_or(new_pq);
-    }
-    if let Some((re, to)) = route.rewrite.as_ref().filter(|_| !via_node) {
-        new_pq = re.replace(&new_pq, to.as_str()).to_string();
-    }
+    // Stripping the prefix and rewriting are left to the last proxy.
+    let new_pq = if via_node { path_and_query.into() } else { upstream_path(&route, path_and_query) };
+    let Ok(uri) = Uri::builder().scheme("http").authority(upstream.to_string()).path_and_query(new_pq.as_ref()).build() else {
+        return page(StatusCode::BAD_REQUEST, "Bad request", "The address is not valid.");
+    };
 
     let grpc = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("application/grpc"));
-    let upgrade = req.headers().get(header::UPGRADE).cloned();
-    let client_upgrade = upgrade.is_some().then(|| hyper::upgrade::on(&mut req));
+    let upgrade = req.headers().contains_key(header::UPGRADE);
+    let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
 
     let (mut parts, body) = req.into_parts();
-    parts.uri = match Uri::builder().scheme("http").authority(upstream.to_string()).path_and_query(new_pq.as_str()).build() {
-        Ok(u) => u,
-        Err(_) => return page(StatusCode::BAD_REQUEST, "Bad request", "The address is not valid."),
-    };
-    strip_hop_headers(&mut parts.headers, upgrade.is_some());
-    if let Ok(h) = HeaderValue::from_str(&host) {
-        parts.headers.insert(header::HOST, h);
-    }
+    parts.uri = uri;
+    strip_hop_headers(&mut parts.headers, upgrade);
     let xff = match parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).filter(|_| via_trusted) {
         Some(prev) => format!("{prev}, {}", peer.ip()),
         None => client.to_string(),
     };
+    let host_value = HeaderValue::from_str(&host).ok();
     for (k, v) in [
-        ("x-forwarded-for", xff),
-        ("x-real-ip", client.to_string()),
-        ("x-forwarded-proto", scheme.to_string()),
-        ("x-forwarded-host", host.clone()),
+        (header::HOST, host_value.clone()),
+        (HeaderName::from_static("x-forwarded-host"), host_value),
+        (HeaderName::from_static("x-forwarded-for"), HeaderValue::from_str(&xff).ok()),
+        (HeaderName::from_static("x-real-ip"), HeaderValue::from_str(&client.to_string()).ok()),
+        (HeaderName::from_static("x-forwarded-proto"), Some(HeaderValue::from_static(scheme))),
     ] {
-        if let Ok(v) = HeaderValue::from_str(&v) {
-            parts.headers.insert(HeaderName::from_static(k), v);
+        if let Some(v) = v {
+            parts.headers.insert(k, v);
         }
     }
     for (k, v) in extra_headers {
@@ -708,10 +684,9 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     if via_node {
         parts.headers.insert(HeaderName::from_static(HOP), HeaderValue::from_static("1"));
     }
-    let limit = route.options.max_body_mb.map(|mb| (mb * 1024 * 1024) as usize);
-    let body: Body = match limit {
-        Some(l) => Limited::new(body, l).boxed(),
-        None => body.map_err(|e| Box::new(e) as BoxErr).boxed(),
+    let body: Body = match route.options.max_body_mb {
+        Some(mb) => Limited::new(body, usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)).boxed(),
+        None => body.map_err(BoxErr::from).boxed(),
     };
     let client = if grpc && parts.version == Version::HTTP_2 {
         &app.proxy.h2c
@@ -720,7 +695,7 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
         &app.proxy.http1
     };
     let timeout = Duration::from_secs(route.options.timeout_s.unwrap_or(300));
-    let resp = match tokio::time::timeout(timeout, client.request(Request::from_parts(parts, body))).await {
+    let mut resp = match tokio::time::timeout(timeout, client.request(Request::from_parts(parts, body))).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::debug!("upstream {upstream} for {host}: {e}");
@@ -728,31 +703,68 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
                 crate::util::lock(&app.proxy.down).insert(upstream, std::time::Instant::now() + Duration::from_secs(15));
                 reload(&app);
             }
-            return error_page(Some(&route), StatusCode::BAD_GATEWAY, "Bad gateway", "The service did not answer. It may be starting or crashing.");
+            return error_page(&route, StatusCode::BAD_GATEWAY, "Bad gateway", "The service did not answer. It may be starting or crashing.");
         }
-        Err(_) => return error_page(Some(&route), StatusCode::GATEWAY_TIMEOUT, "Gateway timeout", "The service took too long to answer."),
+        Err(_) => return error_page(&route, StatusCode::GATEWAY_TIMEOUT, "Gateway timeout", "The service took too long to answer."),
     };
 
-    if resp.status() == StatusCode::SWITCHING_PROTOCOLS
-        && let Some(client_upgrade) = client_upgrade {
-            let (mut rparts, rbody) = resp.into_parts();
-            let mut upstream_resp = Response::from_parts(rparts.clone(), rbody);
-            let upstream_upgrade = hyper::upgrade::on(&mut upstream_resp);
-            tokio::spawn(async move {
-                if let (Ok(c), Ok(u)) = (client_upgrade.await, upstream_upgrade.await) {
-                    let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(c), &mut TokioIo::new(u)).await;
-                }
-            });
-            rparts.headers.remove(header::CONTENT_LENGTH);
-            return Response::from_parts(rparts, Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
-        }
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS && let Some(client_upgrade) = client_upgrade {
+        let upstream_upgrade = hyper::upgrade::on(&mut resp);
+        tokio::spawn(async move {
+            if let (Ok(c), Ok(u)) = (client_upgrade.await, upstream_upgrade.await) {
+                let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(c), &mut TokioIo::new(u)).await;
+            }
+        });
+        let (mut rparts, _) = resp.into_parts();
+        rparts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(rparts, full_body(Bytes::new()));
+    }
     let (mut rparts, rbody) = resp.into_parts();
     if (502..=504).contains(&rparts.status.as_u16())
-        && let Some(custom) = route.options.error_pages.get(&rparts.status.as_u16()) {
-            return full(rparts.status, "text/html; charset=utf-8", custom.clone());
-        }
+        && let Some(custom) = route.options.error_pages.get(&rparts.status.as_u16())
+    {
+        return html_page(rparts.status, custom.clone());
+    }
     strip_hop_headers(&mut rparts.headers, false);
-    Response::from_parts(rparts, rbody.map_err(|e| Box::new(e) as BoxErr).boxed())
+    Response::from_parts(rparts, rbody.map_err(BoxErr::from).boxed())
+}
+
+/// Where a request goes: local replicas only for a hop, a sleeping service woken first (on the
+/// panel), and other servers that just failed skipped unless nothing else is left.
+#[allow(clippy::result_large_err)]
+async fn choose_upstream(app: &App, route: &Route, hop: bool, host: &str) -> Result<Upstream, Response<Body>> {
+    let mut upstreams: Vec<Upstream> = route.upstreams.iter().filter(|u| !hop || matches!(u, Upstream::Local(_))).copied().collect();
+    if upstreams.is_empty() && route.asleep && *crate::util::read(&app.proxy.me) == "local" {
+        upstreams = crate::sleep::wake(app, route.service_id.as_deref().unwrap_or_default(), route.port).await.map_err(|e| {
+            tracing::warn!("waking {host}: {e:#}");
+            error_page(route, StatusCode::SERVICE_UNAVAILABLE, "Waking up failed", &e.to_string())
+        })?;
+    }
+    {
+        let now = std::time::Instant::now();
+        let mut down = crate::util::lock(&app.proxy.down);
+        down.retain(|_, until| *until > now);
+        if upstreams.iter().any(|u| !matches!(u, Upstream::Node(a) if down.contains_key(a))) {
+            upstreams.retain(|u| !matches!(u, Upstream::Node(a) if down.contains_key(a)));
+        }
+    }
+    let pick = app.proxy.rr.fetch_add(1, Ordering::Relaxed) % upstreams.len().max(1);
+    upstreams.get(pick).copied().ok_or_else(|| error_page(route, StatusCode::SERVICE_UNAVAILABLE, "Service unavailable", "The service is not running right now."))
+}
+
+/// The path and query a replica sees: the route's prefix stripped, then its rewrite applied.
+fn upstream_path<'a>(route: &Route, path_and_query: &'a str) -> std::borrow::Cow<'a, str> {
+    let mut pq = std::borrow::Cow::Borrowed(path_and_query);
+    if route.options.strip_prefix
+        && route.path != "/"
+        && let Some(rest) = path_and_query.strip_prefix(route.path.trim_end_matches('/'))
+    {
+        pq = if rest.starts_with('/') { rest.into() } else { format!("/{rest}").into() };
+    }
+    if let Some((re, to)) = &route.rewrite {
+        pq = re.replace(&pq, to.as_str()).into_owned().into();
+    }
+    pq
 }
 
 fn in_mesh(ip: IpAddr) -> bool {
@@ -786,24 +798,20 @@ pub async fn outside_client(url: &str, schemes: &[&str]) -> Option<reqwest::Clie
     if addrs.iter().any(|a| internal(a.ip())) {
         return None;
     }
-    reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::none()).resolve(&host, first).build().ok()
+    crate::util::http(10).redirect(reqwest::redirect::Policy::none()).resolve(&host, first).build().ok()
 }
 
-/// Forward auth's answer can go back to the visitor, so it never reaches `internal` addresses.
-async fn forward_auth_client(url: &str) -> Option<reqwest::Client> {
-    outside_client(url, &["http", "https"]).await
-}
-
-async fn panel_challenge(host: &str, path: &str) -> Response<Body> {
-    let url = format!("http://{}{path}", crate::mesh::PANEL_IP);
-    let answer = async {
-        let r = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().ok()?.get(url).header("host", host).send().await.ok()?;
-        if r.status().is_success() { r.text().await.ok() } else { None }
-    };
-    match answer.await {
-        Some(key_auth) => full(StatusCode::OK, "text/plain", key_auth),
-        None => full(StatusCode::NOT_FOUND, "text/plain", "unknown challenge"),
+/// The key authorization for an ACME challenge `token` (at `path`) for `host`.
+async fn acme_answer(app: &App, host: &str, path: &str, token: &str) -> Option<String> {
+    if let Some(key_auth) = crate::util::lock(&app.proxy.challenges).get(token) {
+        return Some(key_auth.clone());
     }
+    // The panel runs ACME; DNS may point at any server.
+    if *crate::util::read(&app.proxy.me) == "local" {
+        return None;
+    }
+    let r = crate::util::http(10).build().ok()?.get(format!("http://{}{path}", crate::mesh::PANEL_IP)).header("host", host).send().await.ok()?;
+    r.error_for_status().ok()?.text().await.ok()
 }
 
 fn strip_hop_headers(h: &mut HeaderMap, keep_upgrade: bool) {
@@ -827,8 +835,9 @@ async fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
     }
     let Ok(decoded) = crate::crypto::unb64(creds) else { return false };
     let Ok(decoded) = String::from_utf8(decoded) else { return false };
-    let Some((user, pass)) = decoded.split_once(':').map(|(u, p)| (u.to_string(), p.to_string())) else { return false };
+    let Some((user, pass)) = decoded.split_once(':') else { return false };
     let Some(hash) = route.options.basic_auth.iter().find(|u| u.user == user).map(|u| u.hash.clone()) else { return false };
+    let pass = pass.to_string();
     let ok = crate::auth::hashing(move || crate::auth::verify_password(&pass, &hash)).await.unwrap_or(false);
     if ok {
         crate::util::lock(&app.proxy.auth_cache).insert(key, now + 600);
@@ -838,15 +847,14 @@ async fn basic_auth_ok(app: &App, route: &Route, headers: &HeaderMap) -> bool {
 
 #[allow(clippy::result_large_err)]
 async fn forward_auth(
-    app: &App,
     fa: &crate::model::ForwardAuth,
     req: &Request<Incoming>,
     scheme: &str,
     host: &str,
     client: IpAddr,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, Response<Body>> {
-    let _ = app;
-    let Some(http) = forward_auth_client(&fa.url).await else {
+    // Its answer can go back to the visitor, so it never reaches `internal` addresses.
+    let Some(http) = outside_client(&fa.url, &["http", "https"]).await else {
         return Err(page(StatusCode::BAD_GATEWAY, "Sign-in service unavailable", "The authentication service's address is not allowed."));
     };
     let mut r = http
@@ -865,21 +873,17 @@ async fn forward_auth(
         Ok(resp) if resp.status().is_success() => Ok(fa
             .response_headers
             .iter()
-            .filter_map(|n| {
-                let v = resp.headers().get(n.as_str())?.to_str().ok()?;
-                Some((HeaderName::from_bytes(n.as_bytes()).ok()?, HeaderValue::from_str(v).ok()?))
-            })
+            .filter_map(|n| Some((HeaderName::from_bytes(n.as_bytes()).ok()?, resp.headers().get(n.as_str())?.clone())))
             .collect()),
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::UNAUTHORIZED);
-            let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(String::from);
-            let set_cookie: Vec<String> = resp.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok().map(String::from)).collect();
-            let body = crate::util::read_capped(resp, 1 << 20).await.unwrap_or_default();
-            let mut out = full(status, "text/html; charset=utf-8", body);
-            if let Some(l) = location.and_then(|l| HeaderValue::from_str(&l).ok()) {
+            let status = resp.status();
+            let location = resp.headers().get(header::LOCATION).cloned();
+            let cookies: Vec<HeaderValue> = resp.headers().get_all(header::SET_COOKIE).iter().cloned().collect();
+            let mut out = html_page(status, crate::util::read_capped(resp, 1 << 20).await.unwrap_or_default());
+            if let Some(l) = location {
                 out.headers_mut().insert(header::LOCATION, l);
             }
-            for c in set_cookie.into_iter().filter_map(|c| HeaderValue::from_str(&c).ok()) {
+            for c in cookies {
                 out.headers_mut().append(header::SET_COOKIE, c);
             }
             Err(out)
@@ -898,6 +902,12 @@ mod tests {
         assert!(path_under("/api", "/api"));
         assert!(!path_under("/apix", "/api"));
         assert!(path_under("/anything", "/"));
+        assert!(path_under("/api/x", "/api/") && !path_under("/api", "/api/"));
+        let host = |h: &str| host_of(&Request::builder().header(header::HOST, h).body(()).unwrap());
+        assert_eq!(host("Example.COM:8080"), "example.com");
+        assert_eq!(host("example.com."), "example.com");
+        assert_eq!(host("[::1]:8080"), "::1");
+        assert_eq!(host("[::1]"), "::1");
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", "203.0.113.9, 10.0.0.2".parse().unwrap());
         let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
@@ -1003,6 +1013,27 @@ mod tests {
         assert!(reduced.nodes.is_empty() && reduced.trusted_proxies.is_empty());
         assert!(reduced.worker);
         assert!(compile(&reduced, "n1").worker);
+    }
+
+    #[test]
+    fn replicas_see_stripped_and_rewritten_paths() {
+        let route = |path: &str, strip: bool, rewrite: Option<(&str, &str)>| Route {
+            port: 80,
+            service_id: None,
+            path: path.into(),
+            upstreams: vec![],
+            https: false,
+            via_tunnel: false,
+            options: DomainOptions { strip_prefix: strip, ..Default::default() },
+            redirects: vec![],
+            rewrite: rewrite.map(|(from, to)| (regex::Regex::new(from).unwrap(), to.to_string())),
+            asleep: false,
+        };
+        assert_eq!(upstream_path(&route("/api", true, None), "/api/x?q=1"), "/x?q=1");
+        assert_eq!(upstream_path(&route("/api/", true, None), "/api"), "/");
+        assert_eq!(upstream_path(&route("/api", false, None), "/api/x"), "/api/x");
+        assert_eq!(upstream_path(&route("/", true, None), "/x"), "/x");
+        assert_eq!(upstream_path(&route("/api", true, Some(("^/v1/(.*)", "/v2/$1"))), "/api/v1/a"), "/v2/a");
     }
 
 }

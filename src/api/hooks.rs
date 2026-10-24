@@ -1,7 +1,7 @@
 //! Incoming webhooks: per-service deploy URLs (also Easypanel's `/api/deploy/<token>`)
 //! and push events from Git hosts.
 
-use super::{ApiError, ApiResult};
+use super::{ApiError, ApiResult, check_ref};
 use crate::app::AppState;
 use crate::deploy::{self, Request};
 use crate::model::Source;
@@ -10,7 +10,6 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -22,28 +21,18 @@ pub struct HookQuery {
 }
 
 pub async fn deploy_hook(State(app): State<AppState>, Path(token): Path<String>, Query(q): Query<HookQuery>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
-    let id: Option<String> = app
-        .db
-        .conn()
-        .query_row("SELECT id FROM services WHERE deploy_token_hash = ?1", [util::sha256_hex(token.trim())], |r| r.get(0))
-        .optional()?;
+    let id: Option<String> = app.db.row("SELECT id FROM services WHERE deploy_token_hash = ?1", [util::sha256_hex(token.trim())], |r| r.get(0))?;
     let Some(id) = id else {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         return Err(ApiError::not_found("unknown deploy hook"));
     };
     let s = store::service(&app, &id)?.ok_or_else(|| ApiError::not_found("unknown deploy hook"))?;
-    if q.git_ref.as_deref().is_some_and(|r| !git::valid_ref(r)) {
-        return Err(ApiError::bad_request("ref is not a branch, tag or commit name"));
-    }
+    check_ref(q.git_ref.as_deref())?;
     let mut req = Request { trigger: "webhook".into(), actor: Some("deploy hook".into()), git_ref: q.git_ref, ..Default::default() };
     // Easypanel pointed GitHub webhooks at this URL: only pushes to the deployed branch count.
     if headers.contains_key("x-github-event") {
-        let push = git::parse_push(&headers, &body);
-        let branch = match &s.spec.source {
-            Source::Git { branch, .. } => Some(branch),
-            _ => None,
-        };
-        let Some(push) = push.filter(|p| branch.is_some_and(|b| *b == p.branch)) else {
+        let push = git::parse_push(&headers, &body).filter(|p| matches!(&s.spec.source, Source::Git { branch, .. } if *branch == p.branch));
+        let Some(push) = push else {
             return Ok(Json(json!({ "ignored": "not a push to the deployed branch" })));
         };
         // The body is not signed, so it only says that the branch moved: the deploy fetches the
@@ -57,23 +46,20 @@ pub async fn deploy_hook(State(app): State<AppState>, Path(token): Path<String>,
 }
 
 pub async fn git_hook(State(app): State<AppState>, Path(provider_id): Path<String>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
-    let p = git::provider(&app, &provider_id)?.ok_or_else(|| ApiError::not_found("unknown provider"))?;
+    let p = super::git::provider_or_404(&app, &provider_id)?;
     if !git::verify_webhook(&p, &headers, &body) {
         return Err(ApiError::unauthorized("the webhook signature does not match"));
     }
     let Some(push) = git::parse_push(&headers, &body) else {
         return Ok(Json(json!({ "ignored": "not a branch push" })));
     };
+    if push.message.contains("[skip deploy]") || push.message.contains("[skip ci]") {
+        return Ok(Json(json!({ "deploys": [] })));
+    }
     let mut started = vec![];
     for s in store::services(&app, None)? {
         let Source::Git { provider: Some(sp), repo, branch, watch_paths, auto_deploy, .. } = &s.spec.source else { continue };
-        if sp != &p.id || !repo.eq_ignore_ascii_case(&push.repo) || branch != &push.branch || !auto_deploy {
-            continue;
-        }
-        if push.message.contains("[skip deploy]") || push.message.contains("[skip ci]") {
-            continue;
-        }
-        if !git::push_touches(watch_paths, push.changed.as_deref()) {
+        if sp != &p.id || !repo.eq_ignore_ascii_case(&push.repo) || branch != &push.branch || !auto_deploy || !git::push_touches(watch_paths, push.changed.as_deref()) {
             continue;
         }
         let req = Request {

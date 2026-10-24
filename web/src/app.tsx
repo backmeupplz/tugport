@@ -1,8 +1,10 @@
-import type { ComponentChildren } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
-import Router, { getCurrentUrl } from "preact-router";
+import type { ComponentChildren, ComponentType } from "preact";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { ApiError, MeContext, canSeeServers, del, get, onUnauthorized, post, put, startEvents, stopEvents, type Me } from "./api";
-import { CodeBlock, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useSubmit } from "./ui";
+import { useUrl } from "./router";
+import { Icon, type IconName } from "./icons";
+import { CodeBlock, CodeInput, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useDialog, useSubmit } from "./ui";
+import { matchPath } from "./util";
 import { Access, Audit, NewAgent, NewPerson, UserPage } from "./pages/access";
 import { Login, Setup } from "./pages/auth";
 import { CloudPage } from "./pages/cloud";
@@ -12,6 +14,31 @@ import { ServicePage } from "./pages/service";
 import { Settings } from "./pages/settings";
 
 type Gate = "loading" | "setup" | "login" | "in" | "down";
+
+/** The pages by path; the first pattern that fits wins. */
+const ROUTES: [string, ComponentType<any>][] = [
+  ["/", Projects],
+  ["/projects/:project", ProjectPage],
+  ["/projects/:project/:service/:tab?", ServicePage],
+  ["/servers", Servers],
+  ["/servers/cloud", CloudPage],
+  ["/servers/:id", ServerPage],
+  ["/server", ServerPage],
+  ["/access", Access],
+  ["/access/audit", Audit],
+  ["/access/new-agent", NewAgent],
+  ["/access/new-person", NewPerson],
+  ["/access/users/:id", UserPage],
+  ["/settings/:tab?", Settings],
+];
+
+function Routes(props: { path: string }) {
+  for (const [pattern, View] of ROUTES) {
+    const params = matchPath(pattern, props.path);
+    if (params) return <View {...params} />;
+  }
+  return <NotFound />;
+}
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -72,16 +99,17 @@ export function App() {
   );
 }
 
-function useTheme(): [string, () => void] {
-  const [theme, setTheme] = useState(() => {
+type Theme = "system" | "light" | "dark";
+
+function useTheme(): [Theme, (t: Theme) => void] {
+  const [theme, setTheme] = useState<Theme>(() => {
     try {
-      return localStorage.getItem("tugport-theme") ?? "system";
+      return (localStorage.getItem("tugport-theme") as Theme | null) ?? "system";
     } catch {
       return "system";
     }
   });
-  const cycle = () => {
-    const next = theme === "system" ? "light" : theme === "light" ? "dark" : "system";
+  const choose = (next: Theme) => {
     try {
       if (next === "system") localStorage.removeItem("tugport-theme");
       else localStorage.setItem("tugport-theme", next);
@@ -93,70 +121,58 @@ function useTheme(): [string, () => void] {
     window.dispatchEvent(new Event("tugport-theme"));
     setTheme(next);
   };
-  return [theme, cycle];
+  return [theme, choose];
 }
 
-const THEME_LABEL: Record<string, string> = { system: "System", light: "Light", dark: "Dark" };
+const THEMES: [Theme, string, IconName][] = [
+  ["system", "System", "monitor"],
+  ["light", "Light", "sun"],
+  ["dark", "Dark", "moon"],
+];
 
 function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => void }) {
   const { me } = props;
-  const [url, setUrl] = useState(getCurrentUrl());
+  const url = useUrl();
   const [drawer, setDrawer] = useState(false);
   const [twofa, setTwofa] = useState(false);
-  const [theme, cycleTheme] = useTheme();
+  const [theme, setTheme] = useTheme();
   const path = url.split("?")[0];
-  const nav: [string, string, boolean][] = [
-    ["Projects", "/", path === "/" || path.startsWith("/projects")],
-    ...(canSeeServers(me) ? [["Servers", "/servers", path.startsWith("/server")] as [string, string, boolean]] : []),
-    ["Access", "/access", path.startsWith("/access")],
-    ["Settings", "/settings", path.startsWith("/settings")],
+  // A new page starts at the top, before it paints; the drawer closes on any navigation.
+  const shown = useRef(path);
+  useLayoutEffect(() => {
+    if (shown.current !== path) window.scrollTo(0, 0);
+    shown.current = path;
+    setDrawer(false);
+  }, [url]);
+  const nav: [string, string, IconName, boolean][] = [
+    ["Projects", "/", "projects", path === "/" || path.startsWith("/projects")],
+    ...(canSeeServers(me) ? [["Servers", "/servers", "servers", path.startsWith("/server")] as [string, string, IconName, boolean]] : []),
+    ["Access", "/access", "access", path.startsWith("/access")],
+    ["Settings", "/settings", "settings", path.startsWith("/settings")],
   ];
   const sidebar = (
     <div class="flex h-full flex-col">
-      <a href="/" class="flex items-center gap-2.5 px-4 py-4">
-        <img src="/logo.svg" alt="" class="size-8" />
-        <span class="text-base font-semibold">Tugport</span>
+      <a href="/" class="flex items-center gap-2.5 px-5 pt-5 pb-5">
+        <img src="/logo.svg" alt="" class="size-7" />
+        <span class="text-[15px] font-semibold tracking-tight">Tugport</span>
       </a>
-      <nav aria-label="Main" class="flex-1 px-2">
+      <nav aria-label="Main" class="flex-1 px-3">
         <ul class="space-y-0.5">
-          {nav.map(([label, href, active]) => (
+          {nav.map(([label, href, icon, active]) => (
             <li key={href}>
               <a
                 href={href}
                 aria-current={active ? "page" : undefined}
-                class={`flex items-center gap-2 rounded-md px-3 py-2 font-medium ${active ? "bg-raised text-text" : "text-dim hover:bg-raised hover:text-text"}`}
+                class={`flex h-9 items-center gap-3 rounded-lg px-3 font-medium ${active ? "bg-raised text-text" : "text-dim hover:bg-raised/60 hover:text-text"}`}
               >
-                <span class={`h-4 w-0.5 rounded-full ${active ? "bg-accent" : "bg-transparent"}`} aria-hidden="true" />
+                <Icon name={icon} class={`size-4 ${active ? "text-accent" : ""}`} />
                 {label}
               </a>
             </li>
           ))}
         </ul>
       </nav>
-      <div class="border-t border-line p-3">
-        <div class="mb-2 flex items-center gap-2.5 px-1">
-          <span class="grid size-8 shrink-0 place-items-center rounded-full bg-accent text-sm font-semibold text-accent-ink" aria-hidden="true">
-            {me.principal.name.slice(0, 1).toUpperCase()}
-          </span>
-          <span class="min-w-0">
-            <span class="block truncate font-medium">{me.principal.name}</span>
-            <span class="block text-xs text-muted">{me.principal.is_owner ? "Owner" : me.principal.kind === "agent" ? "Agent" : "Member"}</span>
-          </span>
-        </div>
-        <div class="flex flex-col">
-          {me.principal.kind === "human" && (
-            <button class="btn btn-ghost justify-start" onClick={() => setTwofa(true)}>
-              Two-factor: {me.totp ? "on" : "off"}
-            </button>
-          )}
-          <button class="btn btn-ghost justify-start" onClick={cycleTheme} aria-label={`Theme: ${THEME_LABEL[theme]}. Switch theme`}>
-            Theme: {THEME_LABEL[theme]}
-          </button>
-          <button class="btn btn-ghost justify-start" onClick={props.signOut}>
-            Sign out
-          </button>
-        </div>
-      </div>
+      <Account me={me} theme={theme} setTheme={setTheme} openTwofa={() => setTwofa(true)} signOut={props.signOut} />
     </div>
   );
 
@@ -165,43 +181,22 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
       <a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-surface focus:px-3 focus:py-2">
         Skip to content
       </a>
-      <aside class="hidden w-56 shrink-0 border-r border-line bg-surface md:sticky md:top-0 md:block md:h-dvh md:overflow-y-auto">{sidebar}</aside>
+      <aside class="hidden w-60 shrink-0 border-r border-line md:sticky md:top-0 md:block md:h-dvh md:overflow-y-auto">{sidebar}</aside>
       <Drawer open={drawer} onClose={() => setDrawer(false)}>
         {sidebar}
       </Drawer>
       <div class="min-w-0 flex-1">
-        <header class="sticky top-0 z-30 flex items-center justify-between border-b border-line bg-surface px-4 py-2.5 md:hidden">
+        <header class="sticky top-0 z-30 flex items-center justify-between border-b border-line bg-bg/85 px-4 py-2.5 backdrop-blur md:hidden">
           <a href="/" class="flex items-center gap-2">
             <img src="/logo.svg" alt="" class="size-7" />
-            <span class="font-semibold">Tugport</span>
+            <span class="font-semibold tracking-tight">Tugport</span>
           </a>
-          <button class="btn" aria-expanded={drawer} onClick={() => setDrawer(true)}>
-            Menu
+          <button class="btn btn-ghost px-2" aria-label="Open the menu" aria-expanded={drawer} onClick={() => setDrawer(true)}>
+            <Icon name="menu" class="size-5" />
           </button>
         </header>
         <main id="main">
-          <Router
-            onChange={(e) => {
-              if (e.previous && e.previous.split("?")[0] !== e.url.split("?")[0]) window.scrollTo(0, 0);
-              setUrl(e.url);
-              setDrawer(false);
-            }}
-          >
-            <Projects path="/" />
-            <ProjectPage path="/projects/:project" />
-            <ServicePage path="/projects/:project/:service/:tab?" />
-            <Servers path="/servers" />
-            <CloudPage path="/servers/cloud" />
-            <ServerPage path="/servers/:id" />
-            <ServerPage path="/server" />
-            <Access path="/access" />
-            <Audit path="/access/audit" />
-            <NewAgent path="/access/new-agent" />
-            <NewPerson path="/access/new-person" />
-            <UserPage path="/access/users/:id" />
-            <Settings path="/settings/:tab?" />
-            <NotFound default />
-          </Router>
+          <Routes path={path} />
         </main>
       </div>
       <TwoFactor open={twofa} onClose={() => setTwofa(false)} me={me} reloadMe={props.reloadMe} />
@@ -212,30 +207,98 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
 
 /** The mobile navigation, as a modal dialog so it traps focus and closes with Escape. */
 function Drawer(props: { open: boolean; onClose: () => void; children: ComponentChildren }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const d = ref.current;
-    if (!d) return;
-    if (props.open && !d.open) d.showModal();
-    if (!props.open && d.open) d.close();
-  }, [props.open]);
+  const ref = useDialog(props.open);
   return (
     <dialog
       ref={ref}
       onClose={props.onClose}
       onClick={(e) => e.target === ref.current && props.onClose()}
       aria-label="Navigation"
-      class="m-0 h-dvh max-h-none w-64 max-w-[85vw] border-r border-line bg-surface p-0 text-text md:hidden"
+      class="m-0 h-dvh max-h-none w-64 max-w-[85vw] border-r border-line bg-bg p-0 text-text md:hidden"
     >
       {props.children}
     </dialog>
   );
 }
 
-function NotFound(_: { default?: boolean }) {
+/**
+ * Who is signed in, with a menu (a popover, so it closes on Escape or an outside click) for
+ * two-factor sign-in, the theme and signing out.
+ */
+function Account(props: { me: Me; theme: Theme; setTheme: (t: Theme) => void; openTwofa: () => void; signOut: () => void }) {
+  const { principal } = props.me;
+  const menu = useRef<HTMLDivElement>(null);
+  const item = "flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left hover:bg-raised";
+  const run = (f: () => void) => () => {
+    menu.current?.hidePopover?.();
+    f();
+  };
+  return (
+    <div class="border-t border-line p-3">
+      <button
+        type="button"
+        class="flex w-full items-center gap-2.5 rounded-lg p-2 text-left hover:bg-raised"
+        aria-label={`Account: ${principal.name}`}
+        onClick={() => menu.current?.togglePopover?.()}
+      >
+        <span class="grid size-8 shrink-0 place-items-center rounded-full bg-accent text-sm font-semibold text-accent-ink" aria-hidden="true">
+          {principal.name.slice(0, 1).toUpperCase()}
+        </span>
+        <span class="min-w-0 flex-1">
+          <span class="block truncate font-medium">{principal.name}</span>
+          <span class="block text-xs text-muted">{principal.is_owner ? "Owner" : principal.kind === "agent" ? "Agent" : "Member"}</span>
+        </span>
+        <Icon name="updown" class="size-4 text-muted" />
+      </button>
+      <div
+        ref={menu}
+        popover="auto"
+        aria-label="Account"
+        class="fixed top-auto right-auto bottom-[4.5rem] left-3 m-0 w-56 rounded-xl border border-line bg-surface p-1.5 text-text shadow-2xl"
+      >
+        {principal.kind === "human" && (
+          <button type="button" class={item} onClick={run(props.openTwofa)}>
+            <Icon name="shield" class="size-4 text-dim" />
+            <span class="flex-1">Two-factor sign-in</span>
+            <span class="text-xs text-muted">{props.me.totp ? "On" : "Off"}</span>
+          </button>
+        )}
+        <div role="group" aria-label="Theme" class="my-1 grid grid-cols-3 gap-1 rounded-lg bg-raised p-1">
+          {THEMES.map(([t, label, icon]) => (
+            <button
+              key={t}
+              type="button"
+              aria-pressed={props.theme === t}
+              title={label}
+              class={`flex h-7 items-center justify-center gap-1 rounded-md text-xs ${props.theme === t ? "bg-surface text-text shadow-(--shadow)" : "text-dim hover:text-text"}`}
+              onClick={() => props.setTheme(t)}
+            >
+              <Icon name={icon} class="size-3.5" />
+              {label}
+            </button>
+          ))}
+        </div>
+        <button type="button" class={item} onClick={run(props.signOut)}>
+          <Icon name="signout" class="size-4 text-dim" />
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NotFound() {
   return (
     <Page title="Not found">
-      <Empty action={<a class="btn" href="/">Go to projects</a>}>This page does not exist, or you do not have access to it.</Empty>
+      <Empty
+        action={
+          <a class="btn" href="/">
+            Go to projects
+          </a>
+        }
+      >
+        This page does not exist, or you do not have access to it.
+      </Empty>
     </Page>
   );
 }
@@ -263,16 +326,7 @@ function TwoFactor(props: { open: boolean; onClose: () => void; me: Me; reloadMe
   });
   const codeField = (label: string) => (
     <Field label={label}>
-      <input
-        class="input text-center font-mono text-lg tracking-[0.4em]"
-        required
-        inputMode="numeric"
-        autoComplete="one-time-code"
-        pattern="[0-9]{6}"
-        maxLength={6}
-        value={code}
-        onInput={(e) => setCode(e.currentTarget.value)}
-      />
+      <CodeInput value={code} onInput={(e) => setCode(e.currentTarget.value)} />
     </Field>
   );
   return (

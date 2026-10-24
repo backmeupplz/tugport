@@ -4,7 +4,7 @@ use crate::app::App;
 use crate::model::{DomainOptions, ServiceSpec};
 use crate::util;
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
@@ -50,25 +50,18 @@ pub struct Domain {
     pub options: DomainOptions,
 }
 
+const PROJECT_SELECT: &str = "SELECT id, name, description, created_at FROM projects";
+
+fn project_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    Ok(Project { id: r.get(0)?, name: r.get(1)?, description: r.get(2)?, created_at: r.get(3)? })
+}
+
 pub fn project(app: &App, id_or_name: &str) -> Result<Option<Project>> {
-    Ok(app
-        .db
-        .conn()
-        .query_row(
-            "SELECT id, name, description, created_at FROM projects WHERE id = ?1 OR name = ?1",
-            [id_or_name],
-            |r| Ok(Project { id: r.get(0)?, name: r.get(1)?, description: r.get(2)?, created_at: r.get(3)? }),
-        )
-        .optional()?)
+    Ok(app.db.row(&format!("{PROJECT_SELECT} WHERE id = ?1 OR name = ?1"), [id_or_name], project_row)?)
 }
 
 pub fn projects(app: &App) -> Result<Vec<Project>> {
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT id, name, description, created_at FROM projects ORDER BY name")?;
-    let rows = stmt
-        .query_map([], |r| Ok(Project { id: r.get(0)?, name: r.get(1)?, description: r.get(2)?, created_at: r.get(3)? }))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    Ok(app.db.rows(&format!("{PROJECT_SELECT} ORDER BY name"), [], project_row)?)
 }
 
 const SERVICE_SELECT: &str = "SELECT s.id, s.project_id, p.name, s.name, s.kind, s.spec, s.created_at, s.updated_at FROM services s JOIN projects p ON p.id = s.project_id";
@@ -96,125 +89,102 @@ fn with_spec((mut s, raw): (Service, String)) -> Result<Service> {
 
 /// A service by id or `project.service`.
 pub fn service(app: &App, reference: &str) -> Result<Option<Service>> {
-    let row = if let Some((p, s)) = reference.split_once('.') {
-        app.db
-            .conn()
-            .query_row(&format!("{SERVICE_SELECT} WHERE p.name = ?1 AND s.name = ?2"), params![p, s], service_row)
-            .optional()?
-    } else {
-        app.db.conn().query_row(&format!("{SERVICE_SELECT} WHERE s.id = ?1"), [reference], service_row).optional()?
+    let row = match reference.split_once('.') {
+        Some((p, s)) => app.db.row(&format!("{SERVICE_SELECT} WHERE p.name = ?1 AND s.name = ?2"), params![p, s], service_row)?,
+        None => app.db.row(&format!("{SERVICE_SELECT} WHERE s.id = ?1"), [reference], service_row)?,
     };
     row.map(with_spec).transpose()
 }
 
 pub fn services(app: &App, project_id: Option<&str>) -> Result<Vec<Service>> {
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare(&format!("{SERVICE_SELECT} WHERE ?1 IS NULL OR s.project_id = ?1 ORDER BY p.name, s.name"))?;
-    let rows = stmt.query_map([project_id], service_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    drop(conn);
+    let rows = app.db.rows(&format!("{SERVICE_SELECT} WHERE ?1 IS NULL OR s.project_id = ?1 ORDER BY p.name, s.name"), [project_id], service_row)?;
     rows.into_iter().map(with_spec).collect()
 }
 
 pub fn save_spec(app: &App, service_id: &str, spec: &ServiceSpec) -> Result<()> {
-    app.db.conn().execute(
-        "UPDATE services SET spec = ?1, updated_at = ?2 WHERE id = ?3",
-        params![serde_json::to_string(spec)?, util::now(), service_id],
-    )?;
+    app.db.exec("UPDATE services SET spec = ?1, updated_at = ?2 WHERE id = ?3", params![serde_json::to_string(spec)?, util::now(), service_id])?;
     Ok(())
 }
 
-fn env_context(service_id: &str, key: &str) -> String {
-    format!("env:{service_id}:{key}")
+/// A table of sealed values that belong to a service or project. Each value is sealed with the
+/// context `<prefix>:<owner>:<key>`, so a ciphertext copied into another row fails to open.
+struct Sealed {
+    table: &'static str,
+    owner: &'static str,
+    key: &'static str,
+    value: &'static str,
+    prefix: &'static str,
 }
 
-fn var_context(project_id: &str, key: &str) -> String {
-    format!("var:{project_id}:{key}")
+const ENV: Sealed = Sealed { table: "service_env", owner: "service_id", key: "key", value: "value", prefix: "env" };
+const VARS: Sealed = Sealed { table: "project_vars", owner: "project_id", key: "key", value: "value", prefix: "var" };
+const FILES: Sealed = Sealed { table: "service_files", owner: "service_id", key: "target", value: "content", prefix: "file" };
+
+impl Sealed {
+    fn context(&self, owner: &str, key: &str) -> String {
+        format!("{}:{owner}:{key}", self.prefix)
+    }
+
+    /// Every key with its opened value, in key order.
+    fn all(&self, app: &App, owner: &str) -> Result<Vec<(String, Zeroizing<String>)>> {
+        let Sealed { table, owner: col, key, value, .. } = self;
+        let sql = format!("SELECT {key}, {value} FROM {table} WHERE {col} = ?1 ORDER BY {key}");
+        let rows: Vec<(String, Vec<u8>)> = app.db.rows(&sql, [owner], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.into_iter().map(|(k, v)| Ok((k.clone(), app.keys.open_str(&self.context(owner, &k), &v)?))).collect()
+    }
+
+    /// Set a value, or delete it with None.
+    fn set(&self, app: &App, owner: &str, k: &str, v: Option<&str>) -> Result<()> {
+        let Sealed { table, owner: col, key, value, .. } = self;
+        match v {
+            Some(v) => app.db.exec(
+                &format!("INSERT INTO {table} ({col}, {key}, {value}) VALUES (?1, ?2, ?3) ON CONFLICT({col}, {key}) DO UPDATE SET {value} = excluded.{value}"),
+                params![owner, k, app.keys.seal_str(&self.context(owner, k), v)?],
+            )?,
+            None => app.db.exec(&format!("DELETE FROM {table} WHERE {col} = ?1 AND {key} = ?2"), params![owner, k])?,
+        };
+        Ok(())
+    }
 }
 
 /// Every variable a service's containers get: project variables, overridden by the service's own.
 pub fn resolved_env(app: &App, service: &Service) -> Result<BTreeMap<String, Zeroizing<String>>> {
-    let mut out = BTreeMap::new();
-    for (k, v) in project_vars(app, &service.project_id)? {
-        out.insert(k, v);
-    }
-    for (k, v) in service_env(app, &service.id)? {
-        out.insert(k, v);
-    }
+    let mut out = project_vars(app, &service.project_id)?;
+    out.extend(service_env(app, &service.id)?);
     Ok(out)
 }
 
 pub fn service_env(app: &App, service_id: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
-    let rows: Vec<(String, Vec<u8>)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT key, value FROM service_env WHERE service_id = ?1")?;
-        stmt.query_map([service_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-    };
-    rows.into_iter().map(|(k, v)| Ok((k.clone(), app.keys.open_str(&env_context(service_id, &k), &v)?))).collect()
+    Ok(ENV.all(app, service_id)?.into_iter().collect())
 }
 
 pub fn env_names(app: &App, service_id: &str) -> Result<Vec<String>> {
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT key FROM service_env WHERE service_id = ?1 ORDER BY key")?;
-    Ok(stmt.query_map([service_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?)
+    Ok(app.db.rows("SELECT key FROM service_env WHERE service_id = ?1 ORDER BY key", [service_id], |r| r.get(0))?)
 }
 
 pub fn set_env(app: &App, service_id: &str, key: &str, value: Option<&str>) -> Result<()> {
-    match value {
-        Some(v) => app.db.conn().execute(
-            "INSERT INTO service_env (service_id, key, value) VALUES (?1, ?2, ?3) ON CONFLICT(service_id, key) DO UPDATE SET value = excluded.value",
-            params![service_id, key, app.keys.seal_str(&env_context(service_id, key), v)?],
-        )?,
-        None => app.db.conn().execute("DELETE FROM service_env WHERE service_id = ?1 AND key = ?2", params![service_id, key])?,
-    };
-    Ok(())
+    ENV.set(app, service_id, key, value)
 }
 
 pub fn project_vars(app: &App, project_id: &str) -> Result<BTreeMap<String, Zeroizing<String>>> {
-    let rows: Vec<(String, Vec<u8>)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT key, value FROM project_vars WHERE project_id = ?1")?;
-        stmt.query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-    };
-    rows.into_iter().map(|(k, v)| Ok((k.clone(), app.keys.open_str(&var_context(project_id, &k), &v)?))).collect()
+    Ok(VARS.all(app, project_id)?.into_iter().collect())
 }
 
 pub fn set_project_var(app: &App, project_id: &str, key: &str, value: Option<&str>) -> Result<()> {
-    match value {
-        Some(v) => app.db.conn().execute(
-            "INSERT INTO project_vars (project_id, key, value) VALUES (?1, ?2, ?3) ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value",
-            params![project_id, key, app.keys.seal_str(&var_context(project_id, key), v)?],
-        )?,
-        None => app.db.conn().execute("DELETE FROM project_vars WHERE project_id = ?1 AND key = ?2", params![project_id, key])?,
-    };
-    Ok(())
+    VARS.set(app, project_id, key, value)
 }
 
 pub fn valid_env_key(key: &str) -> bool {
     let b = key.as_bytes();
-    !b.is_empty() && !b[0].is_ascii_digit() && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    b.first().is_some_and(|c| !c.is_ascii_digit()) && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 pub fn files(app: &App, service_id: &str) -> Result<Vec<(String, Zeroizing<String>)>> {
-    let rows: Vec<(String, Vec<u8>)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT target, content FROM service_files WHERE service_id = ?1 ORDER BY target")?;
-        stmt.query_map([service_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-    };
-    rows.into_iter()
-        .map(|(t, c)| Ok((t.clone(), app.keys.open_str(&format!("file:{service_id}:{t}"), &c)?)))
-        .collect()
+    FILES.all(app, service_id)
 }
 
 pub fn set_file(app: &App, service_id: &str, target: &str, content: Option<&str>) -> Result<()> {
-    match content {
-        Some(c) => app.db.conn().execute(
-            "INSERT INTO service_files (service_id, target, content) VALUES (?1, ?2, ?3) ON CONFLICT(service_id, target) DO UPDATE SET content = excluded.content",
-            params![service_id, target, app.keys.seal_str(&format!("file:{service_id}:{target}"), c)?],
-        )?,
-        None => app.db.conn().execute("DELETE FROM service_files WHERE service_id = ?1 AND target = ?2", params![service_id, target])?,
-    };
-    Ok(())
+    FILES.set(app, service_id, target, content)
 }
 
 const DOMAIN_SELECT: &str = "SELECT id, service_id, host, path, port, container, https, via_tunnel, options FROM domains";
@@ -225,7 +195,7 @@ fn domain_row(r: &rusqlite::Row) -> rusqlite::Result<Domain> {
         service_id: r.get(1)?,
         host: r.get(2)?,
         path: r.get(3)?,
-        port: r.get::<_, i64>(4)? as u16,
+        port: r.get(4)?,
         container: r.get(5)?,
         https: r.get(6)?,
         via_tunnel: r.get(7)?,
@@ -234,13 +204,11 @@ fn domain_row(r: &rusqlite::Row) -> rusqlite::Result<Domain> {
 }
 
 pub fn domains(app: &App, service_id: Option<&str>) -> Result<Vec<Domain>> {
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare(&format!("{DOMAIN_SELECT} WHERE ?1 IS NULL OR service_id = ?1 ORDER BY host, path"))?;
-    Ok(stmt.query_map([service_id], domain_row)?.collect::<rusqlite::Result<_>>()?)
+    Ok(app.db.rows(&format!("{DOMAIN_SELECT} WHERE ?1 IS NULL OR service_id = ?1 ORDER BY host, path"), [service_id], domain_row)?)
 }
 
 pub fn domain(app: &App, id: &str) -> Result<Option<Domain>> {
-    Ok(app.db.conn().query_row(&format!("{DOMAIN_SELECT} WHERE id = ?1"), [id], domain_row).optional()?)
+    Ok(app.db.row(&format!("{DOMAIN_SELECT} WHERE id = ?1"), [id], domain_row)?)
 }
 
 pub fn valid_host(host: &str) -> bool {
@@ -263,9 +231,18 @@ mod tests {
         assert!(valid_env_key("_x1"));
         assert!(!valid_env_key("1X"));
         assert!(!valid_env_key("A-B"));
+        assert!(!valid_env_key(""));
         assert!(valid_host("shop.example.com"));
         assert!(!valid_host("localhost"));
         assert!(!valid_host("bad_host.com"));
         assert!(!valid_host("-a.com"));
+    }
+
+    #[test]
+    fn sealed_contexts_stay_the_same() {
+        // Stored ciphertexts are bound to these; changing one makes every value unreadable.
+        assert_eq!(ENV.context("s1", "KEY"), "env:s1:KEY");
+        assert_eq!(VARS.context("p1", "KEY"), "var:p1:KEY");
+        assert_eq!(FILES.context("s1", "/etc/a.conf"), "file:s1:/etc/a.conf");
     }
 }

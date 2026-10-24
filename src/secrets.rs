@@ -85,7 +85,11 @@ pub struct Masker {
 impl Masker {
     pub fn new<'a>(values: impl Iterator<Item = &'a str>) -> Self {
         let pats: Vec<&str> = values.filter(|v| v.len() >= 6).collect();
-        Masker { ac: (!pats.is_empty()).then(|| aho_corasick::AhoCorasick::new(pats).ok()).flatten() }
+        if pats.is_empty() {
+            return Masker { ac: None };
+        }
+        let ac = aho_corasick::AhoCorasick::new(pats).inspect_err(|e| tracing::warn!("secrets cannot be masked: {e}")).ok();
+        Masker { ac }
     }
 
     pub fn for_service(app: &App, s: &crate::store::Service) -> Self {
@@ -97,7 +101,14 @@ impl Masker {
 
     pub fn mask<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
         match &self.ac {
-            Some(ac) if ac.is_match(text) => ac.replace_all(text, &vec!["••••••"; ac.patterns_len()]).into(),
+            Some(ac) if ac.is_match(text) => {
+                let mut out = String::with_capacity(text.len());
+                ac.replace_all_with(text, &mut out, |_, _, out| {
+                    out.push_str("••••••");
+                    true
+                });
+                out.into()
+            }
             _ => text.into(),
         }
     }

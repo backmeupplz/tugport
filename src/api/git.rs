@@ -1,7 +1,6 @@
 //! Connecting Git hosts: one-click GitHub App, tokens for GitHub/Forgejo/GitLab, deploy keys.
 
-use super::projects::service_or_404;
-use super::{ApiError, ApiResult, Auth, base_url};
+use super::{ApiError, ApiResult, Auth, Owner, base_url, ok, service_or_404};
 use crate::app::AppState;
 use crate::auth::Role;
 use crate::git::{self, Kind};
@@ -27,8 +26,7 @@ pub struct TokenProvider {
 }
 
 /// Connect a host with an access token (Forgejo/Gitea, GitLab, or a GitHub token).
-pub async fn create(State(app): State<AppState>, a: Auth, Json(b): Json<TokenProvider>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn create(State(app): State<AppState>, Owner(a): Owner, Json(b): Json<TokenProvider>) -> ApiResult<Json<Value>> {
     let kind = Kind::parse(&b.kind).filter(|k| *k != Kind::GithubApp).ok_or_else(|| ApiError::bad_request("kind is forgejo, gitea, gitlab or github_token"))?;
     let base = b
         .base_url
@@ -43,22 +41,21 @@ pub async fn create(State(app): State<AppState>, a: Auth, Json(b): Json<TokenPro
     let id = git::save_provider(&app, None, kind, &name, &base, &config)?;
     let p = git::provider(&app, &id)?.ok_or_else(|| ApiError::not_found("the provider was not saved"))?;
     if let Err(e) = git::repos(&p).await {
-        app.db.conn().execute("DELETE FROM git_providers WHERE id = ?1", [&id])?;
+        app.db.exec("DELETE FROM git_providers WHERE id = ?1", [&id])?;
         return Err(ApiError::bad_request(format!("the token does not work: {e:#}")));
     }
-    app.audit(Some(&a.0), "git.connect", None, None, Some(&name), Some(kind.as_str()));
+    a.audit(&app, "git.connect", Some(&name), Some(kind.as_str()));
     Ok(Json(json!({ "id": id, "name": name })))
 }
 
-pub async fn delete(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn delete(State(app): State<AppState>, Owner(a): Owner, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let used = crate::store::services(&app, None)?.into_iter().any(|s| matches!(&s.spec.source, Source::Git { provider: Some(p), .. } if *p == id));
     if used {
         return Err(ApiError::conflict("services still deploy from this provider"));
     }
-    app.db.conn().execute("DELETE FROM git_providers WHERE id = ?1", [&id])?;
-    app.audit(Some(&a.0), "git.disconnect", None, None, Some(&id), None);
-    Ok(Json(json!({ "ok": true })))
+    app.db.exec("DELETE FROM git_providers WHERE id = ?1", [&id])?;
+    a.audit(&app, "git.disconnect", Some(&id), None);
+    Ok(ok())
 }
 
 pub async fn repos(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
@@ -67,8 +64,11 @@ pub async fn repos(State(app): State<AppState>, a: Auth, Path(id): Path<String>)
     if !p.is_owner && p.all_projects_role.max(p.project_roles.values().copied().max()).is_none_or(|r| r < Role::Operator) {
         return Err(ApiError::forbidden("listing repositories needs the operator role on a project"));
     }
-    let p = git::provider(&app, &id)?.ok_or_else(|| ApiError::not_found("unknown provider"))?;
-    Ok(Json(json!({ "repos": git::repos(&p).await? })))
+    Ok(Json(json!({ "repos": git::repos(&provider_or_404(&app, &id)?).await? })))
+}
+
+pub(super) fn provider_or_404(app: &AppState, id: &str) -> ApiResult<git::Provider> {
+    git::provider(app, id)?.ok_or_else(|| ApiError::not_found("unknown provider"))
 }
 
 #[derive(Deserialize, Default)]
@@ -79,8 +79,7 @@ pub struct ManifestBody {
 
 /// Start creating a GitHub App. The browser posts `manifest` to `action`; GitHub then
 /// redirects back to the callback below.
-pub async fn github_manifest(State(app): State<AppState>, a: Auth, headers: HeaderMap, body: Option<Json<ManifestBody>>) -> ApiResult<Json<Value>> {
-    a.require_owner()?;
+pub async fn github_manifest(State(app): State<AppState>, _: Owner, headers: HeaderMap, body: Option<Json<ManifestBody>>) -> ApiResult<Json<Value>> {
     let base = public_base(&app, &headers);
     let id = util::id();
     let state = util::token(24);
@@ -111,32 +110,37 @@ pub struct Callback {
     state: String,
 }
 
-pub async fn github_callback(State(app): State<AppState>, a: Auth, Query(q): Query<Callback>) -> ApiResult<impl IntoResponse> {
-    a.require_owner()?;
+pub async fn github_callback(State(app): State<AppState>, Owner(a): Owner, Query(q): Query<Callback>) -> ApiResult<impl IntoResponse> {
     let key = format!("gh_manifest:{}", q.state);
     let id = app.db.get_state(&key)?.ok_or_else(|| ApiError::bad_request("this GitHub App setup link expired; start again"))?;
-    app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&key])?;
+    app.db.del_state(&key)?;
     let (slug, install) = git::finish_github_manifest(&app, &id, &q.code).await?;
-    app.audit(Some(&a.0), "git.connect", None, None, Some(&slug), Some("github_app"));
+    a.audit(&app, "git.connect", Some(&slug), Some("github_app"));
     Ok(Redirect::to(&install))
 }
 
 /// The address GitHub and other hosts can reach us on.
-pub fn public_base(app: &AppState, headers: &HeaderMap) -> String {
+fn public_base(app: &AppState, headers: &HeaderMap) -> String {
     match app.settings().panel_domain {
         Some(d) => format!("https://{d}"),
         None => base_url(headers),
     }
 }
 
-/// Make sure the repository sends pushes to us (providers without app-level webhooks).
-pub async fn ensure_hook(app: &AppState, s: &crate::store::Service, base: &str) {
-    let Source::Git { provider: Some(pid), repo, auto_deploy: true, .. } = &s.spec.source else { return };
-    let Ok(Some(p)) = git::provider(app, pid) else { return };
-    if let Err(e) = git::ensure_webhook(&p, repo, &format!("{base}/api/hooks/git/{}", p.id)).await {
-        tracing::warn!("could not create the push webhook on {repo}: {e:#}");
-        app.emit("warning", Some(&s.project_id), Some(&s.id), json!({ "message": format!("could not create the push webhook: {e:#}") }));
-    }
+/// In the background, make sure the service's repository sends pushes to us (providers without
+/// app-level webhooks).
+pub fn ensure_hook_soon(app: &AppState, headers: &HeaderMap, service_id: &str) -> ApiResult<()> {
+    let Some(s) = crate::store::service(app, service_id)? else { return Ok(()) };
+    let Source::Git { provider: Some(pid), repo, auto_deploy: true, .. } = &s.spec.source else { return Ok(()) };
+    let Ok(Some(p)) = git::provider(app, pid) else { return Ok(()) };
+    let (app, url, repo) = (app.clone(), format!("{}/api/hooks/git/{}", public_base(app, headers), p.id), repo.clone());
+    tokio::spawn(async move {
+        if let Err(e) = git::ensure_webhook(&p, &repo, &url).await {
+            tracing::warn!("could not create the push webhook on {repo}: {e:#}");
+            app.emit("warning", Some(&s.project_id), Some(&s.id), json!({ "message": format!("could not create the push webhook: {e:#}") }));
+        }
+    });
+    Ok(())
 }
 
 /// Generate an SSH deploy key for a service; returns the public half to add to the repository.
@@ -151,8 +155,8 @@ pub async fn deploy_key(State(app): State<AppState>, a: Auth, Path(id): Path<Str
     let out = res.and_then(|_| Ok((std::fs::read_to_string(&key)?, std::fs::read_to_string(dir.join("key.pub"))?)));
     let _ = std::fs::remove_dir_all(&dir);
     let (private, public) = out?;
-    let sealed = app.keys.seal_str(&format!("deploykey:{}", s.id), &private)?;
-    app.db.set_state(&format!("deploykey:{}", s.id), &crate::crypto::b64(&sealed))?;
-    app.audit(Some(&a.0), "service.deploy_key", Some(&s.project_id), Some(&s.id), Some(&s.name), None);
+    let deploy_key = format!("deploykey:{}", s.id);
+    app.set_sealed_state(&deploy_key, &deploy_key, &private)?;
+    a.audit_service(&app, "service.deploy_key", &s, None);
     Ok(Json(json!({ "public_key": public.trim() })))
 }

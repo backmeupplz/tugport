@@ -7,6 +7,7 @@ use crate::model::{Mount, Source};
 use crate::store::{self, Service};
 use crate::{runtime, util};
 use anyhow::{Context, Result, anyhow, bail};
+use bollard::models::LocalNodeState;
 use bollard::query_parameters::ListContainersOptions;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ use std::time::Duration;
 
 pub const AGENT_PORT: u16 = 7948;
 pub const DOCKER_PORT: u16 = 7947;
+/// Every call to an agent, and every Docker connection to a server, carries the node key in it.
+pub const AGENT_KEY: &str = "x-tugport-agent-key";
 /// A server unreachable this long has its movable services started elsewhere.
 const RESCHEDULE_AFTER_S: i64 = 120;
 
@@ -33,6 +36,15 @@ pub struct NodeHandle {
     secret: Option<String>,
     pub region: Option<String>,
     pub labels: BTreeMap<String, String>,
+}
+
+impl NodeHandle {
+    /// (mesh address, agent key) of another server.
+    fn reach(&self) -> Result<(&str, &str)> {
+        let ip = self.mesh_ip.as_deref().ok_or_else(|| anyhow!("{} is not on the mesh", self.name))?;
+        let secret = self.secret.as_deref().ok_or_else(|| anyhow!("{} has no agent key", self.name))?;
+        Ok((ip, secret))
+    }
 }
 
 #[derive(Default)]
@@ -68,15 +80,12 @@ struct MeshState {
 }
 
 fn mesh_state(app: &App) -> Result<Option<MeshState>> {
-    match app.db.get_state("mesh")? {
-        Some(sealed) => Ok(Some(serde_json::from_str(&app.keys.open_str("mesh", &crate::crypto::unb64(&sealed)?)?)?)),
-        None => Ok(None),
-    }
+    Ok(app.sealed_state("mesh", "mesh")?.map(|m| serde_json::from_str(&m)).transpose()?)
 }
 
 /// More than one server: services use overlay networks and may run anywhere.
 pub fn mesh_enabled(app: &App) -> bool {
-    app.db.get_state("mesh").ok().flatten().is_some()
+    app.db.state::<String>("mesh").is_some()
 }
 
 pub fn encrypt_overlay(app: &App) -> bool {
@@ -92,7 +101,7 @@ fn remote_docker(ip: &str, secret: &str) -> Result<bollard::Docker> {
     let key = hyper::header::HeaderValue::from_str(secret)?;
     Ok(bollard::Docker::connect_with_custom_transport(
         move |mut req: bollard::BollardRequest| {
-            req.headers_mut().insert("x-tugport-agent-key", key.clone());
+            req.headers_mut().insert(AGENT_KEY, key.clone());
             let client = client.clone();
             async move { client.request(req).await.map_err(bollard::errors::Error::from) }
         },
@@ -104,22 +113,18 @@ fn remote_docker(ip: &str, secret: &str) -> Result<bollard::Docker> {
 
 fn node_secret(app: &App, id: &str) -> Result<String> {
     let key = format!("nodekey:{id}");
-    let sealed = app.db.get_state(&key)?.ok_or_else(|| anyhow!("no agent key stored"))?;
-    Ok(app.keys.open_str(&key, &crate::crypto::unb64(&sealed)?)?.to_string())
+    Ok(app.sealed_state(&key, &key)?.ok_or_else(|| anyhow!("no agent key stored"))?.to_string())
 }
 
 /// Load nodes from the database (the local node always exists).
 #[allow(clippy::type_complexity)]
 pub fn load(app: &App) -> Result<()> {
-    app.db.conn().execute(
+    app.db.exec(
         "INSERT OR IGNORE INTO nodes (id, name, is_local, status, created_at) VALUES ('local', ?1, 1, 'online', ?2)",
         params![hostname(), util::now()],
     )?;
-    let rows: Vec<(String, String, bool, Option<String>, Option<String>, String, bool)> = {
-        let conn = app.db.conn();
-        let mut stmt = conn.prepare("SELECT id, name, is_local, mesh_ip, region, labels, ingress FROM nodes")?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?
-    };
+    let rows: Vec<(String, String, bool, Option<String>, Option<String>, String, bool)> =
+        app.db.rows("SELECT id, name, is_local, mesh_ip, region, labels, ingress FROM nodes", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?;
     let mut map = HashMap::new();
     for (id, name, local, mesh_ip, region, labels, ingress) in rows {
         let (docker, secret) = if local {
@@ -155,7 +160,7 @@ async fn sh(cmd: &str) -> Result<String> {
 }
 
 /// Turn on the mesh on the panel's server: WireGuard, swarm over the mesh, image registry.
-pub async fn ensure_mesh(app: &App) -> Result<()> {
+async fn ensure_mesh(app: &App) -> Result<()> {
     if !mesh::available() {
         bail!("WireGuard tools are missing; install wireguard-tools and try again");
     }
@@ -164,22 +169,16 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
         None => {
             let (private_key, public_key) = mesh::keypair()?;
             let ip = tokio::task::spawn_blocking(crate::public_address).await?.ok_or_else(|| anyhow!("could not find this server's address"))?;
-            let swarm = sh("docker info --format '{{.Swarm.LocalNodeState}} {{.Swarm.NodeAddr}}'").await.unwrap_or_default();
-            let encrypt_overlay = swarm.starts_with("active") && !swarm.contains(mesh::PANEL_IP);
+            let swarm = app.docker.info().await.ok().and_then(|i| i.swarm).unwrap_or_default();
+            let encrypt_overlay = swarm.local_node_state == Some(LocalNodeState::ACTIVE) && swarm.node_addr.as_deref() != Some(mesh::PANEL_IP);
             MeshState { private_key, public_key, endpoint: format!("{ip}:{}", mesh::PORT), encrypt_overlay }
         }
     };
     let key_file = app.paths.etc.join("wg.key");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&key_file)?;
-        f.write_all(state.private_key.as_bytes())?;
-    }
+    util::write_private(&key_file, state.private_key.as_bytes())?;
     mesh::guard()?;
     mesh::up(&key_file, mesh::PANEL_IP)?;
-    let swarm = sh("docker info --format '{{.Swarm.LocalNodeState}}'").await?;
-    if swarm.trim() != "active" {
+    if !swarm_active(&app.docker).await? {
         sh(&format!("docker swarm init --advertise-addr {ip} --data-path-addr {ip} --listen-addr {ip}:2377", ip = mesh::PANEL_IP))
             .await
             .context("starting swarm mode for overlay networks")?;
@@ -188,9 +187,8 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
     // directly, so remove any leftover container and its cache.
     let _ = sh("docker rm -f tugport-registry; docker volume rm tugport-registry").await;
     let first = !mesh_enabled(app);
-    let sealed = app.keys.seal_str("mesh", &serde_json::to_string(&state)?)?;
-    app.db.set_state("mesh", &crate::crypto::b64(&sealed))?;
-    app.db.conn().execute("UPDATE nodes SET mesh_ip = ?1 WHERE id = 'local'", [mesh::PANEL_IP])?;
+    app.set_sealed_state("mesh", "mesh", &serde_json::to_string(&state)?)?;
+    app.db.exec("UPDATE nodes SET mesh_ip = ?1 WHERE id = 'local'", [mesh::PANEL_IP])?;
     set_peers(app)?;
     load(app)?;
     if first {
@@ -199,6 +197,11 @@ pub async fn ensure_mesh(app: &App) -> Result<()> {
         runtime::move_to_overlays(app).await?;
     }
     Ok(())
+}
+
+/// Whether this server's Docker is in swarm mode.
+pub async fn swarm_active(docker: &bollard::Docker) -> Result<bool> {
+    Ok(docker.info().await?.swarm.and_then(|s| s.local_node_state) == Some(LocalNodeState::ACTIVE))
 }
 
 /// After a reboot: the mesh interface and its peers come back before anything uses them.
@@ -259,18 +262,11 @@ pub struct JoinToken {
     pub expires_at: i64,
 }
 
-pub async fn join_token(app: &App, panel_url: &str) -> Result<JoinToken> {
-    join_token_for(app, panel_url, None).await
-}
-
 /// Keys a join derives from its one-time token. The token itself never crosses the
 /// network: a new server sends `id`, proves it holds the token with `proof` (bound to its
 /// WireGuard key), and the panel's answer is sealed with `response`. Plain HTTP is safe.
-pub fn join_secret(token: &str, label: &str) -> Result<[u8; 32]> {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(token.trim().as_bytes()).map_err(|e| anyhow!("{e}"))?;
-    mac.update(label.as_bytes());
-    Ok(mac.finalize().into_bytes().into())
+pub fn join_secret(token: &str, label: &str) -> [u8; 32] {
+    util::hmac_sha256(token.trim(), label)
 }
 
 /// A one-hour join command; `cloud` ties it to a machine Tugport is creating.
@@ -278,7 +274,7 @@ pub async fn join_token_for(app: &App, panel_url: &str, cloud: Option<&str>) -> 
     ensure_mesh(app).await?;
     let token = util::token(40);
     let expires_at = util::now() + 3600;
-    let key = format!("jointoken:{}", hex::encode(join_secret(&token, "id")?));
+    let key = format!("jointoken:{}", hex::encode(join_secret(&token, "id")));
     let sealed = crate::crypto::b64(&app.keys.seal_str(&key, &token)?);
     app.db.set_state(&key, &json!({ "expires_at": expires_at, "cloud": cloud, "token": sealed }).to_string())?;
     Ok(JoinToken {
@@ -312,7 +308,7 @@ pub struct JoinResponse {
 }
 
 /// Addresses only reachable inside one network (private, shared, link-local, loopback).
-fn local_only(ip: std::net::IpAddr) -> bool {
+pub fn local_only(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || (v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64),
         std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
@@ -330,7 +326,8 @@ fn reachable_endpoint(claimed: Option<&str>, seen: Option<std::net::IpAddr>) -> 
     }
 }
 
-pub async fn join(app: &AppState, req: JoinRequest, panel_ip: Option<std::net::IpAddr>, seen: Option<std::net::IpAddr>) -> Result<JoinEnvelope> {
+/// The token a join request proves it holds, used up: (token, the cloud machine it was made for).
+fn redeem(app: &App, req: &JoinRequest) -> Result<(zeroize::Zeroizing<String>, Option<String>)> {
     let invalid = || anyhow!("this join command is not valid; make a new one in the panel");
     if req.token_id.len() != 64 || !req.token_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(invalid());
@@ -338,54 +335,61 @@ pub async fn join(app: &AppState, req: JoinRequest, panel_ip: Option<std::net::I
     let key = format!("jointoken:{}", req.token_id);
     let stored: Value = app.db.get_state(&key)?.and_then(|v| serde_json::from_str(&v).ok()).ok_or_else(invalid)?;
     let token = app.keys.open_str(&key, &crate::crypto::unb64(stored["token"].as_str().unwrap_or_default())?).map_err(|_| invalid())?;
-    let proof = hex::encode(join_secret(&token, &format!("proof:{}", req.wg_public_key))?);
+    let proof = hex::encode(join_secret(&token, &format!("proof:{}", req.wg_public_key)));
     if !util::ct_eq(&proof, req.proof.trim()) {
         return Err(invalid());
     }
-    app.db.conn().execute("DELETE FROM state WHERE key = ?1", [&key])?;
+    app.db.del_state(&key)?;
     if stored["expires_at"].as_i64().unwrap_or(0) < util::now() {
         bail!("this join command expired; make a new one in the panel");
     }
-    let cloud = stored["cloud"].as_str().map(String::from);
+    Ok((token, stored["cloud"].as_str().map(String::from)))
+}
+
+/// Record a joining server under the next free mesh address and a name no other server has.
+/// One lock for picking the address and taking it, so simultaneous joins never share one.
+fn add_node(app: &App, node_id: &str, req: &JoinRequest, seen: Option<std::net::IpAddr>) -> Result<(String, String)> {
+    let conn = app.db.conn();
+    let used: HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT mesh_ip FROM nodes WHERE mesh_ip IS NOT NULL")?;
+        stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    };
+    let index = (2..60000).find(|i| !used.contains(&mesh::mesh_ip(*i))).ok_or_else(|| anyhow!("the mesh is full"))?;
+    let mesh_ip = mesh::mesh_ip(index);
+    let mut name = server_name(&req.name).unwrap_or_else(|| format!("server-{index}"));
+    let taken: bool = conn.query_row("SELECT COUNT(*) > 0 FROM nodes WHERE name = ?1", [&name], |r| r.get(0))?;
+    if taken {
+        name = format!("{name}-{index}");
+    }
+    conn.execute(
+        "INSERT INTO nodes (id, name, is_local, address, mesh_ip, wg_public_key, status, info, created_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'joining', ?6, ?7)",
+        params![node_id, name, reachable_endpoint(req.endpoint.as_deref(), seen), mesh_ip, req.wg_public_key, req.info.to_string(), util::now()],
+    )?;
+    Ok((mesh_ip, name))
+}
+
+pub async fn join(app: &AppState, req: JoinRequest, panel_ip: Option<std::net::IpAddr>, seen: Option<std::net::IpAddr>) -> Result<JoinEnvelope> {
+    let (token, cloud) = redeem(app, &req)?;
     if crate::crypto::unb64(&req.wg_public_key).map(|k| k.len()).unwrap_or(0) != 32 {
         bail!("invalid WireGuard key");
     }
     let node_id = util::id();
     let secret = util::token(40);
-    // One lock for picking the address and taking it, so simultaneous joins never share one.
-    let (mesh_ip, name) = {
-        let conn = app.db.conn();
-        let used: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT mesh_ip FROM nodes WHERE mesh_ip IS NOT NULL")?;
-            stmt.query_map([], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
-        };
-        let index = (2..60000).find(|i| !used.contains(&mesh::mesh_ip(*i))).ok_or_else(|| anyhow!("the mesh is full"))?;
-        let mesh_ip = mesh::mesh_ip(index);
-        let mut name = server_name(&req.name).unwrap_or_else(|| format!("server-{index}"));
-        let taken: bool = conn.query_row("SELECT COUNT(*) > 0 FROM nodes WHERE name = ?1", [&name], |r| r.get(0))?;
-        if taken {
-            name = format!("{name}-{index}");
-        }
-        conn.execute(
-            "INSERT INTO nodes (id, name, is_local, address, mesh_ip, wg_public_key, status, info, created_at) VALUES (?1, ?2, 0, ?3, ?4, ?5, 'joining', ?6, ?7)",
-            params![node_id, name, reachable_endpoint(req.endpoint.as_deref(), seen), mesh_ip, req.wg_public_key, req.info.to_string(), util::now()],
-        )?;
-        (mesh_ip, name)
-    };
-    let sealed = app.keys.seal_str(&format!("nodekey:{node_id}"), &secret)?;
-    app.db.set_state(&format!("nodekey:{node_id}"), &crate::crypto::b64(&sealed))?;
+    let (mesh_ip, name) = add_node(app, &node_id, &req, seen)?;
+    let key = format!("nodekey:{node_id}");
+    app.set_sealed_state(&key, &key, &secret)?;
     if let Some(ip) = panel_ip.filter(|ip| !ip.is_loopback()) {
         app.db.set_state(&format!("panelep:{node_id}"), &SocketAddr::new(ip, mesh::PORT).to_string())?;
     }
     if let Some(machine) = &cloud {
         // A machine Tugport created: it gets its region and its pool's labels.
-        app.db.conn().execute(
+        app.db.exec(
             "UPDATE nodes SET region = (SELECT region FROM cloud_servers WHERE id = ?1),
                labels = COALESCE((SELECT p.labels FROM server_pools p JOIN cloud_servers c ON c.pool_id = p.id WHERE c.id = ?1), '{}')
              WHERE id = ?2",
             params![machine, node_id],
         )?;
-        app.db.conn().execute("UPDATE cloud_servers SET node_id = ?1, status = 'joined' WHERE id = ?2", params![node_id, machine])?;
+        app.db.exec("UPDATE cloud_servers SET node_id = ?1, status = 'joined' WHERE id = ?2", params![node_id, machine])?;
     }
     set_peers(app)?;
     load(app)?;
@@ -396,7 +400,7 @@ pub async fn join(app: &AppState, req: JoinRequest, panel_ip: Option<std::net::I
     app.audit(None, "node.join", None, None, Some(&name), Some(&mesh_ip));
     app.emit("nodes", None, None, json!({ "joined": name }));
     let response = JoinResponse { node_id, mesh_ip, secret, peers, swarm_token };
-    let sealed = crate::crypto::Keyring::new(&join_secret(&token, "response")?).seal_str("join", &serde_json::to_string(&response)?)?;
+    let sealed = crate::crypto::Keyring::new(&join_secret(&token, "response")).seal_str("join", &serde_json::to_string(&response)?)?;
     Ok(JoinEnvelope { sealed: crate::crypto::b64(&sealed) })
 }
 
@@ -425,10 +429,17 @@ fn server_name(host: &str) -> Option<String> {
 
 /// Call a node agent over the mesh.
 pub async fn agent(node: &NodeHandle, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
-    let ip = node.mesh_ip.as_deref().ok_or_else(|| anyhow!("{} is not on the mesh", node.name))?;
-    let secret = node.secret.as_deref().ok_or_else(|| anyhow!("{} has no agent key", node.name))?;
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
-    let mut req = client.request(method, format!("http://{ip}:{AGENT_PORT}{path}")).header("x-tugport-agent-key", secret);
+    let (ip, secret) = node.reach()?;
+    // One client for every call; no idle connections, so each call connects afresh as before.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = match CLIENT.get() {
+        Some(c) => c,
+        None => {
+            let c = util::http(30).pool_max_idle_per_host(0).build()?;
+            CLIENT.get_or_init(|| c)
+        }
+    };
+    let mut req = client.request(method, format!("http://{ip}:{AGENT_PORT}{path}")).header(AGENT_KEY, secret);
     if let Some(b) = body {
         req = req.json(&b);
     }
@@ -444,17 +455,18 @@ pub async fn agent(node: &NodeHandle, method: reqwest::Method, path: &str, body:
 }
 
 /// Services whose replicas were placed on `node` by their last rollout or scaling.
-fn placed_on(app: &App, node: &str) -> std::collections::HashSet<String> {
-    let conn = app.db.conn();
-    let Ok(mut stmt) = conn.prepare("SELECT key, value FROM state WHERE key LIKE 'nodes:%'") else { return Default::default() };
-    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map(|rows| {
-            rows.filter_map(|r| r.ok())
-                .filter(|(_, nodes)| nodes.split(',').any(|n| n == node))
-                .filter_map(|(k, _)| k.strip_prefix("nodes:").map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+fn placed_on(app: &App, node: &str) -> HashSet<String> {
+    let rows = app.db.rows("SELECT key, value FROM state WHERE key LIKE 'nodes:%'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
+    rows.unwrap_or_default()
+        .into_iter()
+        .filter(|(_, nodes)| nodes.split(',').any(|n| n == node))
+        .filter_map(|(k, _)| k.strip_prefix("nodes:").map(String::from))
+        .collect()
+}
+
+/// Whether the last rollout or scaling of a service placed replicas on `node`.
+fn placed_there(app: &App, service_id: &str, node: &str) -> Result<bool> {
+    Ok(app.db.get_state(&format!("nodes:{service_id}"))?.is_some_and(|n| n.split(',').any(|id| id == node)))
 }
 
 /// Where each node's proxy listens on the mesh (for forwarding between servers).
@@ -477,51 +489,52 @@ fn table_for(table: &crate::proxy::Table, n: &NodeHandle) -> Value {
     serde_json::to_value(t).unwrap_or_default()
 }
 
-/// Send the routing table to every server and wait until they have it.
-pub async fn push_routes_now(app: &App) {
-    let table = app.proxy.table();
-    let pushes = remote(app).into_iter().map(|n| {
-        let body = table_for(&table, &n);
-        async move {
-            if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/routes", Some(body)).await {
-                tracing::debug!("pushing routes to {}: {e:#}", n.name);
-            }
-        }
-    });
-    futures_util::future::join_all(pushes).await;
-}
-
-pub fn push_routes(app: &App) {
-    let table = app.proxy.table();
-    for n in remote(app) {
-        let body = table_for(&table, &n);
-        tokio::spawn(async move {
-            if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/routes", Some(body)).await {
-                tracing::debug!("pushing routes to {}: {e:#}", n.name);
-            }
-        });
+/// PUT `body` to `/agent/<what>` on a server; one that is away only gets a debug line.
+async fn push(n: Arc<NodeHandle>, what: &'static str, body: Value) {
+    if let Err(e) = agent(&n, reqwest::Method::PUT, &format!("/agent/{what}"), Some(body)).await {
+        tracing::debug!("pushing {what} to {}: {e:#}", n.name);
     }
 }
 
-pub fn push_peers(app: &AppState) {
+/// One push of the current routing table per server.
+fn route_pushes(app: &App) -> Vec<impl Future<Output = ()> + use<>> {
+    let table = app.proxy.table();
+    remote(app)
+        .into_iter()
+        .map(|n| {
+            let body = table_for(&table, &n);
+            push(n, "routes", body)
+        })
+        .collect()
+}
+
+/// Send the routing table to every server and wait until they have it.
+pub async fn push_routes_now(app: &App) {
+    futures_util::future::join_all(route_pushes(app)).await;
+}
+
+pub fn push_routes(app: &App) {
+    for p in route_pushes(app) {
+        tokio::spawn(p);
+    }
+}
+
+fn push_peers(app: &AppState) {
     for n in remote(app) {
         let Ok(peers) = peers_of_agent(app, &n.id) else { continue };
-        let body = serde_json::to_value(&peers).unwrap_or_default();
-        tokio::spawn(async move {
-            if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/peers", Some(body)).await {
-                tracing::debug!("pushing peers to {}: {e:#}", n.name);
-            }
-        });
+        tokio::spawn(push(n, "peers", serde_json::to_value(&peers).unwrap_or_default()));
     }
 }
 
 /// Certificates go to the servers that may terminate public traffic (ingress). A plain worker
 /// only ever serves requests already forwarded from an ingress server, so it needs none.
 pub async fn push_certs(app: &App) {
-    let rows: Vec<(String, String, Vec<u8>)> = {
-        let conn = app.db.conn();
-        let Ok(mut stmt) = conn.prepare("SELECT host, cert_pem, key_pem FROM certificates WHERE cert_pem IS NOT NULL") else { return };
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    let rows = match crate::acme::stored(app) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("reading certificates to push: {e}");
+            return;
+        }
     };
     // Other servers forward the panel's domain to the panel; they never need its key, and one
     // that is compromised could otherwise pass for the panel.
@@ -530,14 +543,12 @@ pub async fn push_certs(app: &App) {
         .into_iter()
         .filter(|(host, _, _)| panel.as_deref().is_none_or(|p| !p.eq_ignore_ascii_case(host)))
         .filter_map(|(host, cert, key)| {
-            let key = app.keys.open_str(&format!("cert:{host}"), &key).ok()?;
+            let key = app.keys.open_str(&crate::acme::key_context(&host), &key).ok()?;
             Some(json!({ "host": host, "cert": cert, "key": key.as_str() }))
         })
         .collect();
     for n in remote(app).into_iter().filter(|n| n.ingress) {
-        if let Err(e) = agent(&n, reqwest::Method::PUT, "/agent/certs", Some(Value::Array(certs.clone()))).await {
-            tracing::debug!("pushing certificates to {}: {e:#}", n.name);
-        }
+        push(n, "certs", Value::Array(certs.clone())).await;
     }
 }
 
@@ -573,15 +584,13 @@ pub async fn forget_secrets(app: &App, node: &str, container: &str) {
 pub fn docker_cli(app: &App, node: &str) -> Result<tokio::process::Command> {
     let mut c = tokio::process::Command::new("docker");
     let Some(n) = app.node(node).filter(|n| !n.local) else { return Ok(c) };
-    let (Some(ip), Some(secret)) = (n.mesh_ip.as_deref(), n.secret.as_deref()) else { bail!("{} is not on the mesh", n.name) };
+    let (ip, secret) = n.reach()?;
     let dir = app.paths.run.join("docker").join(&n.id);
-    if !dir.join("config.json").exists() {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+    let config = dir.join("config.json");
+    if !config.exists() {
         std::fs::create_dir_all(&dir)?;
         crate::paths::restrict(&dir, 0o700)?;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(dir.join("config.json"))?;
-        f.write_all(json!({ "HttpHeaders": { "x-tugport-agent-key": secret } }).to_string().as_bytes())?;
+        util::write_private(&config, json!({ "HttpHeaders": { AGENT_KEY: secret } }).to_string().as_bytes())?;
     }
     c.env("DOCKER_HOST", format!("tcp://{ip}:{DOCKER_PORT}")).env("DOCKER_CONFIG", &dir);
     Ok(c)
@@ -619,8 +628,7 @@ where
 /// mesh it could not bind its mesh address: a manager stays in an error state and a worker
 /// stays pending, deploys fail with "not a swarm manager", and only a Docker restart with the
 /// mesh up recovers. A worker gets two minutes in pending, the time a normal join takes.
-fn swarm_issue(state: Option<bollard::models::LocalNodeState>, error: Option<&str>, pending_for: Duration) -> Option<String> {
-    use bollard::models::LocalNodeState;
+fn swarm_issue(state: Option<LocalNodeState>, error: Option<&str>, pending_for: Duration) -> Option<String> {
     const FIX: &str = "If Docker started before the private network between servers (after a reboot), run `systemctl restart docker` on this server.";
     match state? {
         LocalNodeState::ERROR => Some(match error.map(str::trim).filter(|e| !e.is_empty()) {
@@ -637,7 +645,6 @@ fn swarm_issue(state: Option<bollard::models::LocalNodeState>, error: Option<&st
 
 /// [`swarm_issue`] for Docker's current info, logged once when it starts and when it clears.
 pub fn swarm_problem(info: Option<&bollard::models::SystemInfo>) -> Option<String> {
-    use bollard::models::LocalNodeState;
     // (pending since, last problem)
     static SEEN: Mutex<(Option<std::time::Instant>, bool)> = Mutex::new((None, false));
     let swarm = info?.swarm.as_ref();
@@ -656,6 +663,19 @@ pub fn swarm_problem(info: Option<&bollard::models::SystemInfo>) -> Option<Strin
     }
     seen.1 = problem.is_some();
     problem
+}
+
+/// Put back the iptables rules that keep containers off the mesh (Docker restarts and firewall
+/// reloads drop them). Returns Docker's info, read on the way.
+pub async fn guard_mesh(docker: &bollard::Docker) -> Option<bollard::models::SystemInfo> {
+    if let Err(e) = mesh::guard() {
+        tracing::error!("{e:#}");
+    }
+    let info = docker.info().await.ok();
+    if let Err(e) = mesh::guard_swarm(info.as_ref().and_then(|i| i.swarm.as_ref()?.node_addr.as_deref())) {
+        tracing::error!("{e:#}");
+    }
+    info
 }
 
 /// What a server reports about itself (agents in their health, the panel for its own).
@@ -699,7 +719,7 @@ pub async fn health_loop(app: AppState) {
         tokio::time::sleep(Duration::from_secs(10)).await;
         ticks += 1;
         let own = host_info(&app).await;
-        let _ = app.db.conn().execute("UPDATE nodes SET info = ?1, last_seen_at = ?2 WHERE id = 'local'", params![own.to_string(), util::now()]);
+        let _ = app.db.exec("UPDATE nodes SET info = ?1, last_seen_at = ?2 WHERE id = 'local'", params![own.to_string(), util::now()]);
         // Docker restarts and firewall reloads drop iptables rules.
         if ticks.is_multiple_of(6) {
             // A server without a usable iptables would repeat the same error every minute.
@@ -709,99 +729,13 @@ pub async fn health_loop(app: AppState) {
             }
             panel_guard_error = error;
             if mesh_enabled(&app) {
-                if let Err(e) = mesh::guard() {
-                    tracing::error!("{e:#}");
-                }
-                let info = app.docker.info().await.ok();
-                if let Err(e) = mesh::guard_swarm(info.as_ref().and_then(|i| i.swarm.as_ref()?.node_addr.as_deref())) {
-                    tracing::error!("{e:#}");
-                }
+                guard_mesh(&app.docker).await;
             }
         }
         for n in remote(&app) {
-            let now = util::now();
             match agent(&n, reqwest::Method::GET, "/agent/health", None).await {
-                Ok(h) => {
-                    let (was, info): (String, String) =
-                        app.db.conn().query_row("SELECT status, info FROM nodes WHERE id = ?1", [&n.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap_or_default();
-                    let old_boot = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["boot_id"].as_str().map(String::from));
-                    // A reboot empties the server's /run, and with it every container's secrets.
-                    let rebooted = old_boot.is_some_and(|b| Some(b.as_str()) != h["boot_id"].as_str());
-                    // Only ingress servers terminate public traffic, so only their counts are
-                    // trusted; a worker's reported traffic (it should report none) is ignored, so
-                    // it cannot drive autoscaling or keep a sleeping service awake.
-                    if n.ingress
-                        && let Ok(mut t) = serde_json::from_value::<HashMap<String, crate::proxy::Traffic>>(h["traffic"].clone())
-                    {
-                        let known: std::collections::HashSet<String> = store::services(&app, None).map(|l| l.into_iter().map(|s| s.id).collect()).unwrap_or_default();
-                        t.retain(|sid, _| known.contains(sid));
-                        t.values_mut().for_each(|x| x.last_at = x.last_at.min(now));
-                        util::lock(&app.proxy.remote_traffic).insert(n.id.clone(), t);
-                    } else {
-                        util::lock(&app.proxy.remote_traffic).remove(&n.id);
-                    }
-                    let mut h = h;
-                    if let Some(o) = h.as_object_mut() {
-                        o.remove("traffic");
-                    }
-                    let _ = app.db.conn().execute("UPDATE nodes SET status = 'online', last_seen_at = ?1, info = ?2 WHERE id = ?3", params![now, h.to_string(), n.id]);
-                    if was != "online" || rebooted {
-                        tracing::info!("server {} is online", n.name);
-                        app.emit("nodes", None, None, json!({ "online": n.name }));
-                        crate::proxy::reload(&app);
-                        push_routes(&app);
-                        push_certs(&app).await;
-                        // A short blip changes nothing; a long absence or a reboot needs repair.
-                        if (was != "unreachable" || rebooted)
-                            && let Err(e) = restore(&app, &n).await
-                        {
-                            tracing::warn!("restoring {}: {e:#}", n.name);
-                        }
-                    }
-                    if let Ok(snap) = agent(&n, reqwest::Method::GET, "/agent/metrics", None).await
-                        && let Ok(mut snap) = serde_json::from_value::<crate::metrics::Snapshot>(snap)
-                    {
-                        // About itself only: services placed there, on the panel's clock (a future
-                        // time would never expire), within sane sizes.
-                        let here = placed_on(&app, &n.id);
-                        snap.services.retain(|s| here.contains(&s.id));
-                        snap.at = now;
-                        snap.cores.truncate(1024);
-                        snap.disks.truncate(64);
-                        snap.gpus.truncate(16);
-                        if let Err(e) = crate::metrics::store_for(&app, &n.id, &snap) {
-                            tracing::debug!("storing metrics of {}: {e:#}", n.name);
-                        }
-                        crate::alerts::evaluate(&app, Some(&n), &snap).await;
-                        util::lock(&app.metrics.nodes).insert(n.id.clone(), snap);
-                    }
-                }
-                Err(e) => {
-                    // Traffic and new replicas avoid it from the first failed check.
-                    let dropped = app.db.conn().execute("UPDATE nodes SET status = 'unreachable' WHERE id = ?1 AND status = 'online'", [&n.id]).unwrap_or(0);
-                    if dropped > 0 {
-                        tracing::info!("server {} stopped answering: {e:#}", n.name);
-                        app.emit("nodes", None, None, json!({ "unreachable": n.name }));
-                        crate::proxy::reload(&app);
-                    }
-                    // A server that just joined counts from when it joined.
-                    let last: Option<i64> =
-                        app.db.conn().query_row("SELECT COALESCE(last_seen_at, created_at) FROM nodes WHERE id = ?1", [&n.id], |r| r.get(0)).optional().ok().flatten();
-                    let gone = now - last.unwrap_or(now);
-                    if gone > 30 {
-                        let changed = app.db.conn().execute("UPDATE nodes SET status = 'offline' WHERE id = ?1 AND status != 'offline'", [&n.id]).unwrap_or(0);
-                        if changed > 0 {
-                            tracing::warn!("server {} is offline: {e:#}", n.name);
-                            app.emit("nodes", None, None, json!({ "offline": n.name }));
-                            crate::notify::event(&app, "node.offline", &format!("Server {} is offline", n.name), &format!("{e:#}"), None).await;
-                        }
-                    }
-                    let key = format!("rescheduled:{}", n.id);
-                    if gone > RESCHEDULE_AFTER_S && app.db.get_state(&key).ok().flatten().is_none() {
-                        let _ = app.db.set_state(&key, &now.to_string());
-                        reschedule(&app, &n).await;
-                    }
-                }
+                Ok(h) => answered(&app, &n, h).await,
+                Err(e) => silent(&app, &n, &e).await,
             }
         }
         if ticks.is_multiple_of(30) {
@@ -812,13 +746,95 @@ pub async fn health_loop(app: AppState) {
     }
 }
 
+/// A server answered its health check with `h`.
+async fn answered(app: &AppState, n: &Arc<NodeHandle>, mut h: Value) {
+    let now = util::now();
+    let (was, info): (String, String) = app.db.row("SELECT status, info FROM nodes WHERE id = ?1", [&n.id], |r| Ok((r.get(0)?, r.get(1)?))).ok().flatten().unwrap_or_default();
+    let old_boot = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["boot_id"].as_str().map(String::from));
+    // A reboot empties the server's /run, and with it every container's secrets.
+    let rebooted = old_boot.is_some_and(|b| Some(b.as_str()) != h["boot_id"].as_str());
+    let traffic = h.as_object_mut().and_then(|o| o.remove("traffic")).unwrap_or_default();
+    // Only ingress servers terminate public traffic, so only their counts are trusted; a
+    // worker's reported traffic (it should report none) is ignored, so it cannot drive
+    // autoscaling or keep a sleeping service awake.
+    if n.ingress
+        && let Ok(mut t) = serde_json::from_value::<HashMap<String, crate::proxy::Traffic>>(traffic)
+    {
+        let known: HashSet<String> = store::services(app, None).map(|l| l.into_iter().map(|s| s.id).collect()).unwrap_or_default();
+        t.retain(|sid, _| known.contains(sid));
+        t.values_mut().for_each(|x| x.last_at = x.last_at.min(now));
+        util::lock(&app.proxy.remote_traffic).insert(n.id.clone(), t);
+    } else {
+        util::lock(&app.proxy.remote_traffic).remove(&n.id);
+    }
+    let _ = app.db.exec("UPDATE nodes SET status = 'online', last_seen_at = ?1, info = ?2 WHERE id = ?3", params![now, h.to_string(), n.id]);
+    if was != "online" || rebooted {
+        tracing::info!("server {} is online", n.name);
+        app.emit("nodes", None, None, json!({ "online": n.name }));
+        crate::proxy::reload(app);
+        push_routes(app);
+        push_certs(app).await;
+        // A short blip changes nothing; a long absence or a reboot needs repair.
+        if (was != "unreachable" || rebooted)
+            && let Err(e) = restore(app, n).await
+        {
+            tracing::warn!("restoring {}: {e:#}", n.name);
+        }
+    }
+    if let Ok(snap) = agent(n, reqwest::Method::GET, "/agent/metrics", None).await
+        && let Ok(mut snap) = serde_json::from_value::<crate::metrics::Snapshot>(snap)
+    {
+        // About itself only: services placed there, on the panel's clock (a future time would
+        // never expire), within sane sizes.
+        let here = placed_on(app, &n.id);
+        snap.services.retain(|s| here.contains(&s.id));
+        snap.at = now;
+        snap.cores.truncate(1024);
+        snap.disks.truncate(64);
+        snap.gpus.truncate(16);
+        if let Err(e) = crate::metrics::store_for(app, &n.id, &snap) {
+            tracing::debug!("storing metrics of {}: {e:#}", n.name);
+        }
+        crate::alerts::evaluate(app, Some(n), &snap).await;
+        util::lock(&app.metrics.nodes).insert(n.id.clone(), snap);
+    }
+}
+
+/// A server did not answer its health check: unreachable at once, offline after 30 seconds,
+/// and its movable services started elsewhere after `RESCHEDULE_AFTER_S`.
+async fn silent(app: &AppState, n: &NodeHandle, e: &anyhow::Error) {
+    let now = util::now();
+    // Traffic and new replicas avoid it from the first failed check.
+    let dropped = app.db.exec("UPDATE nodes SET status = 'unreachable' WHERE id = ?1 AND status = 'online'", [&n.id]).unwrap_or(0);
+    if dropped > 0 {
+        tracing::info!("server {} stopped answering: {e:#}", n.name);
+        app.emit("nodes", None, None, json!({ "unreachable": n.name }));
+        crate::proxy::reload(app);
+    }
+    // A server that just joined counts from when it joined.
+    let last: Option<i64> = app.db.row("SELECT COALESCE(last_seen_at, created_at) FROM nodes WHERE id = ?1", [&n.id], |r| r.get(0)).ok().flatten();
+    let gone = now - last.unwrap_or(now);
+    if gone > 30 {
+        let changed = app.db.exec("UPDATE nodes SET status = 'offline' WHERE id = ?1 AND status != 'offline'", [&n.id]).unwrap_or(0);
+        if changed > 0 {
+            tracing::warn!("server {} is offline: {e:#}", n.name);
+            app.emit("nodes", None, None, json!({ "offline": n.name }));
+            crate::notify::event(app, "node.offline", &format!("Server {} is offline", n.name), &format!("{e:#}"), None).await;
+        }
+    }
+    let key = format!("rescheduled:{}", n.id);
+    if gone > RESCHEDULE_AFTER_S && app.db.state::<String>(&key).is_none() {
+        let _ = app.db.set_state(&key, &now.to_string());
+        reschedule(app, n).await;
+    }
+}
+
 /// Services that ran on a server that went away start again on the others. Services
 /// keeping data there wait for it to come back.
 async fn reschedule(app: &AppState, node: &NodeHandle) {
     let Ok(services) = store::services(app, None) else { return };
     for s in services {
-        let placed = app.db.get_state(&format!("nodes:{}", s.id)).ok().flatten().unwrap_or_default();
-        if s.kind == "compose" || !placed.split(',').any(|id| id == node.id) || stopped(app, &s.id) {
+        if s.kind == "compose" || !placed_there(app, &s.id, &node.id).unwrap_or(false) || stopped(app, &s.id) {
             continue;
         }
         if is_pinned(&s) {
@@ -826,32 +842,39 @@ async fn reschedule(app: &AppState, node: &NodeHandle) {
             crate::notify::event(app, "node.offline", &format!("{}/{} is down", s.project, s.name), &msg, Some(&s)).await;
             continue;
         }
-        let Some(image) = runtime::live_deploy(app, &s.id).and_then(|d| crate::deploy::get(app, &d).ok().flatten()).and_then(|d| d.image) else { continue };
-        let req = crate::deploy::Request { trigger: "reschedule".into(), image: Some(image), ..Default::default() };
-        match crate::deploy::enqueue(app, &s, req) {
-            Ok(_) => tracing::info!("moving {}/{} off {}", s.project, s.name, node.name),
+        match redeploy(app, &s, "reschedule") {
+            Ok(false) => {}
+            Ok(true) => tracing::info!("moving {}/{} off {}", s.project, s.name, node.name),
             Err(e) => tracing::error!("moving {}/{} off {}: {e:#}", s.project, s.name, node.name),
         }
     }
 }
 
+/// Deploy a service's live image again, so placement picks its servers anew (false when
+/// nothing is live).
+fn redeploy(app: &AppState, s: &Service, trigger: &str) -> Result<bool> {
+    let Some(image) = runtime::live_image(app, &s.id) else { return Ok(false) };
+    crate::deploy::enqueue(app, s, crate::deploy::Request { trigger: trigger.into(), image: Some(image), ..Default::default() })?;
+    Ok(true)
+}
+
 /// Stopped by someone or asleep: nothing should start it on its own.
 pub fn stopped(app: &App, service_id: &str) -> bool {
-    app.db.get_state(&format!("stopped:{service_id}")).ok().flatten().is_some() || crate::sleep::is_asleep(app, service_id)
+    app.db.state::<String>(&format!("stopped:{service_id}")).is_some() || crate::sleep::is_asleep(app, service_id)
 }
 
 /// A server came back, perhaps rebooted, which empties the secrets in its /run: send them
 /// again, start what should run, and remove containers that were replaced meanwhile.
 async fn restore(app: &AppState, node: &NodeHandle) -> Result<()> {
-    let _ = app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("rescheduled:{}", node.id)]);
+    let _ = app.db.del_state(&format!("rescheduled:{}", node.id));
     let services: HashMap<String, Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
-    let filters = HashMap::from([("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)])]);
+    let filters = runtime::managed();
     let list = node.docker.list_containers(Some(ListContainersOptions { all: true, filters: Some(filters), ..Default::default() })).await?;
     let mut started = 0;
     for c in list {
         let labels = c.labels.unwrap_or_default();
         let (Some(id), Some(sid)) = (c.id, labels.get(runtime::L_SERVICE)) else { continue };
-        let name = c.names.and_then(|n| n.first().cloned()).unwrap_or_default().trim_start_matches('/').to_string();
+        let name = runtime::listed_name(c.names);
         let Some(s) = services.get(sid) else {
             runtime::remove(app, &node.id, &id, &name).await?;
             continue;
@@ -866,8 +889,7 @@ async fn restore(app: &AppState, node: &NodeHandle) -> Result<()> {
         }
         // The node lists its own containers: secrets go only to servers the service was placed on
         // (a deploy in progress delivers them to new servers itself).
-        let placed = app.db.get_state(&format!("nodes:{}", s.id))?.is_some_and(|n| n.split(',').any(|n| n == node.id));
-        if !placed {
+        if !placed_there(app, &s.id, &node.id)? {
             continue;
         }
         put_secrets(app, node, &name, s).await?;
@@ -888,7 +910,7 @@ pub fn online(app: &App, node_id: &str) -> bool {
     if node_id == "local" {
         return true;
     }
-    app.db.conn().query_row("SELECT status = 'online' FROM nodes WHERE id = ?1", [node_id], |r| r.get(0)).unwrap_or(false)
+    app.db.row("SELECT status = 'online' FROM nodes WHERE id = ?1", [node_id], |r| r.get(0)).ok().flatten().unwrap_or(false)
 }
 
 /// Remove a server from the mesh and the swarm.
@@ -897,12 +919,11 @@ pub async fn remove(app: &AppState, node_id: &str) -> Result<()> {
     if node.local {
         bail!("the panel's own server cannot be removed");
     }
-    let name = node.name.clone();
-    let info: String = app.db.conn().query_row("SELECT info FROM nodes WHERE id = ?1", [node_id], |r| r.get(0)).unwrap_or_default();
+    let info: String = app.db.row("SELECT info FROM nodes WHERE id = ?1", [node_id], |r| r.get(0)).ok().flatten().unwrap_or_default();
     let swarm_node = serde_json::from_str::<Value>(&info).ok().and_then(|i| i["swarm_node"].as_str().map(String::from));
     let _ = agent(&node, reqwest::Method::POST, "/agent/leave", None).await;
-    app.db.conn().execute("DELETE FROM nodes WHERE id = ?1", [node_id])?;
-    app.db.conn().execute(
+    app.db.exec("DELETE FROM nodes WHERE id = ?1", [node_id])?;
+    app.db.exec(
         "DELETE FROM state WHERE key IN (?1, ?2, ?3, ?4)",
         params![format!("nodekey:{node_id}"), format!("rescheduled:{node_id}"), format!("draining:{node_id}"), format!("panelep:{node_id}")],
     )?;
@@ -913,14 +934,14 @@ pub async fn remove(app: &AppState, node_id: &str) -> Result<()> {
     if let Some(id) = swarm_node {
         let _ = app.docker.delete_node(&id, Some(bollard::query_parameters::DeleteNodeOptions { force: true })).await;
     }
-    tracing::info!("removed server {name}");
+    tracing::info!("removed server {}", node.name);
     crate::proxy::reload(app);
     Ok(())
 }
 
 /// Whether services keep data on this server (it cannot be emptied by moving them).
 pub fn keeps_data(app: &App, node_id: &str) -> Result<bool> {
-    Ok(app.db.conn().query_row("SELECT COUNT(*) > 0 FROM state WHERE key LIKE 'pin:%' AND value = ?1", [node_id], |r| r.get(0))?)
+    Ok(app.db.row("SELECT COUNT(*) > 0 FROM state WHERE key LIKE 'pin:%' AND value = ?1", [node_id], |r| r.get(0))?.unwrap_or(false))
 }
 
 /// Empty a server before removing it: no new replicas there, and the ones it runs move.
@@ -928,13 +949,12 @@ pub async fn drain(app: &AppState, node_id: &str) -> Result<()> {
     app.db.set_state(&format!("draining:{node_id}"), &util::now().to_string())?;
     let mut moving = vec![];
     for s in store::services(app, None)? {
-        let placed = app.db.get_state(&format!("nodes:{}", s.id))?.unwrap_or_default();
-        if s.kind == "compose" || is_pinned(&s) || stopped(app, &s.id) || !placed.split(',').any(|id| id == node_id) {
+        if s.kind == "compose" || is_pinned(&s) || stopped(app, &s.id) || !placed_there(app, &s.id, node_id)? {
             continue;
         }
-        let Some(image) = runtime::live_deploy(app, &s.id).and_then(|d| crate::deploy::get(app, &d).ok().flatten()).and_then(|d| d.image) else { continue };
-        crate::deploy::enqueue(app, &s, crate::deploy::Request { trigger: "drain".into(), image: Some(image), ..Default::default() })?;
-        moving.push(s.id);
+        if redeploy(app, &s, "drain")? {
+            moving.push(s.id);
+        }
     }
     let started = std::time::Instant::now();
     while moving.iter().any(|id| app.deployer.busy(id)) {
@@ -951,7 +971,7 @@ pub fn eligible(app: &App, placement: &crate::model::Placement) -> Vec<Arc<NodeH
     app.all_nodes()
         .into_iter()
         .filter(|n| online(app, &n.id))
-        .filter(|n| app.db.get_state(&format!("draining:{}", n.id)).ok().flatten().is_none())
+        .filter(|n| app.db.state::<String>(&format!("draining:{}", n.id)).is_none())
         .filter(|n| placement.node.as_ref().is_none_or(|want| *want == n.id || *want == n.name))
         .filter(|n| placement.region.as_ref().is_none_or(|r| n.region.as_ref() == Some(r)))
         .filter(|n| placement.labels.iter().all(|(k, v)| n.labels.get(k) == Some(v)))
@@ -959,7 +979,7 @@ pub fn eligible(app: &App, placement: &crate::model::Placement) -> Vec<Arc<NodeH
 }
 
 /// Services whose data or host ports live on one server stay there.
-pub fn is_pinned(s: &Service) -> bool {
+fn is_pinned(s: &Service) -> bool {
     s.kind == "database"
         || s.spec.host_network
         || s.spec.docker_socket
@@ -986,7 +1006,7 @@ pub async fn place(app: &App, s: &Service, n: u32, existing: &[String]) -> Resul
         return Ok(vec![node; n as usize]);
     }
     // Spread replicas over as many servers as possible, then prefer the least busy.
-    let filters = HashMap::from([("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)])]);
+    let filters = runtime::managed();
     let mut slots = vec![];
     for c in candidates {
         let busy = c.docker.list_containers(Some(ListContainersOptions { filters: Some(filters.clone()), ..Default::default() })).await.map(|l| l.len()).unwrap_or(usize::MAX / 2);
@@ -1004,7 +1024,7 @@ pub async fn place(app: &App, s: &Service, n: u32, existing: &[String]) -> Resul
 }
 
 /// Make `image` available on a server: pulled there when it comes from a registry,
-/// otherwise sent through the panel's registry on the mesh (only missing layers travel).
+/// otherwise streamed from the panel's Docker.
 pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, log: &(dyn Fn(&str) + Sync)) -> Result<()> {
     if node.local || node.docker.inspect_image(image).await.is_ok() {
         return Ok(());
@@ -1026,18 +1046,13 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
         while let Some(chunk) = export.next().await {
             // An error (or a dropped receiver) stops the feed; the half-written tar then makes
             // `load` on the node fail, rather than loading a truncated image.
-            match chunk {
-                Ok(b) => {
-                    if tx.send(b).await.is_err() {
-                        return Ok(());
-                    }
-                }
-                Err(e) => return Err(anyhow::Error::from(e)),
+            if tx.send(chunk?).await.is_err() {
+                break;
             }
         }
-        Ok(())
+        anyhow::Ok(())
     });
-    let body = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) });
     let mut load = node.docker.import_image_stream(bollard::query_parameters::ImportImageOptions::default(), body, None);
     let mut load_err = None;
     while let Some(item) = load.next().await {
@@ -1045,11 +1060,7 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
             load_err = Some(anyhow::Error::from(e));
         }
     }
-    match feeder.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e.context(format!("reading {image} to send to {}", node.name))),
-        Err(e) => return Err(anyhow::Error::from(e).context("the image transfer task failed")),
-    }
+    feeder.await.context("the image transfer task failed")?.with_context(|| format!("reading {image} to send to {}", node.name))?;
     if let Some(e) = load_err {
         return Err(e.context(format!("loading {image} on {}", node.name)));
     }
@@ -1130,16 +1141,16 @@ mod tests {
     #[test]
     fn joins_never_reveal_the_token() {
         let token = "secret-token";
-        let id = hex::encode(join_secret(token, "id").unwrap());
+        let id = hex::encode(join_secret(token, "id"));
         assert!(!id.contains(token) && id.len() == 64);
         // A proof only fits the WireGuard key it was made for.
-        let proof = join_secret(token, "proof:KEY-A").unwrap();
-        assert_ne!(proof, join_secret(token, "proof:KEY-B").unwrap());
-        assert_ne!(proof, join_secret("other-token", "proof:KEY-A").unwrap());
+        let proof = join_secret(token, "proof:KEY-A");
+        assert_ne!(proof, join_secret(token, "proof:KEY-B"));
+        assert_ne!(proof, join_secret("other-token", "proof:KEY-A"));
         // Only the token holder opens the panel's answer.
-        let sealed = crate::crypto::Keyring::new(&join_secret(token, "response").unwrap()).seal_str("join", "{}").unwrap();
-        assert!(crate::crypto::Keyring::new(&join_secret(token, "response").unwrap()).open_str("join", &sealed).is_ok());
-        assert!(crate::crypto::Keyring::new(&join_secret("other-token", "response").unwrap()).open_str("join", &sealed).is_err());
+        let sealed = crate::crypto::Keyring::new(&join_secret(token, "response")).seal_str("join", "{}").unwrap();
+        assert!(crate::crypto::Keyring::new(&join_secret(token, "response")).open_str("join", &sealed).is_ok());
+        assert!(crate::crypto::Keyring::new(&join_secret("other-token", "response")).open_str("join", &sealed).is_err());
     }
 
     #[test]

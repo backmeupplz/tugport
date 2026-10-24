@@ -1,15 +1,38 @@
 import type { ComponentChildren } from "preact";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { route } from "preact-router";
+import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { FINAL, atLeast, del, get, hasGrant, nodeName, post, put, useApi, useEvent, useMe, useNodes, type Deploy, type Node, type Replica, type ServiceDetail } from "../api";
 import { EnvEditor } from "../env-editor";
-import { Action, Card, Check, CodeBlock, Empty, ErrorBox, Field, Loaded, Modal, Note, Page, Pill, Tabs, errText, toast, useSubmit } from "../ui";
+import { Icon } from "../icons";
+import { route } from "../router";
+import {
+  Action,
+  Card,
+  Check,
+  CodeBlock,
+  ConfirmName,
+  Empty,
+  ErrorBox,
+  FormButtons,
+  Input,
+  Loaded,
+  LoadingPage,
+  Modal,
+  Note,
+  Page,
+  Pill,
+  Rows,
+  Tabs,
+  TextArea,
+  errText,
+  toast,
+  useSubmit,
+} from "../ui";
 import { fmt } from "../charts";
 import { ago, bytes, clock, duration, qs, sumUsage, varName } from "../util";
 import { ReadReplicas, ReplicaOf } from "./database";
 import { Domains } from "./domains";
 import { DeployKey } from "./new-service";
-import { Console, Logs, ServiceMetrics, type Now } from "./observe";
+import { Console, Logs, ServiceMetrics, tailLines, useStickToBottom, type Now } from "./observe";
 import { sourceLabel } from "./projects";
 import { ServiceSettings } from "./service-settings";
 
@@ -45,6 +68,15 @@ export async function deploy(c: Ctx) {
   c.openLog(r.deploy_id);
 }
 
+/** Rolls back to a deploy (the previous image without one) and opens the rollback's log. */
+async function rollback(c: Ctx, deployId?: string) {
+  const r = await post<{ deploy_id: string }>(`/services/${c.d.service.id}/rollback`, deployId ? { deploy_id: deployId } : {});
+  c.openLog(r.deploy_id);
+}
+
+/** "push by alice · 5 minutes ago" */
+const started = (d: Deploy) => `${d.trigger}${d.actor ? ` by ${d.actor}` : ""} · ${ago(d.created_at)}`;
+
 /** "Saved" note with a button that applies the change through a new deploy. */
 export function RedeployNote(props: { c: Ctx; children: ComponentChildren }) {
   return (
@@ -59,7 +91,7 @@ export function RedeployNote(props: { c: Ctx; children: ComponentChildren }) {
   );
 }
 
-export function ServicePage(props: { project?: string; service?: string; tab?: string; path?: string }) {
+export function ServicePage(props: { project?: string; service?: string; tab?: string }) {
   const me = useMe();
   const sid = useRef("");
   // Replicas on a server that drops out vanish from the status without a container event.
@@ -68,13 +100,7 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
   const nodes = useNodes();
   const [logId, setLogId] = useState<string | null>(null);
   const d = r.data;
-  if (!d) {
-    return (
-      <Page title={props.service}>
-        <Loaded r={r}>{() => null}</Loaded>
-      </Page>
-    );
-  }
+  if (!d) return <LoadingPage title={props.service} r={r} />;
   const s = d.service;
   // Read replicas belong to primary databases; a replica follows one instead.
   const tabs = TABS.filter(([id]) => id !== "replicas" || (s.kind === "database" && !s.spec.database?.primary));
@@ -86,27 +112,24 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
   return (
     <Page
       title={s.name}
-      sub={
-        <span class="flex flex-wrap items-center gap-2">
-          <span>
-            <a class="link" href="/">
-              Projects
-            </a>{" "}
-            /{" "}
-            <a class="link" href={`/projects/${s.project}`}>
-              {s.project}
-            </a>{" "}
-            / {s.name}
-          </span>
-          <span class="chip">{s.kind}</span>
+      crumbs={[
+        ["Projects", "/"],
+        [s.project, `/projects/${s.project}`],
+      ]}
+      meta={
+        <>
           <Pill state={d.status.state} />
-          {site && (
-            <a class="link truncate" href={`${site.https ? "https" : "http"}://${site.host}${site.path}`} target="_blank" rel="noreferrer">
-              {site.host}
-              {site.path === "/" ? "" : site.path}
-            </a>
-          )}
-        </span>
+          <span class="chip">{s.kind}</span>
+        </>
+      }
+      sub={
+        site && (
+          <a class="inline-flex items-center gap-1.5 text-dim hover:text-text" href={`${site.https ? "https" : "http"}://${site.host}${site.path}`} target="_blank" rel="noreferrer">
+            {site.host}
+            {site.path === "/" ? "" : site.path}
+            <Icon name="external" class="size-3.5" />
+          </a>
+        )
       }
       actions={
         atLeast(d.role, "deployer") && (
@@ -151,10 +174,7 @@ function Overview({ c }: { c: Ctx }) {
             canDeploy && (
               <>
                 {st.live_deploy && (
-                  <Action
-                    confirm="Roll back to the previous image?"
-                    run={async () => c.openLog((await post<{ deploy_id: string }>(`/services/${id}/rollback`, {})).deploy_id)}
-                  >
+                  <Action confirm="Roll back to the previous image?" run={() => rollback(c)}>
                     Roll back
                   </Action>
                 )}
@@ -185,11 +205,7 @@ function Overview({ c }: { c: Ctx }) {
               {st.running} of {st.desired} {st.desired === 1 ? "replica" : "replicas"} running
             </span>
           </p>
-          {st.replicas.length === 0 ? (
-            <p class="text-muted">There are no containers yet, so deploy the service to start it.</p>
-          ) : (
-            <Replicas c={c} />
-          )}
+          {st.replicas.length === 0 ? <p class="text-muted">There are no containers yet, so deploy the service to start it.</p> : <Replicas c={c} />}
           {st.running > 0 && <Usage id={id} nodes={st.replicas.filter((x) => x.state === "running").map((x) => x.node)} />}
           <p class="mt-4 text-xs text-muted">
             Other services in this project reach it by the host name <code>{s.name}</code>
@@ -215,9 +231,7 @@ function Overview({ c }: { c: Ctx }) {
               {src.watch_paths.length > 0 && <li>Watches {src.watch_paths.join(", ")}</li>}
             </ul>
           )}
-          {s.spec.auto_update?.enabled && src.type === "image" && (
-            <p class="mt-2 text-dim">Checks for a new image every {s.spec.auto_update.interval_minutes} minutes.</p>
-          )}
+          {s.spec.auto_update?.enabled && src.type === "image" && <p class="mt-2 text-dim">Checks for a new image every {s.spec.auto_update.interval_minutes} minutes.</p>}
           <a class="link mt-3 inline-block text-sm" href={`/projects/${s.project}/${s.name}/settings`}>
             Change source and build
           </a>
@@ -269,7 +283,7 @@ function Replicas({ c }: { c: Ctx }) {
   const st = c.d.status;
   const multi = multiServer(c);
   return (
-    <ul class="divide-y divide-line rounded-md border border-line">
+    <ul class="inset-list">
       {st.replicas.map((r) => (
         <li key={r.id} class="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2">
           <span class="min-w-0 flex-1 truncate font-mono text-[13px]" title={r.name}>
@@ -319,8 +333,7 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
           <Pill state={d.status} />
           {d.id === props.live && <span class="chip">serving traffic</span>}
           <span class="text-dim">
-            {d.trigger}
-            {d.actor ? ` by ${d.actor}` : ""} · {ago(d.created_at)}
+            {started(d)}
             {took && ` · took ${took}`}
           </span>
         </div>
@@ -342,10 +355,7 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
           </Action>
         )}
         {props.actions && canDeploy && d.status === "live" && d.id !== props.live && d.image && (
-          <Action
-            confirm={`Roll back to ${d.image}?`}
-            run={async () => c.openLog((await post<{ deploy_id: string }>(`/services/${c.d.service.id}/rollback`, { deploy_id: d.id })).deploy_id)}
-          >
+          <Action confirm={`Roll back to ${d.image}?`} run={() => rollback(c, d.id)}>
             Roll back to this
           </Action>
         )}
@@ -370,10 +380,15 @@ function Webhook({ c }: { c: Ctx }) {
           <CodeBlock label="From CI" text={`curl -fsS -X POST "${url}"`} />
         </div>
       )}
-      {hook.error && (hook.error.status === 404 ? <Note class="mt-3">{errText(hook.error)}</Note> : <div class="mt-3"><ErrorBox error={hook.error} /></div>)}
-      {canOperate && !canRead && !url && (
-        <p class="mt-3 text-xs text-muted">Seeing the current URL needs the secrets:read grant. Rotating it shows you a new URL once.</p>
-      )}
+      {hook.error &&
+        (hook.error.status === 404 ? (
+          <Note class="mt-3">{errText(hook.error)}</Note>
+        ) : (
+          <div class="mt-3">
+            <ErrorBox error={hook.error} />
+          </div>
+        ))}
+      {canOperate && !canRead && !url && <p class="mt-3 text-xs text-muted">Seeing the current URL needs the secrets:read grant. Rotating it shows you a new URL once.</p>}
       {canOperate && (
         <div class="mt-3">
           <Action
@@ -398,10 +413,7 @@ function Deploys({ c }: { c: Ctx }) {
       title="Deploys"
       actions={
         canDeploy && (
-          <Action
-            confirm="Roll back to the previous image?"
-            run={async () => c.openLog((await post<{ deploy_id: string }>(`/services/${id}/rollback`, {})).deploy_id)}
-          >
+          <Action confirm="Roll back to the previous image?" run={() => rollback(c)}>
             Roll back
           </Action>
         )
@@ -409,21 +421,15 @@ function Deploys({ c }: { c: Ctx }) {
       pad={false}
     >
       <Loaded r={r}>
-        {(data) =>
-          data.deploys.length === 0 ? (
-            <div class="p-4">
-              <Empty>This service has not been deployed yet.</Empty>
-            </div>
-          ) : (
-            <ul class="divide-y divide-line">
-              {data.deploys.map((d) => (
-                <li key={d.id} class="px-4 py-3">
-                  <DeployRow d={d} live={data.live} c={c} actions />
-                </li>
-              ))}
-            </ul>
-          )
-        }
+        {(data) => (
+          <Rows items={data.deploys} empty="This service has not been deployed yet.">
+            {(d) => (
+              <li key={d.id} class="px-5 py-3">
+                <DeployRow d={d} live={data.live} c={c} actions />
+              </li>
+            )}
+          </Rows>
+        )}
       </Loaded>
     </Card>
   );
@@ -434,8 +440,7 @@ export function DeployLog(props: { id: string | null; onClose: () => void }) {
   const [lines, setLines] = useState<{ ts: number; line: string }[]>([]);
   const [status, setStatus] = useState("");
   const [info, setInfo] = useState<Deploy | null>(null);
-  const box = useRef<HTMLPreElement>(null);
-  const stick = useRef(true);
+  const box = useStickToBottom<HTMLPreElement>(lines);
   const id = props.id;
 
   useEffect(() => {
@@ -443,7 +448,7 @@ export function DeployLog(props: { id: string | null; onClose: () => void }) {
     setLines([]);
     setStatus("");
     setInfo(null);
-    stick.current = true;
+    box.stick.current = true;
     const refresh = () =>
       get<{ deploy: Deploy }>(`/deploys/${id}`)
         .then((r) => {
@@ -453,27 +458,12 @@ export function DeployLog(props: { id: string | null; onClose: () => void }) {
         .catch(() => {});
     refresh();
     const es = new EventSource(`/api/deploys/${id}/log`);
-    let buf: { ts: number; line: string }[] = [];
-    let frame = 0;
+    const tail = tailLines<{ ts: number; line: string }>(es, (chunk) => setLines((l) => l.concat(chunk)));
     // A reconnect replays the whole log, so start over when the stream (re)opens.
     es.onopen = () => {
-      buf = [];
+      tail.clear();
       setLines([]);
     };
-    es.addEventListener("line", (m) => {
-      try {
-        buf.push(JSON.parse(m.data));
-      } catch {
-        return;
-      }
-      if (!frame)
-        frame = requestAnimationFrame(() => {
-          frame = 0;
-          const chunk = buf;
-          buf = [];
-          setLines((l) => l.concat(chunk));
-        });
-    });
     es.addEventListener("status", (m) => {
       setStatus(m.data);
       // The server ends the stream after the final status; closing stops the browser from reconnecting.
@@ -482,28 +472,15 @@ export function DeployLog(props: { id: string | null; onClose: () => void }) {
         refresh();
       }
     });
-    return () => {
-      es.close();
-      cancelAnimationFrame(frame);
-    };
+    return tail.stop;
   }, [id]);
-
-  useLayoutEffect(() => {
-    const b = box.current;
-    if (b && stick.current) b.scrollTop = b.scrollHeight;
-  }, [lines]);
 
   const done = FINAL.has(status);
   return (
     <Modal open={!!id} onClose={props.onClose} title="Deploy log" wide>
       <div class="mb-3 flex flex-wrap items-center gap-2">
         <Pill state={status || "queued"} />
-        {info && (
-          <span class="text-dim">
-            {info.trigger}
-            {info.actor ? ` by ${info.actor}` : ""} · {ago(info.created_at)}
-          </span>
-        )}
+        {info && <span class="text-dim">{started(info)}</span>}
         {id && !done && status && (
           <Action class="btn btn-danger ml-auto" run={() => post(`/deploys/${id}/cancel`)} done="Cancelling.">
             Cancel deploy
@@ -511,13 +488,10 @@ export function DeployLog(props: { id: string | null; onClose: () => void }) {
         )}
       </div>
       <pre
-        ref={box}
+        ref={box.ref}
         tabIndex={0}
         aria-label="Deploy log"
-        onScroll={(e) => {
-          const b = e.currentTarget;
-          stick.current = b.scrollHeight - b.scrollTop - b.clientHeight < 40;
-        }}
+        onScroll={box.onScroll}
         class="h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-bg p-3 font-mono text-xs leading-relaxed"
       >
         {lines.length ? lines.map((l) => `${clock(l.ts)}  ${l.line}`).join("\n") : done ? "This deploy wrote no log lines." : "Waiting for the first lines…"}
@@ -589,16 +563,13 @@ function Files({ c }: { c: Ctx }) {
           data.files.length === 0 ? (
             <Empty>There are no files yet.</Empty>
           ) : (
-            <ul class="divide-y divide-line rounded-md border border-line">
+            <ul class="inset-list">
               {data.files.map((f) => (
                 <li key={f.target} class="flex flex-wrap items-center gap-2 px-3 py-2">
                   <code class="min-w-0 flex-1 truncate">{f.target}</code>
                   {canEdit && (
                     <>
-                      <button
-                        class="btn"
-                        onClick={() => setEdit({ target: f.target, content: f.content ?? "", known: data.values_visible, isNew: false })}
-                      >
+                      <button class="btn" onClick={() => setEdit({ target: f.target, content: f.content ?? "", known: data.values_visible, isNew: false })}>
                         Edit
                       </button>
                       <Action
@@ -624,30 +595,19 @@ function Files({ c }: { c: Ctx }) {
         {edit && (
           <form class="space-y-4" onSubmit={s.submit}>
             {edit.isNew && (
-              <Field label="Path in the container">
-                <input
-                  class="input font-mono"
-                  required
-                  pattern="/.*"
-                  placeholder="/etc/app/config.yml"
-                  value={edit.target}
-                  onInput={(e) => ((target) => setEdit((x) => x && { ...x, target }))(e.currentTarget.value)}
-                />
-              </Field>
+              <Input
+                label="Path in the container"
+                class="font-mono"
+                required
+                pattern="/.*"
+                placeholder="/etc/app/config.yml"
+                value={edit.target}
+                onInput={(e) => ((target) => setEdit((x) => x && { ...x, target }))(e.currentTarget.value)}
+              />
             )}
             {!edit.known && <Note>The current content is hidden because reading it needs the secrets:read grant. Saving replaces it.</Note>}
-            <Field label="Content">
-              <textarea class="input h-72" spellcheck={false} value={edit.content} onInput={(e) => ((content) => setEdit((x) => x && { ...x, content }))(e.currentTarget.value)} />
-            </Field>
-            <ErrorBox error={s.error} />
-            <div class="flex justify-end gap-2">
-              <button type="button" class="btn" onClick={() => setEdit(null)}>
-                Cancel
-              </button>
-              <button class="btn btn-primary" disabled={s.busy}>
-                Save file
-              </button>
-            </div>
+            <TextArea label="Content" class="h-72" value={edit.content} onInput={(e) => ((content) => setEdit((x) => x && { ...x, content }))(e.currentTarget.value)} />
+            <FormButtons s={s} submit="Save file" onCancel={() => setEdit(null)} />
           </form>
         )}
       </Modal>
@@ -673,9 +633,7 @@ function Danger({ c }: { c: Ctx }) {
   return (
     <Card title="Delete service" class="border-bad/40">
       <form class="max-w-xl space-y-4" onSubmit={sub.submit}>
-        <p class="text-dim">
-          Deleting stops and removes every container of {s.name}, together with its domains, environment, files and deploy history. This cannot be undone.
-        </p>
+        <p class="text-dim">Deleting stops and removes every container of {s.name}, together with its domains, environment, files and deploy history. This cannot be undone.</p>
         {followers.length > 0 && (
           <Note tone="warn">
             {followers.join(", ")} {followers.length === 1 ? "follows" : "follow"} {s.name}, so {s.name} can be deleted only after each read replica is promoted or deleted.
@@ -690,9 +648,7 @@ function Danger({ c }: { c: Ctx }) {
           hint="Volumes hold the service's data, such as database files. Leave this off to keep them on the server."
         />
         {volumes && <Note tone="bad">The data in this service's volumes will be gone for good, so take a backup first if you might need it.</Note>}
-        <Field label={`Type ${s.name} to confirm`}>
-          <input class="input font-mono" autoComplete="off" spellcheck={false} disabled={!allowed} value={name} onInput={(e) => setName(e.currentTarget.value)} />
-        </Field>
+        <ConfirmName name={s.name} value={name} onChange={setName} disabled={!allowed} />
         <ErrorBox error={sub.error} />
         <button class="btn btn-danger" disabled={!allowed || name !== s.name || sub.busy}>
           Delete {s.name}

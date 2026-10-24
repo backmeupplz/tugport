@@ -61,12 +61,25 @@ impl Keyring {
 
     /// Key derived for a purpose (restic repo passwords, signing...): HMAC-SHA256 of the purpose.
     pub fn derive(&self, purpose: &str) -> Result<String> {
-        use hmac::{Hmac, Mac};
-        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(self.mac_key.as_ref()).map_err(|_| anyhow!("invalid key length"))?;
-        mac.update(b"tugport:");
-        mac.update(purpose.as_bytes());
-        Ok(hex::encode(mac.finalize().into_bytes()))
+        Ok(hex::encode(crate::util::hmac_sha256(self.mac_key.as_ref(), format!("tugport:{purpose}"))))
     }
+}
+
+/// An RS256 JSON Web Token (GitHub App authentication) signed with a PKCS#1 or PKCS#8 PEM key.
+pub fn jwt_rs256(pem: &str, claims: &serde_json::Value) -> Result<String> {
+    use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    use rustls::pki_types::{PrivateKeyDer, pem::PemObject};
+    let key = match PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(|_| anyhow!("the key is not a PEM private key"))? {
+        PrivateKeyDer::Pkcs1(k) => RsaKeyPair::from_der(k.secret_pkcs1_der()),
+        PrivateKeyDer::Pkcs8(k) => RsaKeyPair::from_pkcs8(k.secret_pkcs8_der()),
+        _ => bail!("the key is not an RSA key"),
+    }
+    .map_err(|e| anyhow!("unusable RSA key: {e}"))?;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let msg = format!("{}.{}", b64.encode(r#"{"alg":"RS256","typ":"JWT"}"#), b64.encode(claims.to_string()));
+    let mut sig = vec![0; key.public().modulus_len()];
+    key.sign(&RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), msg.as_bytes(), &mut sig).map_err(|_| anyhow!("signing failed"))?;
+    Ok(format!("{msg}.{}", b64.encode(sig)))
 }
 
 /// How the master key is stored on this machine.
@@ -79,22 +92,21 @@ pub enum KeyStore {
 const TPM_FILE: &str = "master.key.cred";
 const PLAIN_FILE: &str = "master.key";
 
+/// Whether this machine has a master key (sealed to the TPM or in the key file).
+pub fn has_master(etc: &Path) -> bool {
+    etc.join(TPM_FILE).exists() || etc.join(PLAIN_FILE).exists()
+}
+
 pub fn load_master(etc: &Path) -> Result<Zeroizing<[u8; 32]>> {
     let tpm = etc.join(TPM_FILE);
-    if tpm.exists() {
-        let out = std::process::Command::new("systemd-creds")
-            .args(["decrypt", "--name=tugport-master"])
-            .arg(&tpm)
-            .arg("-")
-            .output()
-            .context("running systemd-creds to unseal the master key")?;
-        if !out.status.success() {
-            bail!("systemd-creds could not unseal the master key: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
-        return parse_key(&String::from_utf8_lossy(&out.stdout));
-    }
-    let file = etc.join(PLAIN_FILE);
-    let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let text = if tpm.exists() {
+        let mut cmd = std::process::Command::new("systemd-creds");
+        cmd.args(["decrypt", "--name=tugport-master"]).arg(&tpm).arg("-");
+        Zeroizing::new(crate::proc::run_sync(&mut cmd).context("unsealing the master key")?)
+    } else {
+        let file = etc.join(PLAIN_FILE);
+        Zeroizing::new(std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?)
+    };
     parse_key(&text)
 }
 
@@ -118,7 +130,7 @@ pub fn create_master(etc: &Path) -> Result<(Zeroizing<[u8; 32]>, KeyStore)> {
         }
         tracing::warn!("sealing the master key to the TPM failed, falling back to a key file");
     }
-    write_private(&etc.join(PLAIN_FILE), hex_key.as_bytes())?;
+    crate::util::write_private(&etc.join(PLAIN_FILE), hex_key.as_bytes())?;
     Ok((key, KeyStore::File))
 }
 
@@ -126,33 +138,19 @@ pub fn create_master(etc: &Path) -> Result<(Zeroizing<[u8; 32]>, KeyStore)> {
 pub fn restore_master(etc: &Path, recovery: &str) -> Result<()> {
     let key = parse_recovery(recovery)?;
     std::fs::create_dir_all(etc)?;
-    write_private(&etc.join(PLAIN_FILE), hex::encode(key.as_ref()).as_bytes())
+    crate::util::write_private(&etc.join(PLAIN_FILE), Zeroizing::new(hex::encode(key.as_ref())).as_bytes())
 }
 
 fn tpm_available() -> bool {
-    Path::new("/dev/tpmrm0").exists()
-        && std::process::Command::new("systemd-creds")
-            .arg("has-tpm2")
-            .stdout(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-}
-
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(data)?;
-    Ok(())
+    Path::new("/dev/tpmrm0").exists() && crate::proc::succeeds(std::process::Command::new("systemd-creds").arg("has-tpm2"))
 }
 
 fn parse_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
     let bytes = Zeroizing::new(hex::decode(text.trim()).context("master key is not hex")?);
-    let mut key = Zeroizing::new([0u8; 32]);
     if bytes.len() != 32 {
         bail!("master key must be 32 bytes");
     }
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&bytes);
     Ok(key)
 }
@@ -169,7 +167,7 @@ pub fn recovery_key(key: &[u8; 32]) -> String {
     out
 }
 
-pub fn parse_recovery(text: &str) -> Result<Zeroizing<[u8; 32]>> {
+fn parse_recovery(text: &str) -> Result<Zeroizing<[u8; 32]>> {
     let body = text.trim().strip_prefix("TP1-").ok_or_else(|| anyhow!("recovery keys start with TP1-"))?;
     let clean: String = body.chars().filter(|c| *c != '-').collect::<String>().to_uppercase();
     let bytes = Zeroizing::new(unbase32(&clean).ok_or_else(|| anyhow!("recovery key has invalid characters"))?);
@@ -183,7 +181,8 @@ pub fn parse_recovery(text: &str) -> Result<Zeroizing<[u8; 32]>> {
 
 const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-fn base32(data: &[u8]) -> String {
+/// RFC 4648 base32 without padding (recovery keys, TOTP secrets).
+pub fn base32(data: &[u8]) -> String {
     let mut out = String::new();
     let (mut buf, mut bits) = (0u32, 0u32);
     for &b in data {

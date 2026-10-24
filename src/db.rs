@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Params, Row, params};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -18,6 +18,7 @@ impl Db {
         Self::init(conn)
     }
 
+    #[cfg(test)]
     pub fn memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -31,20 +32,32 @@ impl Db {
     }
 
     pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        crate::util::lock(&self.0)
+    }
+
+    /// Every row of a query, mapped by `f`.
+    pub fn rows<T>(&self, sql: &str, params: impl Params, f: impl FnMut(&Row) -> rusqlite::Result<T>) -> rusqlite::Result<Vec<T>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(sql)?;
+        stmt.query_map(params, f)?.collect()
+    }
+
+    /// The first row of a query, if there is one.
+    pub fn row<T>(&self, sql: &str, params: impl Params, f: impl FnOnce(&Row) -> rusqlite::Result<T>) -> rusqlite::Result<Option<T>> {
+        self.conn().query_row(sql, params, f).optional()
+    }
+
+    pub fn exec(&self, sql: &str, params: impl Params) -> rusqlite::Result<usize> {
+        self.conn().execute(sql, params)
     }
 
     pub fn get_setting<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
-        let raw: Option<String> =
-            self.conn().query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional()?;
-        Ok(match raw {
-            Some(s) => Some(serde_json::from_str(&s)?),
-            None => None,
-        })
+        let raw: Option<String> = self.row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
     }
 
     pub fn set_setting<T: serde::Serialize>(&self, key: &str, value: &T) -> Result<()> {
-        self.conn().execute(
+        self.exec(
             "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, serde_json::to_string(value)?],
         )?;
@@ -52,15 +65,25 @@ impl Db {
     }
 
     pub fn get_state(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.conn().query_row("SELECT value FROM state WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+        Ok(self.row("SELECT value FROM state WHERE key = ?1", [key], |r| r.get(0))?)
+    }
+
+    /// A state value parsed as `T` (`String` for the text); None when it is missing, does not
+    /// parse or cannot be read.
+    pub fn state<T: std::str::FromStr>(&self, key: &str) -> Option<T> {
+        self.get_state(key).ok().flatten()?.parse().ok()
     }
 
     pub fn set_state(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute(
+        self.exec(
             "INSERT INTO state (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
         Ok(())
+    }
+
+    pub fn del_state(&self, key: &str) -> rusqlite::Result<()> {
+        self.exec("DELETE FROM state WHERE key = ?1", [key]).map(drop)
     }
 
     /// Consistent copy of the database for backups.
@@ -72,7 +95,7 @@ impl Db {
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let current: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+    let current = usize::try_from(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?).context("the database has a negative schema version")?;
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql).with_context(|| format!("migration {}", i + 1))?;
@@ -94,5 +117,9 @@ mod tests {
         assert_eq!(db.get_setting::<String>("missing").unwrap(), None);
         let v: i64 = db.conn().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v as usize, MIGRATIONS.len());
+        db.set_state("n", "7").unwrap();
+        assert_eq!(db.state::<i64>("n"), Some(7));
+        assert_eq!(db.state::<String>("n").as_deref(), Some("7"));
+        assert_eq!(db.state::<i64>("missing"), None);
     }
 }

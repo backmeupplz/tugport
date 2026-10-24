@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-pub const STEP: i64 = 10;
+const STEP: i64 = 10;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(default)]
@@ -84,7 +84,8 @@ pub struct Metrics {
     pub nodes: Mutex<HashMap<String, Snapshot>>,
     /// Crashes per service since the last sample (from container events on every server).
     pub restarts: Mutex<HashMap<String, u64>>,
-    series: Mutex<HashMap<(String, String, String), i64>>,
+    /// metric_series ids by "node\0scope\0name".
+    series: Mutex<HashMap<String, i64>>,
 }
 
 struct ContainerPrev {
@@ -126,15 +127,14 @@ pub async fn sample_loop(app: AppState, keep: bool) {
         };
         let mut seen = std::collections::HashSet::new();
         for d in disks.list() {
-            let mount = d.mount_point().to_string_lossy().to_string();
-            let fs = d.file_system().to_string_lossy().to_string();
-            if !real_disk(&fs, d.total_space(), d.mount_point()) || !seen.insert(d.name().to_string_lossy().to_string()) {
+            if !real_disk(&d.file_system().to_string_lossy(), d.total_space(), d.mount_point()) || !seen.insert(d.name()) {
                 continue;
             }
             let u = d.usage();
             snap.disk_io.rx += u.read_bytes as f64 / STEP as f64;
             snap.disk_io.tx += u.written_bytes as f64 / STEP as f64;
-            snap.disks.push(DiskUsage { mount, used: d.total_space() - d.available_space(), total: d.total_space() });
+            let mount = d.mount_point().to_string_lossy().into_owned();
+            snap.disks.push(DiskUsage { mount, used: d.total_space().saturating_sub(d.available_space()), total: d.total_space() });
         }
         for (name, n) in nets.list() {
             if name == "lo" || name.starts_with("veth") || name.starts_with("br-") || name.starts_with("docker") {
@@ -148,10 +148,10 @@ pub async fn sample_loop(app: AppState, keep: bool) {
         snap.services = containers(&app, &mut prev).await;
 
         if !keep {
-            *crate::util::lock(&app.metrics.latest) = snap;
+            *util::lock(&app.metrics.latest) = snap;
             continue;
         }
-        let mut crashes = std::mem::take(&mut *crate::util::lock(&app.metrics.restarts));
+        let mut crashes = std::mem::take(&mut *util::lock(&app.metrics.restarts));
         for sv in &mut snap.services {
             sv.restarts = crashes.remove(&sv.id).unwrap_or(0);
         }
@@ -162,7 +162,7 @@ pub async fn sample_loop(app: AppState, keep: bool) {
         }
         crate::alerts::evaluate(&app, None, &snap).await;
         app.emit("metrics", None, None, serde_json::json!({ "at": at, "cpu": snap.cpu, "memory": snap.memory, "net": snap.net }));
-        *crate::util::lock(&app.metrics.latest) = snap;
+        *util::lock(&app.metrics.latest) = snap;
         if at - last_rollup >= 300 {
             if let Err(e) = rollup(&app) {
                 tracing::warn!("metrics rollup: {e:#}");
@@ -173,31 +173,12 @@ pub async fn sample_loop(app: AppState, keep: bool) {
 }
 
 async fn gpus() -> Vec<Gpu> {
+    let mut cmd = tokio::process::Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw", "--format=csv,noheader,nounits"]);
+    if let Ok(csv) = crate::proc::output(cmd).await {
+        return csv.lines().filter_map(nvidia_gpu).collect();
+    }
     let mut out = vec![];
-    let nvidia = tokio::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw", "--format=csv,noheader,nounits"])
-        .output()
-        .await;
-    if let Ok(o) = nvidia
-        && o.status.success() {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let f: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                if f.len() < 7 {
-                    continue;
-                }
-                let num = |s: &str| s.parse::<f64>().ok();
-                out.push(Gpu {
-                    index: f[0].parse().unwrap_or(0),
-                    name: f[1].to_string(),
-                    util: num(f[2]).unwrap_or(0.0),
-                    mem_used: (num(f[3]).unwrap_or(0.0) * 1048576.0) as u64,
-                    mem_total: (num(f[4]).unwrap_or(0.0) * 1048576.0) as u64,
-                    temp: num(f[5]),
-                    power: num(f[6]),
-                });
-            }
-            return out;
-        }
     // AMD (and other DRM drivers that expose busy percent).
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else { return out };
     let mut cards: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("card") && !n.contains('-'))).collect();
@@ -221,9 +202,26 @@ async fn gpus() -> Vec<Gpu> {
     out
 }
 
+/// One line of nvidia-smi's CSV (memory in MiB).
+fn nvidia_gpu(line: &str) -> Option<Gpu> {
+    let mut f = line.split(',').map(str::trim);
+    let mut next = || f.next();
+    let (index, name, util, used, total, temp, power) = (next()?, next()?, next()?, next()?, next()?, next()?, next()?);
+    let num = |s: &str| s.parse::<f64>().ok();
+    Some(Gpu {
+        index: index.parse().unwrap_or(0),
+        name: name.to_string(),
+        util: num(util).unwrap_or(0.0),
+        mem_used: (num(used).unwrap_or(0.0) * 1048576.0) as u64,
+        mem_total: (num(total).unwrap_or(0.0) * 1048576.0) as u64,
+        temp: num(temp),
+        power: num(power),
+    })
+}
+
 /// Per-service usage from cgroup v2 files (cheap), summed over replicas.
 async fn containers(app: &App, prev: &mut HashMap<String, ContainerPrev>) -> Vec<ServiceUsage> {
-    let filters = HashMap::from([("label".to_string(), vec![format!("{}=true", runtime::L_MANAGED)])]);
+    let filters = runtime::managed();
     let Ok(list) = app.docker.list_containers(Some(bollard::query_parameters::ListContainersOptions { filters: Some(filters), ..Default::default() })).await else {
         return vec![];
     };
@@ -285,78 +283,89 @@ fn read_kv(path: &std::path::Path, key: &str) -> Option<u64> {
 
 /// Network counters of the container's first process.
 fn net_bytes(cg: &std::path::Path) -> Option<(u64, u64)> {
-    let pid = std::fs::read_to_string(cg.join("cgroup.procs")).ok().and_then(|s| s.lines().next().map(String::from))?;
-    let text = std::fs::read_to_string(format!("/proc/{pid}/net/dev")).ok()?;
-    let mut rx = 0;
-    let mut tx = 0;
+    let procs = std::fs::read_to_string(cg.join("cgroup.procs")).ok()?;
+    let pid = procs.lines().next()?;
+    Some(net_dev(&std::fs::read_to_string(format!("/proc/{pid}/net/dev")).ok()?))
+}
+
+/// Received and sent bytes over every interface but loopback in a /proc/net/dev table.
+fn net_dev(text: &str) -> (u64, u64) {
+    let (mut rx, mut tx) = (0u64, 0u64);
     for line in text.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else { continue };
         if name.trim() == "lo" {
             continue;
         }
-        let f: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-        if f.len() >= 9 {
-            rx += f[0];
-            tx += f[8];
+        let mut f = rest.split_whitespace().map(|x| x.parse::<u64>().ok());
+        if let (Some(Some(r)), Some(Some(t))) = (f.next(), f.nth(7)) {
+            rx = rx.saturating_add(r);
+            tx = tx.saturating_add(t);
         }
     }
-    Some((rx, tx))
+    (rx, tx)
 }
 
-fn series_id(app: &App, conn: &rusqlite::Connection, node: &str, scope: &str, name: &str) -> Result<i64> {
-    let key = (node.to_string(), scope.to_string(), name.to_string());
-    if let Some(id) = crate::util::lock(&app.metrics.series).get(&key) {
-        return Ok(*id);
-    }
-    conn.execute("INSERT OR IGNORE INTO metric_series (node_id, scope, name) VALUES (?1, ?2, ?3)", params![node, scope, name])?;
-    let id: i64 = conn.query_row("SELECT id FROM metric_series WHERE node_id = ?1 AND scope = ?2 AND name = ?3", params![node, scope, name], |r| r.get(0))?;
-    crate::util::lock(&app.metrics.series).insert(key, id);
-    Ok(id)
+pub fn percent(used: u64, total: u64) -> f64 {
+    used as f64 / total.max(1) as f64 * 100.0
 }
 
 /// Store a server's snapshot ("local" = the panel's own server).
 pub fn store_for(app: &App, node: &str, s: &Snapshot) -> Result<()> {
-    let mut points: Vec<(String, String, f64)> = vec![
-        ("host".into(), "cpu".into(), s.cpu),
-        ("host".into(), "memory".into(), s.memory.used as f64),
-        ("host".into(), "swap".into(), s.swap.used as f64),
-        ("host".into(), "load1".into(), s.load[0]),
-        ("host".into(), "disk_read".into(), s.disk_io.rx),
-        ("host".into(), "disk_write".into(), s.disk_io.tx),
-        ("host".into(), "net_rx".into(), s.net.rx),
-        ("host".into(), "net_tx".into(), s.net.tx),
-    ];
+    let mut conn = app.db.conn();
+    let tx = conn.transaction()?;
+    let mut series = util::lock(&app.metrics.series);
+    let mut key = String::new();
+    let mut put = |scope: &str, name: &str, v: f64| -> Result<()> {
+        key.clear();
+        key.extend([node, "\0", scope, "\0", name]);
+        let id = match series.get(&key) {
+            Some(id) => *id,
+            None => {
+                tx.prepare_cached("INSERT OR IGNORE INTO metric_series (node_id, scope, name) VALUES (?1, ?2, ?3)")?.execute(params![node, scope, name])?;
+                let id: i64 = tx.prepare_cached("SELECT id FROM metric_series WHERE node_id = ?1 AND scope = ?2 AND name = ?3")?.query_row(params![node, scope, name], |r| r.get(0))?;
+                series.insert(key.clone(), id);
+                id
+            }
+        };
+        tx.prepare_cached("INSERT OR REPLACE INTO metrics_raw (series, ts, v) VALUES (?1, ?2, ?3)")?.execute(params![id, s.at, v])?;
+        Ok(())
+    };
+    for (name, v) in [
+        ("cpu", s.cpu),
+        ("memory", s.memory.used as f64),
+        ("swap", s.swap.used as f64),
+        ("load1", s.load[0]),
+        ("disk_read", s.disk_io.rx),
+        ("disk_write", s.disk_io.tx),
+        ("net_rx", s.net.rx),
+        ("net_tx", s.net.tx),
+    ] {
+        put("host", name, v)?;
+    }
     if let Some(t) = s.temp {
-        points.push(("host".into(), "temp".into(), t));
+        put("host", "temp", t)?;
     }
     for d in &s.disks {
-        points.push(("host".into(), format!("disk:{}", d.mount), d.used as f64 / d.total.max(1) as f64 * 100.0));
+        put("host", &format!("disk:{}", d.mount), percent(d.used, d.total))?;
     }
     for g in &s.gpus {
         let scope = format!("gpu:{}", g.index);
-        points.push((scope.clone(), "util".into(), g.util));
-        points.push((scope.clone(), "memory".into(), g.mem_used as f64));
+        put(&scope, "util", g.util)?;
+        put(&scope, "memory", g.mem_used as f64)?;
         if let Some(t) = g.temp {
-            points.push((scope.clone(), "temp".into(), t));
+            put(&scope, "temp", t)?;
         }
         if let Some(p) = g.power {
-            points.push((scope, "power".into(), p));
+            put(&scope, "power", p)?;
         }
     }
     for sv in &s.services {
         let scope = format!("service:{}", sv.id);
-        points.push((scope.clone(), "cpu".into(), sv.cpu));
-        points.push((scope.clone(), "memory".into(), sv.memory as f64));
-        points.push((scope.clone(), "net_rx".into(), sv.net_rx));
-        points.push((scope.clone(), "net_tx".into(), sv.net_tx));
-        points.push((scope, "restarts".into(), sv.restarts as f64));
+        for (name, v) in [("cpu", sv.cpu), ("memory", sv.memory as f64), ("net_rx", sv.net_rx), ("net_tx", sv.net_tx), ("restarts", sv.restarts as f64)] {
+            put(&scope, name, v)?;
+        }
     }
-    let mut conn = app.db.conn();
-    let tx = conn.transaction()?;
-    for (scope, name, v) in points {
-        let id = series_id(app, &tx, node, &scope, &name)?;
-        tx.execute("INSERT OR REPLACE INTO metrics_raw (series, ts, v) VALUES (?1, ?2, ?3)", params![id, s.at, v])?;
-    }
+    drop(series);
     tx.commit()?;
     Ok(())
 }
@@ -379,8 +388,7 @@ fn rollup(app: &App) -> Result<()> {
 
 /// Average of a series over the last `secs` seconds, added up over every server.
 pub fn recent(app: &App, scope: &str, name: &str, secs: i64) -> Option<f64> {
-    let conn = app.db.conn();
-    conn.query_row(
+    app.db.row(
         "SELECT SUM(a) FROM (SELECT AVG(r.v) AS a FROM metrics_raw r JOIN metric_series s ON s.id = r.series
            WHERE s.scope = ?1 AND s.name = ?2 AND r.ts >= ?3 GROUP BY r.series)",
         params![scope, name, util::now() - secs],
@@ -388,12 +396,12 @@ pub fn recent(app: &App, scope: &str, name: &str, secs: i64) -> Option<f64> {
     )
     .ok()
     .flatten()
+    .flatten()
 }
 
 /// Average CPU of the online servers over the last `secs` seconds.
 pub fn cluster_cpu(app: &App, secs: i64) -> Option<f64> {
-    let conn = app.db.conn();
-    conn.query_row(
+    app.db.row(
         "SELECT AVG(a) FROM (SELECT AVG(r.v) AS a FROM metrics_raw r JOIN metric_series s ON s.id = r.series
            JOIN nodes n ON n.id = s.node_id
            WHERE s.scope = 'host' AND s.name = 'cpu' AND n.status = 'online' AND r.ts >= ?1 GROUP BY r.series)",
@@ -401,6 +409,7 @@ pub fn cluster_cpu(app: &App, secs: i64) -> Option<f64> {
         |r| r.get::<_, Option<f64>>(0),
     )
     .ok()
+    .flatten()
     .flatten()
 }
 
@@ -412,29 +421,19 @@ pub fn query(app: &App, node: &str, scope: &str, names: &[String], range_s: i64)
     let from = now - range_s;
     let step = (range_s / 300).max(STEP);
     let (table, step) = if range_s <= 86400 { ("metrics_raw", step) } else { ("metrics_5m", step.max(300)) };
-    let conn = app.db.conn();
     let mut out = HashMap::new();
-    let wanted: Vec<String> = if names.is_empty() {
-        let mut stmt = conn.prepare("SELECT DISTINCT name FROM metric_series WHERE scope = ?1")?;
-        stmt.query_map([scope], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
-    } else {
-        names.to_vec()
-    };
+    let wanted: Vec<String> = if names.is_empty() { app.db.rows("SELECT DISTINCT name FROM metric_series WHERE scope = ?1", [scope], |r| r.get(0))? } else { names.to_vec() };
     let every_node = scope.starts_with("service:");
+    let series = "SELECT id FROM metric_series WHERE scope = ?1 AND name = ?2 AND (?3 OR node_id = ?4)";
+    let points = format!(
+        "SELECT b, SUM(v) FROM (SELECT series, ts / ?6 * ?6 AS b, AVG(v) AS v FROM {table} WHERE series IN ({series}) AND ts >= ?5 GROUP BY series, b) GROUP BY b ORDER BY b"
+    );
     for name in wanted {
-        let ids: Vec<i64> = {
-            let mut stmt = conn.prepare("SELECT id FROM metric_series WHERE scope = ?1 AND name = ?2 AND (?3 OR node_id = ?4)")?;
-            stmt.query_map(params![scope, name, every_node, node], |r| r.get(0))?.filter_map(|r| r.ok()).collect()
-        };
-        if ids.is_empty() {
+        if app.db.row(series, params![scope, name, every_node, node], |_| Ok(()))?.is_none() {
             continue;
         }
-        let list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT b, SUM(v) FROM (SELECT series, ts / ?2 * ?2 AS b, AVG(v) AS v FROM {table} WHERE series IN ({list}) AND ts >= ?1 GROUP BY series, b) GROUP BY b ORDER BY b"
-        ))?;
-        let points: Vec<(i64, f64)> = stmt.query_map(params![from, step], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect();
-        out.insert(name, points);
+        let p = app.db.rows(&points, params![scope, name, every_node, node, from, step], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        out.insert(name, p);
     }
     Ok((step, out))
 }
@@ -459,6 +458,16 @@ mod tests {
     fn ranges() {
         assert_eq!(parse_range("7d"), 604800);
         assert_eq!(parse_range("junk"), 3600);
+    }
+
+    #[test]
+    fn parses_gpus_and_net_dev() {
+        let g = nvidia_gpu("0, NVIDIA GeForce RTX 4070 Ti, 37, 1024, 12282, 51, 64.20").unwrap();
+        assert_eq!((g.index, g.name.as_str(), g.util, g.mem_used, g.temp, g.power), (0, "NVIDIA GeForce RTX 4070 Ti", 37.0, 1 << 30, Some(51.0), Some(64.2)));
+        assert_eq!(nvidia_gpu("0, GPU, [N/A], 1, 2, [N/A], [N/A]").map(|g| (g.util, g.temp)), Some((0.0, None)));
+        assert!(nvidia_gpu("0, short").is_none());
+        let dev = "Inter-|   Receive\n face |bytes packets\n    lo: 500 1 0 0 0 0 0 0 500 1 0 0 0 0 0 0\n  eth0: 100 2 0 0 0 0 0 0 40 3 0 0 0 0 0 0\n  eth1: 5 0 0 0 0 0 0 0 6 0 0 0 0 0 0 0\n";
+        assert_eq!(net_dev(dev), (105, 46));
     }
 
     #[test]

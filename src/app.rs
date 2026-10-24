@@ -38,6 +38,33 @@ pub struct Event {
 }
 
 impl App {
+    /// The shared state, with `build_slots` builds allowed at once.
+    pub fn new(paths: Paths, db: Db, keys: Keyring, docker: bollard::Docker, selflog: Arc<crate::logs::SelfLog>, build_slots: usize) -> anyhow::Result<AppState> {
+        Ok(Arc::new(App {
+            paths,
+            db,
+            keys,
+            docker,
+            events: broadcast::channel(4096).0,
+            deployer: Default::default(),
+            build_slots: Arc::new(tokio::sync::Semaphore::new(build_slots)),
+            proxy: crate::proxy::Proxy::new()?,
+            logs: broadcast::channel(8192).0,
+            selflog,
+            metrics: Default::default(),
+            nodes: Default::default(),
+        }))
+    }
+
+    /// A state value kept sealed (encrypted to `context`), opened.
+    pub fn sealed_state(&self, key: &str, context: &str) -> anyhow::Result<Option<zeroize::Zeroizing<String>>> {
+        self.db.get_state(key)?.map(|v| self.keys.open_str(context, &crate::crypto::unb64(&v)?)).transpose()
+    }
+
+    pub fn set_sealed_state(&self, key: &str, context: &str, plain: &str) -> anyhow::Result<()> {
+        self.db.set_state(key, &crate::crypto::b64(&self.keys.seal_str(context, plain)?))
+    }
+
     pub fn emit(&self, kind: &str, project_id: Option<&str>, service_id: Option<&str>, data: serde_json::Value) {
         let _ = self.events.send(Event {
             kind: kind.into(),
@@ -58,14 +85,14 @@ impl App {
         target: Option<&str>,
         detail: Option<&str>,
     ) {
-        let res = self.db.conn().execute(
+        let res = self.db.exec(
             "INSERT INTO audit (at, actor_id, actor_name, actor_kind, key_id, ip, action, project_id, service_id, target, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 util::now(),
                 who.map(|p| p.user_id.clone()),
                 who.map(|p| p.name.clone()).unwrap_or_else(|| "tugport".into()),
-                who.map(|p| if p.kind == crate::auth::UserKind::Agent { "agent" } else { "human" }).unwrap_or("system"),
+                who.map(|p| p.kind.as_str()).unwrap_or("system"),
                 who.and_then(|p| p.key_id.clone()),
                 who.and_then(|p| p.ip.clone()),
                 action,

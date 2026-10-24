@@ -7,12 +7,13 @@ use crate::model::Source;
 use crate::store::Service;
 use crate::util;
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{OptionalExtension, params};
+use reqwest::{Method, RequestBuilder};
+use rusqlite::params;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use tokio::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -61,7 +62,7 @@ impl Provider {
     fn token(&self) -> Option<&str> {
         self.config.get("token").and_then(|v| v.as_str())
     }
-    pub fn api(&self) -> String {
+    fn api(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         match self.kind {
             Kind::GithubApp | Kind::GithubToken if base == "https://github.com" => "https://api.github.com".into(),
@@ -70,39 +71,31 @@ impl Provider {
             Kind::Gitlab => format!("{base}/api/v4"),
         }
     }
-    pub fn clone_url(&self, repo: &str) -> String {
+    fn clone_url(&self, repo: &str) -> String {
         format!("{}/{}.git", self.base_url.trim_end_matches('/'), repo.trim_end_matches(".git"))
     }
 }
 
 pub fn provider(app: &App, id: &str) -> Result<Option<Provider>> {
-    let row: Option<(String, String, String, String, Vec<u8>)> = app
-        .db
-        .conn()
-        .query_row("SELECT id, kind, name, base_url, config FROM git_providers WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
-        .optional()?;
+    let row = app.db.row("SELECT id, kind, name, base_url, config FROM git_providers WHERE id = ?1", [id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get::<_, Vec<u8>>(4)?))
+    })?;
     let Some((id, kind, name, base_url, config)) = row else { return Ok(None) };
     let config = serde_json::from_str(&app.keys.open_str(&format!("git:{id}"), &config)?)?;
     Ok(Some(Provider { id, kind: Kind::parse(&kind).ok_or_else(|| anyhow!("unknown provider kind {kind}"))?, name, base_url, config }))
 }
 
 pub fn providers(app: &App) -> Result<Vec<Value>> {
-    let conn = app.db.conn();
-    let mut stmt = conn.prepare("SELECT id, kind, name, base_url, created_at FROM git_providers ORDER BY created_at")?;
-    Ok(stmt
-        .query_map([], |r| {
-            Ok(json!({ "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?,
-                       "base_url": r.get::<_, String>(3)?, "created_at": r.get::<_, i64>(4)? }))
-        })?
-        .collect::<rusqlite::Result<_>>()?)
+    Ok(app.db.rows("SELECT id, kind, name, base_url, created_at FROM git_providers ORDER BY created_at", [], |r| {
+        Ok(json!({ "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?,
+                   "base_url": r.get::<_, String>(3)?, "created_at": r.get::<_, i64>(4)? }))
+    })?)
 }
 
 pub fn save_provider(app: &App, id: Option<&str>, kind: Kind, name: &str, base_url: &str, config: &Value) -> Result<String> {
     let id = id.map(String::from).unwrap_or_else(util::id);
     let sealed = app.keys.seal_str(&format!("git:{id}"), &config.to_string())?;
-    app.db.conn().execute(
+    app.db.exec(
         "INSERT INTO git_providers (id, kind, name, base_url, config, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET name = excluded.name, base_url = excluded.base_url, config = excluded.config",
         params![id, kind.as_str(), name, base_url.trim_end_matches('/'), sealed, util::now()],
@@ -111,60 +104,66 @@ pub fn save_provider(app: &App, id: Option<&str>, kind: Kind, name: &str, base_u
 }
 
 fn http() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent(concat!("tugport/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?)
+    Ok(util::http(30).build()?)
 }
 
-static TOKENS: Mutex<Option<HashMap<String, (String, i64)>>> = Mutex::new(None);
+/// A request to the provider's API (`path` after its base), authenticated the way its kind expects.
+fn api(p: &Provider, method: Method, path: &str, token: &str) -> Result<RequestBuilder> {
+    let req = http()?.request(method, format!("{}{path}", p.api()));
+    Ok(match p.kind {
+        Kind::GithubApp | Kind::GithubToken => req.bearer_auth(token).header("Accept", "application/vnd.github+json"),
+        Kind::Forgejo => req.header("Authorization", format!("token {token}")),
+        Kind::Gitlab => req.header("PRIVATE-TOKEN", token),
+    })
+}
+
+async fn send(req: RequestBuilder) -> Result<reqwest::Response> {
+    Ok(req.send().await?.error_for_status()?)
+}
+
+/// The token that reaches `repo`: the provider's own, or a GitHub App installation token.
+async fn repo_token(p: &Provider, repo: &str) -> Result<String> {
+    match p.kind {
+        Kind::GithubApp => installation_token(p, repo).await,
+        _ => Ok(p.token().unwrap_or_default().to_string()),
+    }
+}
+
+/// Installation tokens by provider and repository owner, with their expiry.
+static TOKENS: LazyLock<Mutex<HashMap<String, (String, i64)>>> = LazyLock::new(Default::default);
 
 fn app_jwt(p: &Provider) -> Result<String> {
     let app_id = p.config.get("app_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("GitHub App id missing"))?;
     let pem = p.config.get("pem").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("GitHub App key missing"))?;
     let now = util::now();
     let claims = json!({ "iat": now - 60, "exp": now + 540, "iss": app_id.to_string() });
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())?;
-    Ok(jsonwebtoken::encode(&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256), &claims, &key)?)
+    crate::crypto::jwt_rs256(pem, &claims)
 }
 
 /// Short-lived installation token for a repository the GitHub App can see.
-pub async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
+async fn installation_token(p: &Provider, repo: &str) -> Result<String> {
     let owner = repo.split('/').next().unwrap_or(repo).to_lowercase();
     let cache_key = format!("{}:{owner}", p.id);
-    if let Some((t, exp)) = crate::util::lock(&TOKENS).get_or_insert_with(HashMap::new).get(&cache_key)
-        && *exp > util::now() + 300 {
-            return Ok(t.clone());
-        }
+    if let Some((t, exp)) = util::lock(&TOKENS).get(&cache_key)
+        && *exp > util::now() + 300
+    {
+        return Ok(t.clone());
+    }
     let jwt = app_jwt(p)?;
-    let api = p.api();
-    let inst: Value = http()?
-        .get(format!("{api}/repos/{repo}/installation"))
-        .bearer_auth(&jwt)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()
+    let inst: Value = send(api(p, Method::GET, &format!("/repos/{repo}/installation"), &jwt)?)
+        .await
         .with_context(|| format!("the GitHub App is not installed on {repo}"))?
         .json()
         .await?;
     let inst_id = inst["id"].as_i64().ok_or_else(|| anyhow!("no installation id"))?;
     let (token, exp) = installation_access(p, &jwt, inst_id).await?;
-    crate::util::lock(&TOKENS).get_or_insert_with(HashMap::new).insert(cache_key, (token.clone(), exp));
+    util::lock(&TOKENS).insert(cache_key, (token.clone(), exp));
     Ok(token)
 }
 
 /// A token for one installation of the GitHub App, and when it expires.
 async fn installation_access(p: &Provider, jwt: &str, inst_id: i64) -> Result<(String, i64)> {
-    let tok: Value = http()?
-        .post(format!("{}/app/installations/{inst_id}/access_tokens", p.api()))
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let tok: Value = send(api(p, Method::POST, &format!("/app/installations/{inst_id}/access_tokens"), jwt)?).await?.json().await?;
     let token = tok["token"].as_str().ok_or_else(|| anyhow!("no installation token"))?.to_string();
     let exp = chrono::DateTime::parse_from_rfc3339(tok["expires_at"].as_str().unwrap_or("")).map(|d| d.timestamp()).unwrap_or(util::now() + 3000);
     Ok((token, exp))
@@ -172,17 +171,29 @@ async fn installation_access(p: &Provider, jwt: &str, inst_id: i64) -> Result<(S
 
 /// HTTP Basic credentials for cloning, passed per command so they never land in .git/config.
 async fn clone_header(p: &Provider, repo: &str) -> Result<String> {
-    let (user, pass) = match p.kind {
-        Kind::GithubApp => ("x-access-token".to_string(), installation_token(p, repo).await?),
-        Kind::GithubToken => ("x-access-token".to_string(), p.token().unwrap_or_default().to_string()),
-        Kind::Forgejo => ("tugport".to_string(), p.token().unwrap_or_default().to_string()),
-        Kind::Gitlab => ("oauth2".to_string(), p.token().unwrap_or_default().to_string()),
+    let user = match p.kind {
+        Kind::GithubApp | Kind::GithubToken => "x-access-token",
+        Kind::Forgejo => "tugport",
+        Kind::Gitlab => "oauth2",
     };
+    let pass = repo_token(p, repo).await?;
     Ok(format!("Authorization: Basic {}", crate::crypto::b64(format!("{user}:{pass}").as_bytes())))
 }
 
-pub fn deploy_key_path(app: &App, service_id: &str) -> std::path::PathBuf {
-    app.paths.run.join("keys").join(format!("{service_id}.key"))
+/// GIT_SSH_COMMAND for the service's deploy key, if it has one: the key is written to `key_path`,
+/// which the caller removes once git is done.
+fn deploy_key_ssh(app: &App, s: &Service, key_path: &Path) -> Result<Option<String>> {
+    let name = format!("deploykey:{}", s.id);
+    let Some(mut key) = app.sealed_state(&name, &name)? else { return Ok(None) };
+    if !key.ends_with('\n') {
+        key.push('\n');
+    }
+    if let Some(dir) = key_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    util::write_private(key_path, key.as_bytes())?;
+    let known = app.paths.data.join("known_hosts");
+    Ok(Some(format!("ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={}", key_path.display(), known.display())))
 }
 
 /// A branch, tag or commit name as git accepts it, and never something git would take as an option.
@@ -230,7 +241,7 @@ fn redact(url: &str) -> String {
 
 /// Builds and Compose read a checkout as root, so it must not hold symlinks that lead out of it
 /// (to /etc/tugport, say, or another service's files).
-pub fn check_links(root: &Path) -> Result<()> {
+fn check_links(root: &Path) -> Result<()> {
     use std::path::Component;
     fn walk(root: &Path, dir: &Path) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
@@ -261,8 +272,20 @@ pub fn check_links(root: &Path) -> Result<()> {
     walk(root, root)
 }
 
+/// Check out a service's Git source for a deploy (its commit, else its ref, else the branch) and
+/// record the commit on the deploy. Returns the folder at the source's path and the commit.
+pub async fn checkout(app: &App, s: &Service, d: &Deploy, log: &(dyn Fn(&str) + Sync)) -> Result<(PathBuf, String)> {
+    let Source::Git { provider, repo, branch, path, .. } = &s.spec.source else { bail!("this service does not deploy from Git") };
+    let git_ref = d.commit_sha.as_deref().or(d.git_ref.as_deref()).unwrap_or(branch);
+    let dest = app.paths.sources().join(&s.id).join("repo");
+    let (sha, msg) = fetch(app, s, provider.as_deref(), repo, git_ref, &dest, log).await?;
+    app.db.exec("UPDATE deploys SET commit_sha = ?1, commit_message = ?2 WHERE id = ?3", params![sha, msg, d.id])?;
+    let dir = util::inside(&dest, path).filter(|d| d.is_dir()).ok_or_else(|| anyhow!("the path {path} does not exist in the repository"))?;
+    Ok((dir, sha))
+}
+
 /// Fetch `git_ref` (branch, tag or commit) into `dest` and check it out. Returns (sha, message).
-pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, git_ref: &str, dest: &Path, log: &(dyn Fn(&str) + Sync)) -> Result<(String, String)> {
+async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, git_ref: &str, dest: &Path, log: &(dyn Fn(&str) + Sync)) -> Result<(String, String)> {
     // Every source of a ref (the spec, webhooks, the API, migration) passes through here.
     if !valid_ref(git_ref) {
         bail!("{git_ref:?} is not a branch, tag or commit name");
@@ -270,11 +293,8 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
     if !valid_repo(repo, provider_id.is_some()) {
         bail!("{repo:?} is not a repository Tugport can fetch: use an https://, ssh:// or git@host: address");
     }
-    let provider = match provider_id {
-        Some(id) => Some(provider(app, id)?.ok_or_else(|| anyhow!("the Git provider of this service was removed"))?),
-        None => None,
-    };
-    let url = provider.as_ref().map(|p| p.clone_url(repo)).unwrap_or_else(|| repo.to_string());
+    let provider = provider_id.map(|id| provider(app, id)?.ok_or_else(|| anyhow!("the Git provider of this service was removed"))).transpose()?;
+    let url = provider.as_ref().map_or_else(|| repo.to_string(), |p| p.clone_url(repo));
     // Scoped to the provider's address, so submodules hosted elsewhere never receive the token,
     // and passed in the environment, which other users cannot read (unlike argv).
     let header = match &provider {
@@ -284,27 +304,8 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
         }
         None => None,
     };
-    let ssh_cmd = match app.db.get_state(&format!("deploykey:{}", s.id))? {
-        Some(sealed) => {
-            let key = app.keys.open_str(&format!("deploykey:{}", s.id), &crate::crypto::unb64(&sealed)?)?;
-            let path = deploy_key_path(app, &s.id);
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
-                f.write_all(key.as_bytes())?;
-                if !key.ends_with('\n') {
-                    f.write_all(b"\n")?;
-                }
-            }
-            let known = app.paths.data.join("known_hosts");
-            Some(format!("ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile={}", path.display(), known.display()))
-        }
-        None => None,
-    };
+    let key_path = app.paths.run.join("keys").join(format!("{}.key", s.id));
+    let ssh_cmd = deploy_key_ssh(app, s, &key_path)?;
     let git = |args: &[&str]| {
         let mut c = Command::new("git");
         if let Some(h) = &header {
@@ -317,35 +318,38 @@ pub async fn checkout(app: &App, s: &Service, provider_id: Option<&str>, repo: &
         }
         c
     };
-    if !dest.join(".git").exists() {
-        std::fs::create_dir_all(dest)?;
-        crate::proc::output(git(&["init", "-q"])).await?;
-        crate::proc::output(git(&["remote", "add", "origin", &url])).await?;
-    } else {
-        crate::proc::output(git(&["remote", "set-url", "origin", &url])).await?;
+    let run = |args: &[&str]| crate::proc::output(git(args));
+    let fetched: Result<(String, String)> = async {
+        if !dest.join(".git").exists() {
+            std::fs::create_dir_all(dest)?;
+            run(&["init", "-q"]).await?;
+            run(&["remote", "add", "origin", &url]).await?;
+        } else {
+            run(&["remote", "set-url", "origin", &url]).await?;
+        }
+        log(&format!("Fetching {git_ref} from {}", redact(&url)));
+        if let Err(e) = crate::proc::run_streamed(git(&["fetch", "-q", "--depth", "50", "--no-tags", "origin", git_ref]), log).await {
+            // Full SHAs not at a branch tip need an unshallow fetch on some hosts.
+            log(&format!("Shallow fetch failed ({e}); fetching all branches"));
+            crate::proc::run_streamed(git(&["fetch", "-q", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]), log).await?;
+            run(&["checkout", "-q", "--force", git_ref]).await?;
+        } else {
+            run(&["checkout", "-q", "--force", "FETCH_HEAD"]).await?;
+        }
+        run(&["clean", "-ffdxq"]).await?;
+        if dest.join(".gitmodules").exists() {
+            crate::proc::run_streamed(git(&["submodule", "update", "--init", "--recursive", "--depth", "1"]), log).await?;
+        }
+        check_links(dest)?;
+        Ok((run(&["rev-parse", "HEAD"]).await?.trim().to_string(), run(&["log", "-1", "--format=%B"]).await?.trim().to_string()))
     }
-    log(&format!("Fetching {git_ref} from {}", redact(&url)));
-    let fetched = crate::proc::run_streamed(git(&["fetch", "-q", "--depth", "50", "--no-tags", "origin", git_ref]), log).await;
-    if let Err(e) = fetched {
-        // Full SHAs not at a branch tip need an unshallow fetch on some hosts.
-        log(&format!("Shallow fetch failed ({e}); fetching all branches"));
-        crate::proc::run_streamed(git(&["fetch", "-q", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]), log).await?;
-        crate::proc::output(git(&["checkout", "-q", "--force", git_ref])).await?;
-    } else {
-        crate::proc::output(git(&["checkout", "-q", "--force", "FETCH_HEAD"])).await?;
+    .await;
+    // The key stays on disk only while git runs, whether or not the fetch worked.
+    if ssh_cmd.is_some() {
+        let _ = std::fs::remove_file(&key_path);
     }
-    crate::proc::output(git(&["clean", "-ffdxq"])).await?;
-    if dest.join(".gitmodules").exists() {
-        crate::proc::run_streamed(git(&["submodule", "update", "--init", "--recursive", "--depth", "1"]), log).await?;
-    }
-    check_links(dest)?;
-    let sha = crate::proc::output(git(&["rev-parse", "HEAD"])).await?.trim().to_string();
-    let msg = crate::proc::output(git(&["log", "-1", "--format=%B"])).await?.trim().to_string();
-    if let Some(ssh) = &ssh_cmd {
-        let _ = ssh;
-        let _ = std::fs::remove_file(deploy_key_path(app, &s.id));
-    }
-    log(&format!("Checked out {} {}", &sha[..sha.len().min(7)], msg.lines().next().unwrap_or("")));
+    let (sha, msg) = fetched?;
+    log(&format!("Checked out {} {}", sha.get(..7).unwrap_or(&sha), msg.lines().next().unwrap_or("")));
     Ok((sha, msg))
 }
 
@@ -356,35 +360,21 @@ pub async fn report(app: &App, s: &Service, d: &Deploy, state: &str, description
     let Ok(Some(p)) = provider(app, pid) else { return };
     let target = app.settings().panel_domain.map(|h| format!("https://{h}/services/{}/deploys/{}", s.id, d.id));
     let res: Result<()> = async {
-        let client = http()?;
+        let token = repo_token(&p, repo).await?;
         let req = match p.kind {
-            Kind::GithubApp | Kind::GithubToken => {
-                let token = match p.kind {
-                    Kind::GithubApp => installation_token(&p, repo).await?,
-                    _ => p.token().unwrap_or_default().to_string(),
-                };
-                client
-                    .post(format!("{}/repos/{repo}/statuses/{sha}", p.api()))
-                    .bearer_auth(token)
-                    .json(&json!({ "state": state, "description": description, "context": "tugport", "target_url": target }))
-            }
-            Kind::Forgejo => client
-                .post(format!("{}/repos/{repo}/statuses/{sha}", p.api()))
-                .header("Authorization", format!("token {}", p.token().unwrap_or_default()))
-                .json(&json!({ "state": state, "description": description, "context": "tugport", "target_url": target })),
             Kind::Gitlab => {
                 let gl = match state {
                     "success" => "success",
                     "failure" => "failed",
                     _ => "running",
                 };
-                client
-                    .post(format!("{}/projects/{}/statuses/{sha}", p.api(), urlencode(repo)))
-                    .header("PRIVATE-TOKEN", p.token().unwrap_or_default())
+                api(&p, Method::POST, &format!("/projects/{}/statuses/{sha}", util::urlencode(repo)), &token)?
                     .json(&json!({ "state": gl, "name": "tugport", "description": description, "target_url": target }))
             }
+            _ => api(&p, Method::POST, &format!("/repos/{repo}/statuses/{sha}"), &token)?
+                .json(&json!({ "state": state, "description": description, "context": "tugport", "target_url": target })),
         };
-        req.send().await?.error_for_status()?;
+        send(req).await?;
         Ok(())
     }
     .await;
@@ -393,31 +383,19 @@ pub async fn report(app: &App, s: &Service, d: &Deploy, state: &str, description
     }
 }
 
-fn urlencode(s: &str) -> String {
-    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
-}
-
-fn hmac_hex(secret: &str, body: &[u8]) -> Option<String> {
-    use hmac::{Hmac, Mac};
-    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(body);
-    Some(hex::encode(mac.finalize().into_bytes()))
+fn hmac_hex(secret: &str, body: &[u8]) -> String {
+    hex::encode(util::hmac_sha256(secret, body))
 }
 
 pub fn verify_webhook(p: &Provider, headers: &axum::http::HeaderMap, body: &[u8]) -> bool {
     let Some(secret) = p.secret() else { return false };
     let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-    match p.kind {
-        Kind::GithubApp | Kind::GithubToken => {
-            let expected = hmac_hex(secret, body);
-            h("x-hub-signature-256").and_then(|s| s.strip_prefix("sha256=")).is_some_and(|sig| expected.is_some_and(|e| util::ct_eq(sig, &e)))
-        }
-        Kind::Forgejo => {
-            let expected = hmac_hex(secret, body);
-            h("x-forgejo-signature").or(h("x-gitea-signature")).is_some_and(|sig| expected.is_some_and(|e| util::ct_eq(sig, &e)))
-        }
-        Kind::Gitlab => h("x-gitlab-token").is_some_and(|t| util::ct_eq(t, secret)),
-    }
+    let sig = match p.kind {
+        Kind::GithubApp | Kind::GithubToken => h("x-hub-signature-256").and_then(|s| s.strip_prefix("sha256=")),
+        Kind::Forgejo => h("x-forgejo-signature").or(h("x-gitea-signature")),
+        Kind::Gitlab => return h("x-gitlab-token").is_some_and(|t| util::ct_eq(t, secret)),
+    };
+    sig.is_some_and(|sig| util::ct_eq(sig, hmac_hex(secret, body)))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -470,7 +448,7 @@ pub fn parse_push(headers: &axum::http::HeaderMap, body: &[u8]) -> Option<Push> 
 }
 
 /// Glob match: `*` within a path segment, `**` across segments; a plain path matches everything under it.
-pub fn path_matches(pattern: &str, path: &str) -> bool {
+fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.trim_start_matches("./").trim_start_matches('/');
     if !pattern.contains('*') {
         let p = pattern.trim_end_matches('/');
@@ -509,126 +487,54 @@ pub fn push_touches(watch: &[String], changed: Option<&[String]>) -> bool {
 /// Create the push webhook on a repository (providers without app-level webhooks).
 pub async fn ensure_webhook(p: &Provider, repo: &str, hook_url: &str) -> Result<()> {
     let secret = p.secret().ok_or_else(|| anyhow!("provider has no webhook secret"))?;
-    let client = http()?;
-    match p.kind {
-        Kind::GithubApp => Ok(()),
-        Kind::GithubToken => {
-            let hooks: Vec<Value> =
-                client.get(format!("{}/repos/{repo}/hooks", p.api())).bearer_auth(p.token().unwrap_or_default()).send().await?.error_for_status()?.json().await?;
-            if hooks.iter().any(|h| h["config"]["url"].as_str() == Some(hook_url)) {
-                return Ok(());
-            }
-            client
-                .post(format!("{}/repos/{repo}/hooks", p.api()))
-                .bearer_auth(p.token().unwrap_or_default())
-                .json(&json!({ "name": "web", "active": true, "events": ["push"], "config": { "url": hook_url, "content_type": "json", "secret": secret } }))
-                .send()
-                .await?
-                .error_for_status()?;
-            Ok(())
-        }
-        Kind::Forgejo => {
-            let auth = format!("token {}", p.token().unwrap_or_default());
-            let hooks: Vec<Value> =
-                client.get(format!("{}/repos/{repo}/hooks", p.api())).header("Authorization", &auth).send().await?.error_for_status()?.json().await?;
-            if hooks.iter().any(|h| h["config"]["url"].as_str() == Some(hook_url)) {
-                return Ok(());
-            }
-            client
-                .post(format!("{}/repos/{repo}/hooks", p.api()))
-                .header("Authorization", &auth)
-                .json(&json!({ "type": "forgejo", "active": true, "events": ["push"], "config": { "url": hook_url, "content_type": "json", "secret": secret } }))
-                .send()
-                .await?
-                .error_for_status()?;
-            Ok(())
-        }
-        Kind::Gitlab => {
-            let pid = urlencode(repo);
-            let hooks: Vec<Value> = client
-                .get(format!("{}/projects/{pid}/hooks", p.api()))
-                .header("PRIVATE-TOKEN", p.token().unwrap_or_default())
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            if hooks.iter().any(|h| h["url"].as_str() == Some(hook_url)) {
-                return Ok(());
-            }
-            client
-                .post(format!("{}/projects/{pid}/hooks", p.api()))
-                .header("PRIVATE-TOKEN", p.token().unwrap_or_default())
-                .json(&json!({ "url": hook_url, "push_events": true, "token": secret }))
-                .send()
-                .await?
-                .error_for_status()?;
-            Ok(())
-        }
+    let config = json!({ "url": hook_url, "content_type": "json", "secret": secret });
+    // (hooks path, where a hook keeps its address, the new hook)
+    let (path, url_at, hook) = match p.kind {
+        Kind::GithubApp => return Ok(()),
+        Kind::GithubToken => (format!("/repos/{repo}/hooks"), "/config/url", json!({ "name": "web", "active": true, "events": ["push"], "config": config })),
+        Kind::Forgejo => (format!("/repos/{repo}/hooks"), "/config/url", json!({ "type": "forgejo", "active": true, "events": ["push"], "config": config })),
+        Kind::Gitlab => (format!("/projects/{}/hooks", util::urlencode(repo)), "/url", json!({ "url": hook_url, "push_events": true, "token": secret })),
+    };
+    let token = p.token().unwrap_or_default();
+    let hooks: Vec<Value> = send(api(p, Method::GET, &path, token)?).await?.json().await?;
+    if !hooks.iter().any(|h| h.pointer(url_at).and_then(Value::as_str) == Some(hook_url)) {
+        send(api(p, Method::POST, &path, token)?.json(&hook)).await?;
     }
+    Ok(())
+}
+
+/// The `key` field of every item of a JSON list.
+fn names(list: &Value, key: &str) -> Vec<String> {
+    list.as_array().into_iter().flatten().filter_map(|r| r[key].as_str().map(String::from)).collect()
 }
 
 /// Repositories the provider can see, for the repository picker.
 pub async fn repos(p: &Provider) -> Result<Vec<String>> {
-    let client = http()?;
-    let names = |v: Vec<Value>, key: &str| -> Vec<String> { v.into_iter().filter_map(|r| r[key].as_str().map(String::from)).collect() };
-    Ok(match p.kind {
+    let (path, key) = match p.kind {
         Kind::GithubApp => {
             let jwt = app_jwt(p)?;
-            let installs: Vec<Value> = client.get(format!("{}/app/installations", p.api())).bearer_auth(&jwt).send().await?.error_for_status()?.json().await?;
+            let installs: Value = send(api(p, Method::GET, "/app/installations", &jwt)?).await?.json().await?;
             let mut out = vec![];
-            for i in installs {
+            for i in installs.as_array().into_iter().flatten() {
                 let Some(inst_id) = i["id"].as_i64() else { continue };
                 let Ok((token, _)) = installation_access(p, &jwt, inst_id).await else { continue };
-                let v: Value = client
-                    .get(format!("{}/installation/repositories?per_page=100", p.api()))
-                    .bearer_auth(token)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                out.extend(names(v["repositories"].as_array().cloned().unwrap_or_default(), "full_name"));
+                let v: Value = send(api(p, Method::GET, "/installation/repositories?per_page=100", &token)?).await?.json().await?;
+                out.extend(names(&v["repositories"], "full_name"));
             }
-            out
+            return Ok(out);
         }
-        Kind::GithubToken => names(
-            client.get(format!("{}/user/repos?per_page=100&sort=pushed", p.api())).bearer_auth(p.token().unwrap_or_default()).send().await?.error_for_status()?.json().await?,
-            "full_name",
-        ),
-        Kind::Forgejo => names(
-            client
-                .get(format!("{}/user/repos?limit=50", p.api()))
-                .header("Authorization", format!("token {}", p.token().unwrap_or_default()))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?,
-            "full_name",
-        ),
-        Kind::Gitlab => names(
-            client
-                .get(format!("{}/projects?membership=true&per_page=100&order_by=last_activity_at", p.api()))
-                .header("PRIVATE-TOKEN", p.token().unwrap_or_default())
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?,
-            "path_with_namespace",
-        ),
-    })
+        Kind::GithubToken => ("/user/repos?per_page=100&sort=pushed", "full_name"),
+        Kind::Forgejo => ("/user/repos?limit=50", "full_name"),
+        Kind::Gitlab => ("/projects?membership=true&per_page=100&order_by=last_activity_at", "path_with_namespace"),
+    };
+    let list: Value = send(api(p, Method::GET, path, p.token().unwrap_or_default())?).await?.json().await?;
+    Ok(names(&list, key))
 }
 
 /// Turn a GitHub App manifest code into a stored provider.
 pub async fn finish_github_manifest(app: &App, provider_id: &str, code: &str) -> Result<(String, String)> {
-    let v: Value = http()?
-        .post(format!("https://api.github.com/app-manifests/{code}/conversions"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()
+    let v: Value = send(http()?.post(format!("https://api.github.com/app-manifests/{code}/conversions")).header("Accept", "application/vnd.github+json"))
+        .await
         .context("GitHub did not accept the app manifest code")?
         .json()
         .await?;
@@ -733,9 +639,9 @@ mod tests {
         let p = Provider { id: "x".into(), kind: Kind::Forgejo, name: "f".into(), base_url: "https://git.example.com".into(), config: json!({ "webhook_secret": "s3cret" }) };
         let body = b"{}";
         let mut h = axum::http::HeaderMap::new();
-        h.insert("x-forgejo-signature", hmac_hex("s3cret", body).unwrap().parse().unwrap());
+        h.insert("x-forgejo-signature", hmac_hex("s3cret", body).parse().unwrap());
         assert!(verify_webhook(&p, &h, body));
-        h.insert("x-forgejo-signature", hmac_hex("wrong", body).unwrap().parse().unwrap());
+        h.insert("x-forgejo-signature", hmac_hex("wrong", body).parse().unwrap());
         assert!(!verify_webhook(&p, &h, body));
     }
 }

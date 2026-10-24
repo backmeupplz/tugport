@@ -4,7 +4,7 @@
 
 use crate::app::{App, AppState};
 use crate::mesh::{self, Peer};
-use crate::nodes::{AGENT_PORT, DOCKER_PORT};
+use crate::nodes::{AGENT_KEY, AGENT_PORT, DOCKER_PORT};
 use crate::{logs, paths, proxy, secrets, util};
 use anyhow::{Context, Result, bail};
 use axum::extract::{ConnectInfo, Path, Request, State};
@@ -35,16 +35,8 @@ fn config_path(p: &paths::Paths) -> std::path::PathBuf {
     p.etc.join("agent.json")
 }
 
-fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(data)?;
-    Ok(())
-}
-
 fn save_config(p: &paths::Paths, c: &AgentConfig) -> Result<()> {
-    write_private(&config_path(p), serde_json::to_string_pretty(c)?.as_bytes())
+    util::write_private(&config_path(p), serde_json::to_string_pretty(c)?.as_bytes())
 }
 
 struct Ctx {
@@ -77,7 +69,6 @@ pub async fn run() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .with(tracing_subscriber::fmt::layer().json().with_ansi(false).with_writer(logs::SelfLogHandle(selflog.clone())))
         .init();
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let config: AgentConfig = serde_json::from_str(&std::fs::read_to_string(config_path(&paths)).context("this server has not joined a panel")?)?;
     if let Err(e) = mesh::install_boot_hook() {
         tracing::warn!("making Docker wait for the mesh at boot: {e:#}");
@@ -90,20 +81,8 @@ pub async fn run() -> Result<()> {
     // It has no secrets of its own: the key below only seals what never leaves this process.
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rng(), key.as_mut());
-    let app: AppState = Arc::new(App {
-        db: crate::db::Db::open(&paths.data.join("agent.db"))?,
-        keys: crate::crypto::Keyring::new(&key),
-        docker: bollard::Docker::connect_with_local_defaults()?,
-        events: tokio::sync::broadcast::channel(16).0,
-        deployer: Default::default(),
-        build_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-        proxy: proxy::Proxy::new()?,
-        logs: tokio::sync::broadcast::channel(16).0,
-        selflog,
-        metrics: Default::default(),
-        nodes: Default::default(),
-        paths,
-    });
+    let db = crate::db::Db::open(&paths.data.join("agent.db"))?;
+    let app = App::new(paths, db, crate::crypto::Keyring::new(&key), bollard::Docker::connect_with_local_defaults()?, selflog, 1)?;
     *util::write(&app.proxy.me) = config.node_id.clone();
     crate::install_init_binary(&app)?;
     if let Some(table) = std::fs::read_to_string(app.paths.data.join("agent-routes.json")).ok().and_then(|t| serde_json::from_str(&t).ok()) {
@@ -113,24 +92,16 @@ pub async fn run() -> Result<()> {
     let ctx: Shared = Arc::new(Ctx { app: app.clone(), config: tokio::sync::Mutex::new(config), secret: secret.clone(), started: std::time::Instant::now() });
 
     tokio::spawn(crate::metrics::sample_loop(app.clone(), false));
-    // Docker restarts and firewall reloads drop iptables rules; keep containers off the mesh.
-    {
-        let app = app.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                if let Err(e) = mesh::guard() {
-                    tracing::error!("{e:#}");
-                }
-                let info = app.docker.info().await.ok();
-                if let Err(e) = mesh::guard_swarm(info.as_ref().and_then(|i| i.swarm.as_ref()?.node_addr.as_deref())) {
-                    tracing::error!("{e:#}");
-                }
-                // Logs a warning when swarm mode breaks, even while the panel is away.
-                crate::nodes::swarm_problem(info.as_ref());
-            }
-        });
-    }
+    // Docker restarts and firewall reloads drop iptables rules; keep containers off the mesh,
+    // and log a warning when swarm mode breaks, even while the panel is away.
+    let docker = app.docker.clone();
+    tokio::spawn(util::every(60, "guarding the mesh", move || {
+        let docker = docker.clone();
+        async move {
+            crate::nodes::swarm_problem(crate::nodes::guard_mesh(&docker).await.as_ref());
+            Ok(())
+        }
+    }));
     tokio::spawn(docker_proxy(mesh_ip.clone(), secret));
     {
         let app = app.clone();
@@ -157,9 +128,13 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+fn from_panel(peer: &SocketAddr) -> bool {
+    peer.ip().to_string() == mesh::PANEL_IP
+}
+
 async fn only_panel(State(ctx): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
-    let key = req.headers().get("x-tugport-agent-key").and_then(|v| v.to_str().ok()).unwrap_or_default();
-    if peer.ip().to_string() != mesh::PANEL_IP || !util::ct_eq(key, &ctx.secret) {
+    let key = req.headers().get(AGENT_KEY).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    if !from_panel(&peer) || !util::ct_eq(key, &ctx.secret) {
         return (StatusCode::FORBIDDEN, Json(json!({ "error": "only the panel may call this agent" }))).into_response();
     }
     next.run(req).await
@@ -173,8 +148,16 @@ async fn docker_proxy(mesh_ip: String, secret: String) {
         return;
     };
     loop {
-        let Ok((stream, peer)) = listener.accept().await else { continue };
-        if peer.ip().to_string() != mesh::PANEL_IP {
+        let (stream, peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                // Out of descriptors, say: wait rather than spin.
+                tracing::debug!("accepting a docker connection: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if !from_panel(&peer) {
             continue;
         }
         let secret = secret.clone();
@@ -217,11 +200,12 @@ async fn docker_conn(mut stream: tokio::net::TcpStream, secret: &str) -> Result<
 
 fn request_has_key(head: &[u8], secret: &str) -> bool {
     String::from_utf8_lossy(head).lines().skip(1).any(|l| {
-        l.split_once(':').is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("x-tugport-agent-key") && util::ct_eq(v.trim(), secret))
+        l.split_once(':').is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case(AGENT_KEY) && util::ct_eq(v.trim(), secret))
     })
 }
 
-fn fail(e: anyhow::Error) -> Failure {
+fn fail(e: impl Into<anyhow::Error>) -> Failure {
+    let e = e.into();
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e:#}") })))
 }
 
@@ -241,8 +225,8 @@ async fn peers(State(ctx): State<Shared>, Json(peers): Json<Vec<Peer>>) -> Resul
 }
 
 async fn routes(State(ctx): State<Shared>, Json(table): Json<proxy::Table>) -> Result<Json<Value>, Failure> {
-    let text = serde_json::to_string(&table).map_err(|e| fail(e.into()))?;
-    std::fs::write(ctx.app.paths.data.join("agent-routes.json"), text).map_err(|e| fail(e.into()))?;
+    let text = serde_json::to_string(&table).map_err(fail)?;
+    std::fs::write(ctx.app.paths.data.join("agent-routes.json"), text).map_err(fail)?;
     ctx.app.proxy.set_table(table);
     Ok(Json(json!({ "ok": true })))
 }
@@ -273,9 +257,14 @@ struct SecretsIn {
     files: Vec<(String, String)>,
 }
 
+/// A Docker container name, safe as a file name under /run.
+fn container_name(c: &str) -> bool {
+    c.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') && !c.starts_with('.')
+}
+
 /// Secrets land in this server's memory-only /run, exactly as on the panel's server.
 async fn put_secrets(State(ctx): State<Shared>, Path(container): Path<String>, Json(b): Json<SecretsIn>) -> Result<Json<Value>, Failure> {
-    if !container.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') || container.starts_with('.') {
+    if !container_name(&container) {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "bad container name" }))));
     }
     let env: BTreeMap<String, Zeroizing<String>> = b.env.into_iter().map(|(k, v)| (k, Zeroizing::new(v))).collect();
@@ -286,7 +275,7 @@ async fn put_secrets(State(ctx): State<Shared>, Path(container): Path<String>, J
 }
 
 async fn delete_secrets(State(ctx): State<Shared>, Path(container): Path<String>) -> Json<Value> {
-    if container.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') && !container.starts_with('.') {
+    if container_name(&container) {
         secrets::forget(&ctx.app, &container);
     }
     Json(json!({ "ok": true }))
@@ -312,7 +301,7 @@ async fn check(Json(q): Json<CheckIn>) -> Json<Value> {
 }
 
 async fn metrics(State(ctx): State<Shared>) -> Json<Value> {
-    Json(serde_json::to_value(util::lock(&ctx.app.metrics.latest).clone()).unwrap_or_default())
+    Json(serde_json::to_value(&*util::lock(&ctx.app.metrics.latest)).unwrap_or_default())
 }
 
 /// Leave the panel: drop out of the swarm and the mesh, then stop for good.
@@ -334,14 +323,14 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
     let paths = paths::Paths::from_env();
     paths.ensure()?;
     let (private, public) = mesh::keypair()?;
-    write_private(&paths.etc.join("wg.key"), private.as_bytes())?;
+    util::write_private(&paths.etc.join("wg.key"), private.as_bytes())?;
     let endpoint = crate::public_ip().map(|ip| format!("{ip}:{}", mesh::PORT));
     let hostname = std::fs::read_to_string("/etc/hostname").map(|h| h.trim().to_string()).unwrap_or_default();
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
+    let client = util::http(60).build()?;
     // The token never leaves this server; see nodes::join_secret.
     let req = crate::nodes::JoinRequest {
-        token_id: hex::encode(crate::nodes::join_secret(token, "id")?),
-        proof: hex::encode(crate::nodes::join_secret(token, &format!("proof:{public}"))?),
+        token_id: hex::encode(crate::nodes::join_secret(token, "id")),
+        proof: hex::encode(crate::nodes::join_secret(token, &format!("proof:{public}"))),
         name: hostname,
         wg_public_key: public,
         endpoint,
@@ -359,30 +348,24 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
         bail!("the panel refused to add this server: {}", v["error"].as_str().unwrap_or(status.as_str()));
     }
     let envelope: crate::nodes::JoinEnvelope = serde_json::from_value(v)?;
-    let opened = crate::crypto::Keyring::new(&crate::nodes::join_secret(token, "response")?)
+    let opened = crate::crypto::Keyring::new(&crate::nodes::join_secret(token, "response"))
         .open_str("join", &crate::crypto::unb64(&envelope.sealed)?)
         .context("the panel's answer did not open with this token")?;
     let r: crate::nodes::JoinResponse = serde_json::from_str(&opened)?;
     mesh::guard()?;
     mesh::up(&paths.etc.join("wg.key"), &r.mesh_ip)?;
     mesh::set_peers(&r.peers)?;
-    let state = std::process::Command::new("docker").args(["info", "--format", "{{.Swarm.LocalNodeState}}"]).output()?;
-    if String::from_utf8_lossy(&state.stdout).trim() != "active" {
+    if !crate::nodes::swarm_active(&bollard::Docker::connect_with_local_defaults()?).await? {
+        let panel = format!("{}:2377", mesh::PANEL_IP);
         // The first packets may wait for the WireGuard handshake.
-        let mut last = String::new();
-        for _ in 0..10 {
-            let out = std::process::Command::new("docker")
-                .args(["swarm", "join", "--token", &r.swarm_token, "--advertise-addr", &r.mesh_ip, "--data-path-addr", &r.mesh_ip, &format!("{}:2377", mesh::PANEL_IP)])
-                .output()?;
-            if out.status.success() {
-                last.clear();
-                break;
+        for attempt in 1.. {
+            let mut c = tokio::process::Command::new("docker");
+            c.args(["swarm", "join", "--token", &r.swarm_token, "--advertise-addr", &r.mesh_ip, "--data-path-addr", &r.mesh_ip, &panel]);
+            match crate::proc::output(c).await {
+                Ok(_) => break,
+                Err(e) if attempt == 10 => return Err(e.context("joining the overlay network failed")),
+                Err(_) => tokio::time::sleep(Duration::from_secs(3)).await,
             }
-            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-        if !last.is_empty() {
-            bail!("joining the overlay network failed: {last}");
         }
     }
     let config = AgentConfig { node_id: r.node_id, panel_url: panel_url.to_string(), mesh_ip: r.mesh_ip, secret: r.secret, peers: r.peers };
@@ -393,6 +376,13 @@ pub async fn join(panel_url: &str, token: &str) -> Result<AgentConfig> {
 #[cfg(test)]
 mod tests {
     use super::request_has_key;
+
+    #[test]
+    fn secrets_only_for_plain_container_names() {
+        use super::container_name;
+        assert!(container_name("web-1.abc_x"));
+        assert!(!container_name(".hidden") && !container_name("../etc") && !container_name("a/b"));
+    }
 
     #[test]
     fn docker_requests_need_the_key() {

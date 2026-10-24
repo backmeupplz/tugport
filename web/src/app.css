@@ -1,23 +1,25 @@
 @import "tailwindcss";
 
 /* Every color is a token with a light and a dark value. `color-scheme` picks one:
-   the system preference by default, or the manual choice stored by the theme toggle. */
+   the system preference by default, or the manual choice stored by the theme menu. */
 :root {
   color-scheme: light dark;
-  --bg: light-dark(#f6f3ee, #0b1018);
-  --surface: light-dark(#ffffff, #121a26);
-  --raised: light-dark(#efe9e0, #1a2433);
-  --line: light-dark(#e1d9cc, #243349);
-  --text: light-dark(#121a26, #e9eef5);
-  --dim: light-dark(#465264, #a3afc0);
-  --muted: light-dark(#5f6979, #8592a6);
+  --bg: light-dark(#f7f6f2, #0a0e14);
+  --surface: light-dark(#ffffff, #10161f);
+  --raised: light-dark(#f1eee8, #18202b);
+  --line: light-dark(#e6e1d8, #1f2936);
+  --line-strong: light-dark(#d4cdc1, #2c3848);
+  --text: light-dark(#141b26, #e8edf3);
+  --dim: light-dark(#4a5567, #a0abba);
+  --muted: light-dark(#667080, #7a8698);
   --accent: #ff6a3d;
-  --accent-ink: #0b1018;
+  --accent-ink: #0a0e14;
   --accent-text: light-dark(#b8401c, #ff8a63);
   --ok: light-dark(#117535, #4ade80);
   --warn: light-dark(#a35207, #fbbf24);
   --bad: light-dark(#b91c1c, #f87171);
   --info: light-dark(#1d4ed8, #7cb4fb);
+  --shadow: 0 1px 2px light-dark(rgb(20 27 38 / 0.06), transparent);
   /* Chart series, validated for both surfaces (see charts.tsx). */
   --series-1: light-dark(#2a78d6, #3987e5);
   --series-2: light-dark(#eb6834, #d95926);
@@ -35,6 +37,7 @@
   --color-surface: var(--surface);
   --color-raised: var(--raised);
   --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
   --color-text: var(--text);
   --color-dim: var(--dim);
   --color-muted: var(--muted);
@@ -60,6 +63,7 @@
     font-family: var(--font-sans);
     font-size: 14px;
     line-height: 1.5;
+    font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
   }
   button,
@@ -80,59 +84,59 @@
     font-size: 0.92em;
   }
   dialog::backdrop {
-    background: rgb(0 0 0 / 0.55);
+    background: rgb(4 7 12 / 0.6);
+    backdrop-filter: blur(2px);
   }
 }
 
 @layer components {
   .btn {
-    @apply inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-line bg-surface px-3 py-1.5 text-sm font-medium text-text hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-line bg-surface px-3 text-[13px] font-medium text-text shadow-(--shadow) transition-colors hover:border-line-strong hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-primary {
-    @apply border-transparent bg-accent text-accent-ink hover:bg-accent hover:brightness-110;
+    @apply border-transparent bg-accent text-accent-ink hover:border-transparent hover:bg-accent hover:brightness-110;
   }
   .btn-danger {
-    @apply border-bad/50 text-bad hover:bg-bad/10;
+    @apply border-bad/40 text-bad hover:border-bad/60 hover:bg-bad/10;
   }
   .btn-ghost {
-    @apply border-transparent bg-transparent;
+    @apply border-transparent bg-transparent shadow-none hover:border-transparent;
+  }
+  .btn-sm {
+    @apply h-7 px-2 text-xs;
   }
   .input {
-    @apply block w-full min-w-0 rounded-md border border-line bg-bg px-3 py-1.5 text-sm text-text placeholder:text-muted disabled:opacity-60;
+    @apply block h-9 w-full min-w-0 rounded-lg border border-line bg-bg px-3 text-sm text-text transition-colors placeholder:text-muted hover:border-line-strong focus:border-accent/70 focus:outline-none focus-visible:outline-none focus:ring-3 focus:ring-accent/15 disabled:opacity-60;
   }
   textarea.input {
-    @apply font-mono text-[13px] leading-snug;
+    @apply h-auto py-2 font-mono text-[13px] leading-snug;
   }
   .card {
-    @apply rounded-lg border border-line bg-surface;
+    @apply rounded-xl border border-line bg-surface shadow-(--shadow);
   }
   .label {
-    @apply mb-1 block text-xs font-medium text-dim;
+    @apply mb-1.5 block text-[13px] font-medium text-dim;
   }
   .hint {
-    @apply mt-1 block text-xs text-muted;
+    @apply mt-1.5 block text-xs leading-relaxed text-muted;
   }
   .link {
     @apply text-accent-text underline-offset-2 hover:underline;
   }
+  /* One entry of a card's list (see Rows). */
+  .row {
+    @apply flex flex-wrap items-center gap-3 px-5 py-3;
+  }
+  /* A bordered list inside a card. */
+  .inset-list {
+    @apply divide-y divide-line rounded-lg border border-line;
+  }
   .chip {
-    @apply inline-flex items-center gap-1 whitespace-nowrap rounded border border-line px-1.5 py-px text-xs text-dim;
+    @apply inline-flex items-center gap-1 whitespace-nowrap rounded-md border border-line bg-raised/60 px-1.5 py-px text-xs text-dim;
   }
 }
 
-/* uPlot legend and axes follow the panel's text tokens. */
+/* uPlot follows the panel's font; its legend is replaced by the chart header's readout. */
 .uplot {
   font-family: var(--font-sans);
-}
-.u-legend {
-  font-size: 12px;
-  color: var(--dim);
-  text-align: left;
-}
-.u-legend .u-marker {
-  border-radius: 2px;
-}
-/* The time entry only repeats the axis; the series entries are the hover readout. */
-.u-legend .u-series:first-child {
-  display: none;
 }

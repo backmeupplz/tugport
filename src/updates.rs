@@ -3,11 +3,8 @@
 
 use crate::app::AppState;
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::StreamExt;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 
 const REPO: &str = "backmeupplz/tugport";
 
@@ -26,7 +23,7 @@ fn asset_name() -> String {
 }
 
 pub async fn latest() -> Result<Release> {
-    let client = reqwest::Client::builder().user_agent(concat!("tugport/", env!("CARGO_PKG_VERSION"))).https_only(true).timeout(Duration::from_secs(30)).build()?;
+    let client = crate::util::http(30).https_only(true).build()?;
     let v: serde_json::Value = client.get(format!("https://api.github.com/repos/{REPO}/releases/latest")).send().await?.error_for_status()?.json().await?;
     let version = v["tag_name"].as_str().ok_or_else(|| anyhow!("no release found"))?.trim_start_matches('v').to_string();
     let find = |name: &str| {
@@ -40,38 +37,42 @@ pub async fn latest() -> Result<Release> {
     })
 }
 
+/// Whether release `candidate` (`x.y.z`) is newer than this build. Anything else, such as a
+/// pre-release, never is.
 pub fn newer(candidate: &str) -> bool {
-    match (semver::Version::parse(candidate), semver::Version::parse(crate::VERSION)) {
-        (Ok(a), Ok(b)) => a > b,
-        _ => false,
+    fn parse(v: &str) -> Option<[u64; 3]> {
+        let mut parts = v.split('.').map(|p| p.parse().ok());
+        let v = [parts.next()??, parts.next()??, parts.next()??];
+        parts.next().is_none().then_some(v)
     }
+    matches!((parse(candidate), parse(crate::VERSION)), (Some(a), Some(b)) if a > b)
+}
+
+/// The hash `SHA256SUMS` lists for `name` (lines of `<hash>  <name>`).
+fn checksum<'a>(sums: &'a str, name: &str) -> Option<&'a str> {
+    sums.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        let hash = words.next()?;
+        (words.next()? == name).then_some(hash)
+    })
 }
 
 /// Download, verify and install the latest release, then hand over to it.
 pub async fn apply(app: &AppState) -> Result<()> {
-    let r = latest().await?;
+    install(app, latest().await?).await
+}
+
+async fn install(app: &AppState, r: Release) -> Result<()> {
     if !newer(&r.version) {
         bail!("Tugport {} is already the newest version", crate::VERSION);
     }
     let exe = crate::handoff::binary_path()?;
     let tmp = exe.with_extension("download");
-    let client = reqwest::Client::builder().https_only(true).timeout(Duration::from_secs(600)).build()?;
+    let client = crate::util::http(600).https_only(true).build()?;
     let sums = client.get(&r.sums).send().await?.error_for_status()?.text().await?;
-    let expected = sums
-        .lines()
-        .find_map(|l| l.split_whitespace().collect::<Vec<_>>().split_first().and_then(|(h, rest)| (rest.first() == Some(&asset_name().as_str())).then(|| h.to_string())))
-        .ok_or_else(|| anyhow!("SHA256SUMS does not list {}", asset_name()))?;
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut hasher = Sha256::new();
-    let mut stream = client.get(&r.binary).send().await?.error_for_status()?.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        hasher.update(&chunk);
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    drop(file);
-    if hex::encode(hasher.finalize()) != expected {
+    let asset = asset_name();
+    let expected = checksum(&sums, &asset).ok_or_else(|| anyhow!("SHA256SUMS does not list {asset}"))?;
+    if !crate::util::download(client.get(&r.binary).send().await?, &tmp).await?.eq_ignore_ascii_case(expected) {
         let _ = std::fs::remove_file(&tmp);
         bail!("the downloaded binary does not match its checksum");
     }
@@ -97,19 +98,30 @@ pub async fn apply(app: &AppState) -> Result<()> {
 
 /// Install new releases automatically when enabled in settings.
 pub async fn auto(app: AppState) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
-        if !app.settings().updates.auto {
-            continue;
+    crate::util::every(6 * 3600, "automatic update", || auto_tick(app.clone())).await
+}
+
+async fn auto_tick(app: AppState) -> Result<()> {
+    if app.settings().updates.auto {
+        let r = latest().await?;
+        if newer(&r.version) {
+            install(&app, r).await?;
         }
-        match latest().await {
-            Ok(r) if newer(&r.version) => {
-                if let Err(e) = apply(&app).await {
-                    tracing::warn!("automatic update failed: {e:#}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::debug!("update check failed: {e:#}"),
-        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksums_and_versions() {
+        let sums = "aa  tugport-linux-aarch64\nbb *tugport-linux-x86_64\ncc  tugport-linux-x86_64.sig\n\n";
+        assert_eq!(checksum(sums, "tugport-linux-aarch64"), Some("aa"));
+        assert_eq!(checksum(sums, "tugport-linux-x86_64"), None, "binary-mode entries keep their star");
+        assert_eq!(checksum(sums, "tugport-linux-x86_64.sig"), Some("cc"));
+        assert!(newer("999.0.0"));
+        assert!(!newer("0.0.1") && !newer("999.0.0-rc1") && !newer("999.0"));
     }
 }

@@ -1,6 +1,6 @@
 import { useState } from "preact/hooks";
 import { post, useApi } from "../api";
-import { Action, Check, CodeBlock, ErrorBox, Field, Modal, NameInput, Note, Select, errText, useForm, useSubmit } from "../ui";
+import { Action, Check, CodeBlock, ErrorBox, Field, Input, Modal, NameInput, Note, Select, TextArea, errText, useForm, useSubmit } from "../ui";
 import { lines } from "../util";
 
 type Kind = "git" | "image" | "dockerfile" | "compose" | "database";
@@ -19,6 +19,12 @@ export const PROVIDER_KINDS: Record<string, string> = {
   gitea: "Gitea",
   gitlab: "GitLab",
 };
+
+/** Where a repository comes from: a URL or one of the connected Git hosts. */
+export const providerOptions = (list: { id: string; kind: string; name: string }[] = []): [string, string][] => [
+  ["", "A URL (public, or private with a deploy key)"],
+  ...list.map((p): [string, string] => [p.id, `${p.name} (${PROVIDER_KINDS[p.kind] ?? p.kind})`]),
+];
 
 export const BUILDS: [string, string][] = [
   ["auto", "Automatic (Dockerfile if present, otherwise Railpack)"],
@@ -74,7 +80,7 @@ const needsKey = (f: Form) => !f.provider && /^(git@|ssh:\/\/)/.test(f.repo.trim
 
 export function gitSource(f: Pick<Form, "provider" | "repo" | "branch" | "path" | "watch" | "auto">, compose = false) {
   return {
-    type: "git",
+    type: "git" as const,
     provider: f.provider || null,
     repo: f.repo.trim(),
     branch: f.branch.trim() || "main",
@@ -84,7 +90,9 @@ export function gitSource(f: Pick<Form, "provider" | "repo" | "branch" | "path" 
   };
 }
 
-export function buildSpec(f: Pick<Form, "build" | "dockerfile" | "target" | "builder">) {
+type BuildForm = Pick<Form, "build" | "dockerfile" | "target" | "builder">;
+
+export function buildSpec(f: BuildForm) {
   if (f.build === "dockerfile") return { type: "dockerfile", path: f.dockerfile.trim() || "Dockerfile", target: f.target.trim() || null };
   if (f.build === "buildpacks") return { type: "buildpacks", builder: f.builder.trim() || "heroku/builder:24" };
   return { type: f.build };
@@ -162,23 +170,30 @@ export function NewService(props: { project: { id: string; name: string }; open:
             <>
               <GitFields form={form} />
               <BuildFields f={f} set={set} bind={bind} />
-              <Field label="Watch paths (optional)" hint="Redeploy only when a push changes these paths, one glob per line. Leave this empty to redeploy on any change.">
-                <textarea class="input h-20" placeholder={"apps/api/**\npackages/shared/**"} spellcheck={false} {...bind("watch")} />
-              </Field>
+              <TextArea
+                label="Watch paths (optional)"
+                hint="Redeploy only when a push changes these paths, one glob per line. Leave this empty to redeploy on any change."
+                class="h-20"
+                placeholder={"apps/api/**\npackages/shared/**"}
+                {...bind("watch")}
+              />
               <Check checked={f.auto} onChange={(auto) => set({ auto })} label="Deploy on every push" hint="Pushes to the branch start a deploy automatically." />
             </>
           )}
 
           {kind === "image" && (
-            <Field label="Image" hint="Registry credentials for private images are set once in Settings, under Registries.">
-              <input class="input font-mono" required placeholder="ghcr.io/owner/app:1.4.2" spellcheck={false} {...bind("image")} />
-            </Field>
+            <Input
+              label="Image"
+              hint="Registry credentials for private images are set once in Settings, under Registries."
+              mono
+              required
+              placeholder="ghcr.io/owner/app:1.4.2"
+              {...bind("image")}
+            />
           )}
 
           {kind === "dockerfile" && (
-            <Field label="Dockerfile">
-              <textarea class="input h-56" required spellcheck={false} placeholder={'FROM node:24-alpine\nWORKDIR /app\nCOPY . .\nCMD ["node", "server.js"]'} {...bind("content")} />
-            </Field>
+            <TextArea label="Dockerfile" class="h-56" required placeholder={'FROM node:24-alpine\nWORKDIR /app\nCOPY . .\nCMD ["node", "server.js"]'} {...bind("content")} />
           )}
 
           {kind === "compose" && (
@@ -196,9 +211,14 @@ export function NewService(props: { project: { id: string; name: string }; open:
                 ))}
               </fieldset>
               {f.composeFrom === "paste" ? (
-                <Field label="docker-compose.yml" hint="Every container shows up with its own logs, charts and domains. Sections with build: use the same builder as apps.">
-                  <textarea class="input h-64" required spellcheck={false} placeholder={"services:\n  web:\n    image: nginx:alpine"} {...bind("yaml")} />
-                </Field>
+                <TextArea
+                  label="docker-compose.yml"
+                  hint="Every container shows up with its own logs, charts and domains. Sections with build: use the same builder as apps."
+                  class="h-64"
+                  required
+                  placeholder={"services:\n  web:\n    image: nginx:alpine"}
+                  {...bind("yaml")}
+                />
               ) : (
                 <GitFields form={form} compose />
               )}
@@ -211,26 +231,18 @@ export function NewService(props: { project: { id: string; name: string }; open:
                 <Field label="Engine">
                   <Select value={f.engine} onChange={(engine) => set({ engine })} options={ENGINES} />
                 </Field>
-                <Field label="Image (optional)" hint="Leave this empty to pin the newest stable release.">
-                  <input class="input font-mono" spellcheck={false} placeholder={`${f.engine}:<version>`} {...bind("dbImage")} />
-                </Field>
+                <Input label="Image (optional)" hint="Leave this empty to pin the newest stable release." mono placeholder={`${f.engine}:<version>`} {...bind("dbImage")} />
               </div>
               {f.engine !== "redis" && (
                 <details>
                   <summary class="text-sm text-dim">User and database name</summary>
                   <div class="mt-3 grid gap-4 sm:grid-cols-2">
-                    <Field label="User">
-                      <input class="input font-mono" placeholder={f.engine === "mongo" ? "admin" : "app"} {...bind("dbUser")} />
-                    </Field>
-                    <Field label="Database">
-                      <input class="input font-mono" placeholder="app" {...bind("dbName")} />
-                    </Field>
+                    <Input label="User" class="font-mono" placeholder={f.engine === "mongo" ? "admin" : "app"} {...bind("dbUser")} />
+                    <Input label="Database" class="font-mono" placeholder="app" {...bind("dbName")} />
                   </div>
                 </details>
               )}
-              <p class="text-xs text-muted">
-                Tugport generates the password, keeps the data in a volume and adds a connection URL to the project variables.
-              </p>
+              <p class="text-xs text-muted">Tugport generates the password, keeps the data in a volume and adds a connection URL to the project variables.</p>
             </>
           )}
 
@@ -264,16 +276,18 @@ function GitFields(props: { form: ReturnType<typeof useForm<Form>>; compose?: bo
   return (
     <>
       <Field label="Repository from" hint={list.length ? undefined : "Connect GitHub, Forgejo, Gitea or GitLab in Settings to pick repositories and deploy on push."}>
-        <Select
-          value={f.provider}
-          onChange={(provider) => set({ provider, repo: "" })}
-          options={[["", "A URL (public, or private with a deploy key)"], ...list.map((p): [string, string] => [p.id, `${p.name} (${PROVIDER_KINDS[p.kind] ?? p.kind})`])]}
-        />
+        <Select value={f.provider} onChange={(provider) => set({ provider, repo: "" })} options={providerOptions(list)} />
       </Field>
       {f.provider ? (
         <Field
           label="Repository"
-          hint={repos.error ? `Could not list repositories: ${repos.error.message}` : repos.loading ? "Loading repositories…" : "Start typing to search the repositories this connection can see."}
+          hint={
+            repos.error
+              ? `Could not list repositories: ${repos.error.message}`
+              : repos.loading
+                ? "Loading repositories…"
+                : "Start typing to search the repositories this connection can see."
+          }
         >
           <input class="input font-mono" required list="tp-repos" placeholder="owner/name" spellcheck={false} autoComplete="off" {...bind("repo")} />
           <datalist id="tp-repos">
@@ -283,33 +297,30 @@ function GitFields(props: { form: ReturnType<typeof useForm<Form>>; compose?: bo
           </datalist>
         </Field>
       ) : (
-        <Field label="Repository URL" hint="A private repository needs its SSH URL, like git@github.com:owner/app.git, and the deploy key that the next step shows.">
-          <input class="input font-mono" required placeholder="https://github.com/owner/app.git" spellcheck={false} autoComplete="off" {...bind("repo")} />
-        </Field>
+        <Input
+          label="Repository URL"
+          hint="A private repository needs its SSH URL, like git@github.com:owner/app.git, and the deploy key that the next step shows."
+          mono
+          required
+          placeholder="https://github.com/owner/app.git"
+          autoComplete="off"
+          {...bind("repo")}
+        />
       )}
       <div class="grid gap-4 sm:grid-cols-2">
-        <Field label="Branch">
-          <input class="input font-mono" required spellcheck={false} {...bind("branch")} />
-        </Field>
+        <Input label="Branch" mono required {...bind("branch")} />
         {props.compose ? (
-          <Field label="Compose file">
-            <input class="input font-mono" spellcheck={false} {...bind("file")} />
-          </Field>
+          <Input label="Compose file" mono {...bind("file")} />
         ) : (
-          <Field label="Path (optional)" hint="This is the build context inside the repository.">
-            <input class="input font-mono" placeholder="apps/api" spellcheck={false} {...bind("path")} />
-          </Field>
+          <Input label="Path (optional)" hint="This is the build context inside the repository." mono placeholder="apps/api" {...bind("path")} />
         )}
       </div>
     </>
   );
 }
 
-export function BuildFields(props: {
-  f: Pick<Form, "build" | "dockerfile" | "target" | "builder">;
-  set: (p: Partial<Form>) => void;
-  bind: (k: keyof Form) => { value: string; onInput: (e: any) => void };
-}) {
+/** The build method and its options, shared by the new-service form and the service settings. */
+export function BuildFields(props: { f: BuildForm; set: (p: Partial<BuildForm>) => void; bind: (k: keyof BuildForm) => { value: string; onInput: (e: any) => void } }) {
   const { f, set, bind } = props;
   return (
     <>
@@ -318,19 +329,11 @@ export function BuildFields(props: {
       </Field>
       {f.build === "dockerfile" && (
         <div class="grid gap-4 sm:grid-cols-2">
-          <Field label="Dockerfile path">
-            <input class="input font-mono" spellcheck={false} {...bind("dockerfile")} />
-          </Field>
-          <Field label="Target stage (optional)">
-            <input class="input font-mono" spellcheck={false} {...bind("target")} />
-          </Field>
+          <Input label="Dockerfile path" mono {...bind("dockerfile")} />
+          <Input label="Target stage (optional)" mono {...bind("target")} />
         </div>
       )}
-      {f.build === "buildpacks" && (
-        <Field label="Builder image">
-          <input class="input font-mono" spellcheck={false} {...bind("builder")} />
-        </Field>
-      )}
+      {f.build === "buildpacks" && <Input label="Builder image" mono {...bind("builder")} />}
     </>
   );
 }
@@ -347,8 +350,8 @@ function Result(props: { created: Created; project: string; gitKey: boolean; onC
         <div class="space-y-2">
           <CodeBlock label="Connection URL" text={c.database.url} />
           <p class="text-xs text-muted">
-            Copy it now, because this is the only time it is shown here. It is also saved as the project variable{" "}
-            <code>{c.database.project_var}</code>, so other services in the project can use it.
+            Copy it now, because this is the only time it is shown here. It is also saved as the project variable <code>{c.database.project_var}</code>, so other services in the
+            project can use it.
           </p>
         </div>
       )}

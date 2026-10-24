@@ -1,7 +1,7 @@
 //! Turning services into running containers: networks, container configs, health checks.
 
 use crate::app::{App, AppState};
-use crate::model::{HealthKind, Mount, Protocol, ServiceSpec};
+use crate::model::{Health, HealthKind, Mount, Protocol, ServiceSpec};
 use crate::nodes::NodeHandle;
 use crate::secrets;
 use crate::store::{self, Project, Service};
@@ -22,7 +22,7 @@ pub const L_MANAGED: &str = "tugport.managed";
 pub const L_PROJECT: &str = "tugport.project";
 pub const L_SERVICE: &str = "tugport.service";
 pub const L_DEPLOY: &str = "tugport.deploy";
-pub const L_REPLICA: &str = "tugport.replica";
+const L_REPLICA: &str = "tugport.replica";
 pub const L_NODE: &str = "tugport.node";
 
 /// With one server, projects get a bridge network; with more, an overlay spanning them.
@@ -36,7 +36,7 @@ pub fn overlay_name(project: &str) -> String {
 
 /// Bridge on every server of a multi-server setup that its proxy reaches replicas through;
 /// containers on it cannot talk to each other.
-pub const INGRESS: &str = "tp-ingress";
+const INGRESS: &str = "tp-ingress";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Replica {
@@ -56,8 +56,27 @@ pub struct Replica {
     pub compose_service: Option<String>,
 }
 
-fn label_filter(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+/// Docker's `filters` that match containers carrying all these labels.
+pub fn label_filter(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
     HashMap::from([("label".into(), pairs.iter().map(|(k, v)| format!("{k}={v}")).collect())])
+}
+
+/// Docker's `filters` that match every container Tugport runs.
+pub fn managed() -> HashMap<String, Vec<String>> {
+    label_filter(&[(L_MANAGED, "true")])
+}
+
+/// Labels that tie a container to its service, deploy and server.
+pub fn labels(s: &Service, deploy_id: &str, node: &str) -> [(&'static str, String); 5] {
+    [(L_MANAGED, "true".into()), (L_PROJECT, s.project_id.clone()), (L_SERVICE, s.id.clone()), (L_DEPLOY, deploy_id.into()), (L_NODE, node.into())]
+}
+
+/// Log rotation of every container Tugport runs.
+pub const LOG_LIMITS: [(&str, &str); 2] = [("max-size", "10m"), ("max-file", "3")];
+
+/// A container's name as Docker lists it (`/web-1`), without the slash.
+pub fn listed_name(names: Option<Vec<String>>) -> String {
+    names.and_then(|n| n.into_iter().next()).unwrap_or_default().trim_start_matches('/').to_string()
 }
 
 /// (node id, Docker) of every online server; just this one before nodes are loaded.
@@ -97,8 +116,9 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
             Err(_) => continue,
         };
         for c in list {
-            let labels = c.labels.clone().unwrap_or_default();
-            let nets = c.network_settings.as_ref().and_then(|n| n.networks.clone()).unwrap_or_default();
+            let mut labels = c.labels.unwrap_or_default();
+            let Some(service) = labels.remove(L_SERVICE) else { continue };
+            let nets = c.network_settings.and_then(|n| n.networks).unwrap_or_default();
             let ip_of = |e: &EndpointSettings| e.ip_address.clone().filter(|ip| !ip.is_empty());
             // The proxy on the replica's server reaches it on the ingress bridge, or on any
             // bridge it is on (overlay addresses are not reachable from the host), Tugport's
@@ -109,11 +129,10 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
             let health = c.status.as_deref().and_then(|s| {
                 ["(healthy)", "(unhealthy)", "(health: starting)"].iter().find(|h| s.contains(*h)).map(|h| h.trim_matches(['(', ')']).replace("health: ", ""))
             });
-            let Some(service) = labels.get(L_SERVICE).cloned() else { continue };
             out.push((service, Replica {
                 id: c.id.unwrap_or_default(),
-                name: c.names.and_then(|n| n.first().cloned()).unwrap_or_default().trim_start_matches('/').to_string(),
-                deploy: labels.get(L_DEPLOY).cloned().unwrap_or_default(),
+                name: listed_name(c.names),
+                deploy: labels.remove(L_DEPLOY).unwrap_or_default(),
                 replica: labels.get(L_REPLICA).and_then(|r| r.parse().ok()).unwrap_or(0),
                 state: c.state.map(|s| s.to_string()).unwrap_or_default(),
                 health,
@@ -122,7 +141,7 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
                 created: c.created.unwrap_or_default(),
                 node: node.clone(),
                 node_name: names.get(&node).cloned().unwrap_or_else(|| node.clone()),
-                compose_service: labels.get("com.docker.compose.service").cloned(),
+                compose_service: labels.remove("com.docker.compose.service"),
             }));
         }
     }
@@ -132,7 +151,24 @@ async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica
 
 /// The deploy currently receiving traffic.
 pub fn live_deploy(app: &App, service_id: &str) -> Option<String> {
-    app.db.get_state(&format!("live:{service_id}")).ok().flatten()
+    app.db.state::<String>(&format!("live:{service_id}"))
+}
+
+/// Replicas of the live deploy (all of them before the first deploy, and every container of a
+/// Compose stack): what serves the service right now.
+pub async fn current(app: &App, s: &Service) -> Result<Vec<Replica>> {
+    let live = live_deploy(app, &s.id);
+    Ok(replicas(app, &s.id).await?.into_iter().filter(|r| s.kind == "compose" || live.as_deref().is_none_or(|l| r.deploy == l)).collect())
+}
+
+/// One running replica of the live deploy, for commands that need the service up.
+pub async fn running_replica(app: &App, s: &Service) -> Result<Replica> {
+    current(app, s).await?.into_iter().find(|r| r.state == "running").ok_or_else(|| anyhow::anyhow!("{} is not running", s.name))
+}
+
+/// The image the live deploy runs.
+pub fn live_image(app: &App, service_id: &str) -> Option<String> {
+    crate::deploy::get(app, &live_deploy(app, service_id)?).ok().flatten()?.image
 }
 
 pub fn set_live_deploy(app: &App, service_id: &str, deploy_id: &str) -> Result<()> {
@@ -140,7 +176,7 @@ pub fn set_live_deploy(app: &App, service_id: &str, deploy_id: &str) -> Result<(
 }
 
 #[derive(Serialize)]
-pub struct Status {
+struct Status {
     pub state: &'static str,
     pub running: usize,
     pub desired: u32,
@@ -178,10 +214,6 @@ pub fn status_of(app: &App, s: &Service, reps: Vec<Replica>) -> serde_json::Valu
 pub async fn ensure_network(app: &App, project: &str) -> Result<String> {
     let overlay = crate::nodes::mesh_enabled(app);
     let name = if overlay { overlay_name(project) } else { network_name(project) };
-    if app.docker.inspect_network(&name, None::<bollard::query_parameters::InspectNetworkOptions>).await.is_ok() {
-        return Ok(name);
-    }
-    let labels = HashMap::from([(L_MANAGED.to_string(), "true".to_string())]);
     let mut options = HashMap::new();
     if overlay {
         // WireGuard (1420) minus the VXLAN header.
@@ -194,12 +226,24 @@ pub async fn ensure_network(app: &App, project: &str) -> Result<String> {
         name: name.clone(),
         driver: Some(if overlay { "overlay" } else { "bridge" }.into()),
         attachable: overlay.then_some(true),
-        labels: Some(labels),
-        options: (!options.is_empty()).then_some(options),
+        options: non_empty(options),
         ..Default::default()
     };
-    app.docker.create_network(req).await.with_context(|| format!("creating network {name}"))?;
+    create_network(&app.docker, req).await?;
     Ok(name)
+}
+
+/// Create a Tugport network unless it exists (or another deploy creates it meanwhile).
+async fn create_network(docker: &bollard::Docker, req: NetworkCreateRequest) -> Result<()> {
+    if docker.inspect_network(&req.name, None::<bollard::query_parameters::InspectNetworkOptions>).await.is_ok() {
+        return Ok(());
+    }
+    let name = req.name.clone();
+    let req = NetworkCreateRequest { labels: Some(HashMap::from([(L_MANAGED.to_string(), "true".to_string())])), ..req };
+    match docker.create_network(req).await {
+        Ok(_) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("creating network {name}"))),
+    }
 }
 
 /// Host interfaces of this server's Docker bridge networks.
@@ -217,22 +261,8 @@ pub async fn bridge_interfaces(docker: &bollard::Docker) -> Result<Vec<String>> 
 
 /// The ingress bridge on a server (multi-server setups only).
 async fn ensure_ingress(docker: &bollard::Docker) -> Result<()> {
-    if docker.inspect_network(INGRESS, None::<bollard::query_parameters::InspectNetworkOptions>).await.is_ok() {
-        return Ok(());
-    }
-    let req = NetworkCreateRequest {
-        name: INGRESS.into(),
-        driver: Some("bridge".into()),
-        labels: Some(HashMap::from([(L_MANAGED.to_string(), "true".to_string())])),
-        options: Some(HashMap::from([("com.docker.network.bridge.enable_icc".to_string(), "false".to_string())])),
-        ..Default::default()
-    };
-    match docker.create_network(req).await {
-        Ok(_) => Ok(()),
-        // Another deploy created it meanwhile.
-        Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => Ok(()),
-        Err(e) => Err(anyhow::Error::from(e).context("creating the ingress network")),
-    }
+    let options = HashMap::from([("com.docker.network.bridge.enable_icc".to_string(), "false".to_string())]);
+    create_network(docker, NetworkCreateRequest { name: INGRESS.into(), driver: Some("bridge".into()), options: Some(options), ..Default::default() }).await
 }
 
 /// First server added: running containers join their project's overlay with the same
@@ -240,13 +270,11 @@ async fn ensure_ingress(docker: &bollard::Docker) -> Result<()> {
 pub async fn move_to_overlays(app: &App) -> Result<()> {
     for s in store::services(app, None)? {
         let network = ensure_network(app, &s.project).await?;
-        let mut aliases = vec![s.name.clone()];
-        aliases.extend(s.spec.aliases.iter().cloned());
         for r in replicas(app, &s.id).await? {
             if r.node != "local" || r.state != "running" {
                 continue;
             }
-            let aliases = if s.kind == "compose" { r.compose_service.iter().map(|c| format!("{}-{c}", s.name)).collect() } else { aliases.clone() };
+            let aliases = if s.kind == "compose" { r.compose_service.iter().map(|c| format!("{}-{c}", s.name)).collect() } else { aliases(&s) };
             let req = bollard::models::NetworkConnectRequest {
                 container: Some(r.id.clone()),
                 endpoint_config: Some(EndpointSettings { aliases: Some(aliases), ..Default::default() }),
@@ -311,24 +339,20 @@ pub fn registry_host(image: &str) -> &str {
     }
 }
 
-fn registry_credentials(app: &App, image: &str) -> Result<Option<bollard::auth::DockerCredentials>> {
+/// The saved login (user, password) for the registry `image` comes from, if any.
+pub fn registry_login(app: &App, image: &str) -> Result<Option<(String, zeroize::Zeroizing<String>)>> {
     let host = registry_host(image);
-    let row: Option<(String, Vec<u8>)> = {
-        use rusqlite::OptionalExtension;
-        app.db
-            .conn()
-            .query_row("SELECT username, password FROM registries WHERE host = ?1", [host], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?
-    };
-    Ok(match row {
-        Some((user, pw)) => Some(bollard::auth::DockerCredentials {
-            username: Some(user),
-            password: Some(app.keys.open_str(&format!("registry:{host}"), &pw)?.to_string()),
-            serveraddress: Some(host.to_string()),
-            ..Default::default()
-        }),
-        None => None,
-    })
+    let row: Option<(String, Vec<u8>)> = app.db.row("SELECT username, password FROM registries WHERE host = ?1", [host], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    row.map(|(user, pw)| Ok((user, app.keys.open_str(&format!("registry:{host}"), &pw)?))).transpose()
+}
+
+fn registry_credentials(app: &App, image: &str) -> Result<Option<bollard::auth::DockerCredentials>> {
+    Ok(registry_login(app, image)?.map(|(user, pw)| bollard::auth::DockerCredentials {
+        username: Some(user),
+        password: Some(pw.to_string()),
+        serveraddress: Some(registry_host(image).to_string()),
+        ..Default::default()
+    }))
 }
 
 pub struct ImageInfo {
@@ -347,7 +371,7 @@ pub async fn image_info(app: &App, image: &str) -> Result<ImageInfo> {
 }
 
 /// The process a container should run, before it is wrapped by Tugport's init.
-pub fn final_command(spec: &ServiceSpec, img: &ImageInfo) -> Vec<String> {
+fn final_command(spec: &ServiceSpec, img: &ImageInfo) -> Vec<String> {
     match (&spec.entrypoint, &spec.command) {
         (Some(ep), cmd) => ep.iter().chain(cmd.iter().flatten()).cloned().collect(),
         (None, Some(cmd)) => img.entrypoint.iter().chain(cmd.iter()).cloned().collect(),
@@ -358,9 +382,10 @@ pub fn final_command(spec: &ServiceSpec, img: &ImageInfo) -> Vec<String> {
 /// GPUs on the server a replica runs on (other servers report theirs in their health).
 fn gpu_access(app: &App, node: &NodeHandle) -> (Option<Vec<DeviceRequest>>, Option<Vec<bollard::models::DeviceMapping>>) {
     let (nvidia, dri) = if node.local {
-        (app.db.get_state("gpu:nvidia").ok().flatten().as_deref() == Some("1"), std::path::Path::new("/dev/dri").exists())
+        (app.db.state::<String>("gpu:nvidia").as_deref() == Some("1"), std::path::Path::new("/dev/dri").exists())
     } else {
-        let info: serde_json::Value = app.db.conn().query_row("SELECT info FROM nodes WHERE id = ?1", [&node.id], |r| r.get::<_, String>(0)).ok().and_then(|i| serde_json::from_str(&i).ok()).unwrap_or_default();
+        let info: serde_json::Value =
+            app.db.row("SELECT info FROM nodes WHERE id = ?1", [&node.id], |r| r.get::<_, String>(0)).ok().flatten().and_then(|i| serde_json::from_str(&i).ok()).unwrap_or_default();
         (info["nvidia"].as_bool().unwrap_or(false), info["dri"].as_bool().unwrap_or(false))
     };
     if nvidia {
@@ -378,12 +403,41 @@ fn gpu_access(app: &App, node: &NodeHandle) -> (Option<Vec<DeviceRequest>>, Opti
     }
 }
 
+fn mount(typ: MountTypeEnum, source: &str, target: &str, read_only: bool) -> DockerMount {
+    DockerMount { typ: Some(typ), source: Some(source.into()), target: Some(target.into()), read_only: Some(read_only), ..Default::default() }
+}
+
 fn bind(source: &str, target: &str, read_only: bool) -> DockerMount {
-    DockerMount { typ: Some(MountTypeEnum::BIND), source: Some(source.into()), target: Some(target.into()), read_only: Some(read_only), ..Default::default() }
+    mount(MountTypeEnum::BIND, source, target, read_only)
+}
+
+/// `script` run by `sh` through Tugport's init, so with the service's environment.
+fn init_sh(script: &str) -> Vec<String> {
+    [secrets::INIT_PATH, "exec", "--", "sh", "-c", script].map(String::from).into()
+}
+
+/// None for an empty list or map, which Docker reads as "leave the default".
+fn non_empty<C: Default + PartialEq>(c: C) -> Option<C> {
+    (c != C::default()).then_some(c)
+}
+
+/// Names other services of the project reach a service's replicas by.
+fn aliases(s: &Service) -> Vec<String> {
+    std::iter::once(&s.name).chain(&s.spec.aliases).cloned().collect()
+}
+
+/// MiB in bytes.
+fn mib(m: u64) -> i64 {
+    i64::try_from(m.saturating_mul(1024 * 1024)).unwrap_or(i64::MAX)
+}
+
+/// Seconds in Docker's nanoseconds.
+fn nanos(secs: u32) -> i64 {
+    i64::from(secs) * 1_000_000_000
 }
 
 pub fn container_name(s: &Service, deploy_id: &str, replica: u32) -> String {
-    format!("{}-{}-{replica}", s.slug(), &deploy_id[..deploy_id.len().min(6)])
+    format!("{}-{}-{replica}", s.slug(), deploy_id.get(..6).unwrap_or(deploy_id))
 }
 
 /// Like other platforms, tell the app which port the proxy expects it on.
@@ -394,6 +448,22 @@ pub fn add_port(app: &App, s: &Service, env: &mut std::collections::BTreeMap<Str
         env.insert("PORT".into(), zeroize::Zeroizing::new(d.port.to_string()));
     }
     Ok(())
+}
+
+/// The Docker health check of a service: its command, explicitly none, or the image's own.
+fn healthcheck(h: &Health) -> Option<HealthConfig> {
+    match h.kind {
+        HealthKind::Command => h.command.as_ref().map(|c| HealthConfig {
+            test: Some(std::iter::once("CMD".to_string()).chain(init_sh(c)).collect()),
+            interval: Some(nanos(h.interval_s)),
+            timeout: Some(nanos(h.timeout_s)),
+            retries: Some(h.retries.into()),
+            start_period: Some(nanos(h.start_period_s)),
+            start_interval: Some(nanos(1)),
+        }),
+        HealthKind::None => Some(HealthConfig { test: Some(vec!["NONE".into()]), ..Default::default() }),
+        _ => None,
+    }
 }
 
 /// Create (not start) one replica of a service running `image` on `node`.
@@ -407,82 +477,46 @@ pub async fn create_replica(app: &App, node: &NodeHandle, s: &Service, deploy_id
     }
     let (env_file, files) = crate::nodes::put_secrets(app, node, &name, s).await?;
     let mut mounts = vec![bind(&app.paths.init_binary().to_string_lossy(), secrets::INIT_PATH, true), bind(&env_file, secrets::ENV_PATH, true)];
-    for (host, target) in files {
-        mounts.push(bind(&host, &target, true));
-    }
-    for m in &spec.mounts {
-        match m {
-            Mount::Volume { name, target, readonly } => mounts.push(DockerMount {
-                typ: Some(MountTypeEnum::VOLUME),
-                source: Some(name.clone()),
-                target: Some(target.clone()),
-                read_only: Some(*readonly),
-                ..Default::default()
-            }),
-            Mount::Bind { source, target, readonly } => mounts.push(bind(source, target, *readonly)),
-            Mount::File { .. } => {}
-        }
-    }
+    mounts.extend(files.iter().map(|(host, target)| bind(host, target, true)));
+    mounts.extend(spec.mounts.iter().filter_map(|m| match m {
+        Mount::Volume { name, target, readonly } => Some(mount(MountTypeEnum::VOLUME, name, target, *readonly)),
+        Mount::Bind { source, target, readonly } => Some(bind(source, target, *readonly)),
+        Mount::File { .. } => None,
+    }));
     if spec.docker_socket {
         mounts.push(bind("/var/run/docker.sock", "/var/run/docker.sock", false));
     }
 
-    let mut cmd = vec!["--".to_string()];
-    cmd.extend(final_command(spec, img));
-    if cmd.len() == 1 {
+    let run = final_command(spec, img);
+    if run.is_empty() {
         bail!("the image has no command to run; set one on the service");
     }
-
-    let healthcheck = match spec.health.kind {
-        HealthKind::Command => spec.health.command.as_ref().map(|c| HealthConfig {
-            test: Some(vec!["CMD".into(), secrets::INIT_PATH.into(), "exec".into(), "--".into(), "sh".into(), "-c".into(), c.clone()]),
-            interval: Some(spec.health.interval_s as i64 * 1_000_000_000),
-            timeout: Some(spec.health.timeout_s as i64 * 1_000_000_000),
-            retries: Some(spec.health.retries as i64),
-            start_period: Some(spec.health.start_period_s as i64 * 1_000_000_000),
-            start_interval: Some(1_000_000_000),
-        }),
-        HealthKind::None => Some(HealthConfig { test: Some(vec!["NONE".into()]), ..Default::default() }),
-        _ => None,
-    };
-
-    let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-    let mut exposed: HashMap<String, HashMap<(), ()>> = HashMap::new();
-    if publish_ports {
-        for p in &spec.ports {
+    let (exposed, port_bindings): (HashMap<_, HashMap<(), ()>>, HashMap<_, _>) = spec
+        .ports
+        .iter()
+        .filter(|_| publish_ports)
+        .map(|p| {
             let key = format!("{}/{}", p.container, if p.protocol == Protocol::Udp { "udp" } else { "tcp" });
-            exposed.insert(key.clone(), HashMap::new());
-            port_bindings.insert(key, Some(vec![PortBinding { host_ip: None, host_port: Some(p.host.to_string()) }]));
-        }
-    }
+            ((key.clone(), HashMap::new()), (key, Some(vec![PortBinding { host_ip: None, host_port: Some(p.host.to_string()) }])))
+        })
+        .unzip();
 
     let (device_requests, devices) = if spec.gpu { gpu_access(app, node) } else { (None, None) };
-    let mut security_opt = vec![];
-    if spec.no_new_privileges {
-        security_opt.push("no-new-privileges:true".to_string());
-    }
-    let labels = HashMap::from([
-        (L_MANAGED.to_string(), "true".to_string()),
-        (L_PROJECT.to_string(), s.project_id.clone()),
-        (L_SERVICE.to_string(), s.id.clone()),
-        (L_DEPLOY.to_string(), deploy_id.to_string()),
-        (L_REPLICA.to_string(), replica.to_string()),
-        (L_NODE.to_string(), node.id.clone()),
-    ]);
+    let labels = labels(s, deploy_id, &node.id).into_iter().chain([(L_REPLICA, replica.to_string())]).map(|(k, v)| (k.to_string(), v)).collect();
     let host_config = HostConfig {
         mounts: Some(mounts),
         restart_policy: Some(RestartPolicy { name: Some(RestartPolicyNameEnum::UNLESS_STOPPED), maximum_retry_count: None }),
         log_config: Some(HostConfigLogConfig {
             typ: Some("json-file".into()),
-            config: Some(HashMap::from([("max-size".into(), "10m".into()), ("max-file".into(), "3".into())])),
+            config: Some(LOG_LIMITS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
         }),
         nano_cpus: spec.resources.cpus.map(|c| (c * 1e9) as i64),
-        memory: spec.resources.memory_mb.map(|m| (m * 1024 * 1024) as i64),
-        memory_reservation: spec.resources.memory_reservation_mb.map(|m| (m * 1024 * 1024) as i64),
-        cap_add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
-        cap_drop: (!spec.cap_drop.is_empty()).then(|| spec.cap_drop.clone()),
-        group_add: (!spec.groups.is_empty()).then(|| spec.groups.clone()),
-        sysctls: (!spec.sysctls.is_empty()).then(|| spec.sysctls.clone().into_iter().collect()),
+        memory: spec.resources.memory_mb.map(mib),
+        memory_reservation: spec.resources.memory_reservation_mb.map(mib),
+        cap_add: non_empty(spec.cap_add.clone()),
+        cap_drop: non_empty(spec.cap_drop.clone()),
+        group_add: non_empty(spec.groups.clone()),
+        sysctls: non_empty(spec.sysctls.clone().into_iter().collect()),
         privileged: Some(spec.privileged),
         // With several networks Docker cannot attach an overlay that has no containers on
         // this server yet as the first one; the local ingress bridge always can be.
@@ -493,20 +527,19 @@ pub async fn create_replica(app: &App, node: &NodeHandle, s: &Service, deploy_id
         } else {
             network.to_string()
         }),
-        security_opt: (!security_opt.is_empty()).then_some(security_opt),
-        port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
+        security_opt: spec.no_new_privileges.then(|| vec!["no-new-privileges:true".into()]),
+        port_bindings: non_empty(port_bindings),
         device_requests,
         devices,
         extra_hosts: Some(vec!["host.docker.internal:host-gateway".into()]),
         ..Default::default()
     };
     let networking = (!spec.host_network).then(|| {
-        let mut aliases = vec![s.name.clone()];
-        aliases.extend(spec.aliases.iter().cloned());
-        let mut endpoints = HashMap::from([(network.to_string(), EndpointSettings { aliases: Some(aliases.clone()), ..Default::default() })]);
-        for extra in &spec.networks {
-            endpoints.insert(extra.clone(), EndpointSettings { aliases: Some(aliases.clone()), ..Default::default() });
-        }
+        let aliases = aliases(s);
+        let mut endpoints: HashMap<String, EndpointSettings> = std::iter::once(network)
+            .chain(spec.networks.iter().map(String::as_str))
+            .map(|n| (n.to_string(), EndpointSettings { aliases: Some(aliases.clone()), ..Default::default() }))
+            .collect();
         if multi {
             endpoints.insert(INGRESS.to_string(), EndpointSettings::default());
         }
@@ -515,25 +548,41 @@ pub async fn create_replica(app: &App, node: &NodeHandle, s: &Service, deploy_id
     let config = ContainerCreateBody {
         image: Some(image.to_string()),
         entrypoint: Some(vec![secrets::INIT_PATH.to_string()]),
-        cmd: Some(cmd),
+        cmd: Some(std::iter::once("--".to_string()).chain(run).collect()),
         user: spec.user.clone(),
         working_dir: spec.working_dir.clone(),
         labels: Some(labels),
-        healthcheck,
-        exposed_ports: (!exposed.is_empty()).then_some(exposed),
+        healthcheck: healthcheck(&spec.health),
+        exposed_ports: non_empty(exposed),
         env: Some(vec![format!("TUGPORT_SERVICE={}", s.name), format!("TUGPORT_PROJECT={}", s.project)]),
         host_config: Some(host_config),
         networking_config: networking,
         ..Default::default()
     };
     // A leftover container with the same name (from a crashed deploy) would block creation.
-    let _ = node.docker.remove_container(&name, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+    force_remove(&node.docker, &name).await;
     let created = node
         .docker
         .create_container(Some(CreateContainerOptions { name: Some(name.clone()), ..Default::default() }), config)
         .await
         .with_context(|| format!("creating container {name}"))?;
     Ok(created.id)
+}
+
+/// Create and start one replica (ports unpublished) and wait until it is healthy; it is
+/// removed again if it never is.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_healthy(app: &App, node: &NodeHandle, s: &Service, deploy_id: &str, replica: u32, image: &str, img: &ImageInfo, network: &str, timeout: Duration) -> Result<String> {
+    let id = create_replica(app, node, s, deploy_id, replica, image, img, network, false).await?;
+    let started = async {
+        start(app, &node.id, &id).await?;
+        wait_healthy(app, s, &node.id, &id, network, timeout, img.has_healthcheck, &|_| {}).await
+    };
+    if let Err(e) = started.await {
+        let _ = remove(app, &node.id, &id, &container_name(s, deploy_id, replica)).await;
+        return Err(e);
+    }
+    Ok(id)
 }
 
 pub async fn start(app: &App, node: &str, id: &str) -> Result<()> {
@@ -554,8 +603,12 @@ pub async fn restart(app: &App, node: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+async fn force_remove(docker: &bollard::Docker, id: &str) {
+    let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+}
+
 pub async fn remove(app: &App, node: &str, id: &str, name: &str) -> Result<()> {
-    let _ = app.docker_on(node)?.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+    force_remove(&app.docker_on(node)?, id).await;
     crate::nodes::forget_secrets(app, node, name).await;
     Ok(())
 }
@@ -567,7 +620,7 @@ pub async fn stop_and_remove(app: &App, r: &Replica, timeout_s: i32) -> Result<(
 
 pub async fn remove_service(app: &App, s: &Service, volumes: bool) -> Result<()> {
     if s.kind == "compose" {
-        crate::compose::down(app, s, volumes).await?;
+        crate::compose::down(s, volumes).await?;
     }
     for r in replicas(app, &s.id).await? {
         stop_and_remove(app, &r, 20).await?;
@@ -582,14 +635,14 @@ pub async fn remove_service(app: &App, s: &Service, volumes: bool) -> Result<()>
         }
     }
     for key in ["pin", "nodes", "stopped", "hook", "live", "asleep", "exposed", "active", "scale", "replica"] {
-        let _ = app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("{key}:{}", s.id)]);
+        let _ = app.db.del_state(&format!("{key}:{}", s.id));
     }
     let _ = std::fs::remove_dir_all(app.paths.sources().join(&s.id));
     Ok(())
 }
 
 /// Where the replica's own server can reach it: the ingress bridge, else `network`.
-pub async fn container_ip(docker: &bollard::Docker, id: &str, network: &str) -> Option<String> {
+async fn container_ip(docker: &bollard::Docker, id: &str, network: &str) -> Option<String> {
     let i = docker.inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>).await.ok()?;
     let nets = i.network_settings?.networks?;
     [INGRESS, network].iter().find_map(|n| nets.get(*n)?.ip_address.clone().filter(|ip| !ip.is_empty()))
@@ -616,47 +669,42 @@ pub async fn wait_healthy(app: &App, s: &Service, node: &str, id: &str, network:
     let docker = app.docker_on(node)?;
     let started = std::time::Instant::now();
     let domain_port = store::domains(app, Some(&s.id)).ok().and_then(|d| d.first().map(|d| d.port));
-    let settle = Duration::from_secs(spec.health.start_period_s.max(3) as u64);
+    let settle = Duration::from_secs(spec.health.start_period_s.max(3).into());
+    let uses_docker_check = spec.health.kind == HealthKind::Command || (spec.health.kind == HealthKind::Auto && has_image_check);
+    // (port, HTTP path, whether only 2xx/3xx count) of Tugport's own check.
+    let (port, path, strict) = match spec.health.kind {
+        HealthKind::Tcp => (spec.health.port.or(domain_port), None, false),
+        HealthKind::Http => (spec.health.port.or(domain_port), Some(spec.health.path.as_str()), true),
+        // A web service counts as up once it answers at all.
+        _ => (domain_port, Some(spec.health.path.as_str()), false),
+    };
     let mut announced = false;
     loop {
         let i = docker.inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
         let state = i.state.unwrap_or_default();
-        if state.running != Some(true) || state.restarting == Some(true) {
-            let code = state.exit_code.unwrap_or(0);
+        let running = state.running == Some(true) && state.restarting != Some(true);
+        if !running && started.elapsed() > Duration::from_secs(1) {
             let oom = if state.oom_killed == Some(true) { " (out of memory)" } else { "" };
-            if started.elapsed() > Duration::from_secs(1) {
-                bail!("the container exited with code {code}{oom}");
-            }
-        } else {
-            let docker_health = state.health.as_ref().and_then(|h| h.status);
-            let uses_docker_check = matches!(spec.health.kind, HealthKind::Command) || (spec.health.kind == HealthKind::Auto && has_image_check);
-            let healthy = if uses_docker_check {
-                match docker_health {
+            bail!("the container exited with code {}{oom}", state.exit_code.unwrap_or(0));
+        }
+        let healthy = running
+            && if uses_docker_check {
+                match state.health.as_ref().and_then(|h| h.status) {
                     Some(HealthStatusEnum::HEALTHY) => true,
                     Some(HealthStatusEnum::UNHEALTHY) => bail!("the health check reports unhealthy"),
                     _ => false,
                 }
+            } else if spec.health.kind == HealthKind::None {
+                true
             } else {
-                match spec.health.kind {
-                    HealthKind::None => true,
-                    HealthKind::Tcp => match (container_ip(&docker, id, network).await, spec.health.port.or(domain_port)) {
-                        (Some(ip), Some(port)) => probe(app, node, &ip, port, None, false).await,
-                        _ => started.elapsed() >= settle,
-                    },
-                    HealthKind::Http => match (container_ip(&docker, id, network).await, spec.health.port.or(domain_port)) {
-                        (Some(ip), Some(port)) => probe(app, node, &ip, port, Some(&spec.health.path), true).await,
-                        _ => bail!("HTTP health checks need a port"),
-                    },
-                    _ => match (container_ip(&docker, id, network).await, domain_port) {
-                        // A web service counts as up once it answers at all.
-                        (Some(ip), Some(port)) => probe(app, node, &ip, port, Some(&spec.health.path), false).await,
-                        _ => started.elapsed() >= settle,
-                    },
+                match (container_ip(&docker, id, network).await, port) {
+                    (Some(ip), Some(port)) => probe(app, node, &ip, port, path, strict).await,
+                    _ if spec.health.kind == HealthKind::Http => bail!("HTTP health checks need a port"),
+                    _ => started.elapsed() >= settle,
                 }
             };
-            if healthy {
-                return Ok(());
-            }
+        if healthy {
+            return Ok(());
         }
         if started.elapsed() > timeout {
             return Err(anyhow!("not healthy after {}s", timeout.as_secs()));
@@ -670,9 +718,9 @@ pub async fn wait_healthy(app: &App, s: &Service, node: &str, id: &str, network:
 }
 
 pub async fn http_ok(ip: &str, port: u16, path: &str, strict: bool) -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).redirect(reqwest::redirect::Policy::none()).build() else {
-        return false;
-    };
+    // One client for every probe: building one loads the TLS roots.
+    static CLIENT: std::sync::LazyLock<Option<reqwest::Client>> = std::sync::LazyLock::new(|| crate::util::http(5).redirect(reqwest::redirect::Policy::none()).build().ok());
+    let Some(client) = CLIENT.as_ref() else { return false };
     match client.get(format!("http://{ip}:{port}{path}")).send().await {
         Ok(r) if strict => r.status().is_success() || r.status().is_redirection(),
         Ok(r) => r.status().as_u16() < 500,
@@ -684,15 +732,12 @@ pub async fn http_ok(ip: &str, port: u16, path: &str, strict: bool) -> bool {
 /// return its exit code and output.
 pub async fn exec(app: &App, r: &Replica, script: &str) -> Result<(i64, String)> {
     let docker = app.docker_on(&r.node)?;
-    let cmd = vec![secrets::INIT_PATH.to_string(), "exec".into(), "--".into(), "sh".into(), "-c".into(), script.to_string()];
-    let config = bollard::models::ExecConfig { attach_stdout: Some(true), attach_stderr: Some(true), cmd: Some(cmd), ..Default::default() };
+    let config = bollard::models::ExecConfig { attach_stdout: Some(true), attach_stderr: Some(true), cmd: Some(init_sh(script)), ..Default::default() };
     let created = docker.create_exec(&r.id, config).await.with_context(|| format!("running a command in {}", r.name))?;
-    let mut text = String::new();
-    if let bollard::exec::StartExecResults::Attached { mut output, .. } = docker.start_exec(&created.id, None).await? {
-        while let Some(Ok(chunk)) = output.next().await {
-            text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
-        }
-    }
+    let text = match docker.start_exec(&created.id, None).await? {
+        bollard::exec::StartExecResults::Attached { output, .. } => text(output).await,
+        bollard::exec::StartExecResults::Detached => String::new(),
+    };
     let code = docker.inspect_exec(&created.id).await?.exit_code.unwrap_or(-1);
     Ok((code, text))
 }
@@ -700,15 +745,17 @@ pub async fn exec(app: &App, r: &Replica, script: &str) -> Result<(i64, String)>
 /// Tail of a container's output, for explaining failed deploys.
 pub async fn tail_logs(app: &App, node: &str, id: &str, lines: usize) -> Vec<String> {
     let Ok(docker) = app.docker_on(node) else { return vec![] };
-    let mut stream = docker.logs(
-        id,
-        Some(bollard::query_parameters::LogsOptions { stdout: true, stderr: true, tail: lines.to_string(), ..Default::default() }),
-    );
-    let mut out = vec![];
-    while let Some(Ok(chunk)) = stream.next().await {
-        out.extend(String::from_utf8_lossy(&chunk.into_bytes()).lines().map(String::from));
+    let opts = bollard::query_parameters::LogsOptions { stdout: true, stderr: true, tail: lines.to_string(), ..Default::default() };
+    text(docker.logs(id, Some(opts))).await.lines().map(String::from).collect()
+}
+
+/// A container's output stream as text, up to its end or first error.
+async fn text(mut output: impl futures_util::Stream<Item = Result<bollard::container::LogOutput, bollard::errors::Error>> + Unpin) -> String {
+    let mut text = String::new();
+    while let Some(Ok(chunk)) = output.next().await {
+        text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
     }
-    out
+    text
 }
 
 /// Detect GPUs once at startup so containers can be given access.
@@ -716,5 +763,20 @@ pub async fn detect_gpu(app: &AppState) {
     if let Ok(info) = app.docker.info().await {
         let nvidia = info.runtimes.as_ref().is_some_and(|r| r.contains_key("nvidia"));
         let _ = app.db.set_state("gpu:nvidia", if nvidia { "1" } else { "0" });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_commands_run_through_init() {
+        let h = Health { kind: HealthKind::Command, command: Some("curl -f localhost".into()), ..Default::default() };
+        let test = healthcheck(&h).and_then(|c| c.test).unwrap_or_default();
+        assert_eq!(test, ["CMD", secrets::INIT_PATH, "exec", "--", "sh", "-c", "curl -f localhost"]);
+        assert!(healthcheck(&Health::default()).is_none());
+        assert_eq!(non_empty(Vec::<String>::new()), None);
+        assert_eq!(listed_name(Some(vec!["/web-1".into()])), "web-1");
     }
 }

@@ -2,7 +2,6 @@
 
 use crate::paths::Paths;
 use anyhow::{Context, Result, bail};
-use std::io::{BufRead, Write};
 use std::process::Command;
 
 #[derive(clap::Args)]
@@ -22,21 +21,7 @@ pub struct InstallArgs {
 }
 
 fn ask(yes: bool, question: &str) -> bool {
-    if yes {
-        return true;
-    }
-    print!("{question} [Y/n] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    let a = line.trim().to_lowercase();
-    a.is_empty() || a == "y" || a == "yes"
-}
-
-fn ok(cmd: &mut Command) -> bool {
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+    yes || crate::util::prompt(&format!("{question} [Y/n]")).is_ok_and(|a| a.is_empty() || a == "y" || a == "yes")
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
@@ -48,7 +33,7 @@ fn run(cmd: &mut Command) -> Result<()> {
 }
 
 fn has(program: &str) -> bool {
-    ok(Command::new("sh").args(["-c", &format!("command -v {program}")]))
+    crate::proc::succeeds(Command::new("sh").args(["-c", &format!("command -v {program}")]))
 }
 
 fn os_id() -> String {
@@ -77,27 +62,19 @@ pub fn install(args: InstallArgs) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("run the installer as root (sudo)");
     }
-    println!("Installing Tugport {} on {}.", crate::VERSION, if os_id().is_empty() { "this server".into() } else { os_id() });
+    let os = os_id();
+    println!("Installing Tugport {} on {}.", crate::VERSION, if os.is_empty() { "this server" } else { &os });
 
-    if !ok(Command::new("docker").arg("version")) {
+    if !crate::proc::succeeds(Command::new("docker").arg("version")) {
         if !ask(args.yes, "Docker is not installed. Install it now with the official script from get.docker.com?") {
             bail!("Tugport needs Docker");
         }
         run(Command::new("sh").args(["-c", "curl -fsSL --retry 5 https://get.docker.com | sh"]))?;
-        let _ = ok(Command::new("systemctl").args(["enable", "--now", "docker"]));
+        let _ = crate::proc::succeeds(Command::new("systemctl").args(["enable", "--now", "docker"]));
     }
-    let mut missing = vec![];
-    if !ok(Command::new("docker").args(["buildx", "version"])) {
-        missing.push("docker-buildx-plugin");
-    }
-    if !ok(Command::new("docker").args(["compose", "version"])) {
-        missing.push("docker-compose-plugin");
-    }
-    for (bin, pkg) in [("git", "git"), ("ssh-keygen", "openssh-client"), ("wg", "wireguard-tools")] {
-        if !has(bin) {
-            missing.push(pkg);
-        }
-    }
+    let plugins = [("buildx", "docker-buildx-plugin"), ("compose", "docker-compose-plugin")].into_iter().filter(|(sub, _)| !crate::proc::succeeds(Command::new("docker").args([sub, "version"])));
+    let tools = [("git", "git"), ("ssh-keygen", "openssh-client"), ("wg", "wireguard-tools")].into_iter().filter(|(bin, _)| !has(bin));
+    let missing: Vec<&str> = plugins.chain(tools).map(|(_, pkg)| pkg).collect();
     if !missing.is_empty() {
         println!("Installing {}.", missing.join(", "));
         install_packages(&missing)?;
@@ -117,8 +94,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
     if let (Some(panel), Some(token)) = (&args.join, &args.token) {
         return join(panel, token);
     }
-    let has_key = paths.etc.join("master.key").exists() || paths.etc.join("master.key.cred").exists();
-    if !has_key {
+    if !crate::crypto::has_master(&paths.etc) {
         let (key, store) = crate::crypto::create_master(&paths.etc)?;
         let where_ = match store {
             crate::crypto::KeyStore::Tpm => "sealed to this server's TPM",
@@ -129,21 +105,18 @@ pub fn install(args: InstallArgs) -> Result<()> {
         println!("only way to read your secrets and backups if this server's disk or TPM is lost:\n");
         println!("    {}\n", crate::crypto::recovery_key(&key));
         if !args.yes {
-            print!("Press Enter once you have saved it. ");
-            let _ = std::io::stdout().flush();
-            let mut s = String::new();
-            let _ = std::io::stdin().lock().read_line(&mut s);
+            let _ = crate::util::prompt("Press Enter once you have saved it.");
         }
     }
 
     write_units()?;
     run(Command::new("systemctl").arg("daemon-reload"))?;
     run(Command::new("systemctl").args(["enable", "--now", "tugport.service"]))?;
-    if ok(Command::new("systemctl").args(["is-active", "--quiet", "tugport.service"])) {
-        let _ = ok(Command::new("systemctl").args(["reload", "tugport.service"]));
+    if crate::proc::succeeds(Command::new("systemctl").args(["is-active", "--quiet", "tugport.service"])) {
+        let _ = crate::proc::succeeds(Command::new("systemctl").args(["reload", "tugport.service"]));
     }
 
-    let found = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(crate::migrate::detect());
+    let found = crate::block_on(crate::migrate::detect())?;
     for f in &found {
         let name = if f.panel == "easypanel" { "Easypanel" } else { "Coolify" };
         println!("\nFound {name} {} on this server.", f.version);
@@ -167,39 +140,50 @@ pub fn install(args: InstallArgs) -> Result<()> {
         Some(link) => println!("\nTugport is running. Open {link} to create your account."),
         None => println!("\nTugport is running and already set up; open http://{}:8484 to sign in.", crate::public_address().unwrap_or_else(|| "this-server".into())),
     }
-    if ok(Command::new("sh").args(["-c", "ufw status | grep -q 'Status: active'"])) {
-        println!("ufw is active: allow the panel and web traffic with `ufw allow 80,443,8484/tcp`.");
-    }
+    ufw_hint("the panel and web traffic", "ufw allow 80,443,8484/tcp");
     Ok(())
 }
 
-/// Become a server of an existing panel: mesh, overlay networks, then the agent service.
-fn join(panel: &str, token: &str) -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(crate::agent::join(panel, token))?;
-    let unit = "[Unit]\n\
-Description=Tugport node\n\
+fn ufw_hint(what: &str, command: &str) {
+    if crate::proc::succeeds(Command::new("sh").args(["-c", "ufw status | grep -q 'Status: active'"])) {
+        println!("ufw is active: allow {what} with `{command}`.");
+    }
+}
+
+/// A systemd unit that runs `tugport <command>` next to Docker. The panel server also reloads
+/// in place (SIGHUP) and gets time to drain on stop.
+fn unit(description: &str, command: &str, server: bool) -> String {
+    let (reload, stop) = if server { ("ExecReload=/bin/kill -HUP $MAINPID\n", "KillMode=mixed\nTimeoutStopSec=40\n") } else { ("", "") };
+    format!(
+        "[Unit]\n\
+Description={description}\n\
 Documentation=https://tugport.com\n\
 After=network-online.target docker.service\n\
 Wants=network-online.target\n\
 Requires=docker.service\n\
 \n\
 [Service]\n\
-ExecStart=/usr/local/bin/tugport node\n\
+ExecStart=/usr/local/bin/tugport {command}\n\
+{reload}\
 Restart=always\n\
 RestartSec=2\n\
 Environment=RUST_LOG=tugport=info\n\
 LimitNOFILE=1048576\n\
+{stop}\
 \n\
 [Install]\n\
-WantedBy=multi-user.target\n";
-    std::fs::write("/etc/systemd/system/tugport-node.service", unit)?;
+WantedBy=multi-user.target\n"
+    )
+}
+
+/// Become a server of an existing panel: mesh, overlay networks, then the agent service.
+fn join(panel: &str, token: &str) -> Result<()> {
+    let config = crate::block_on(crate::agent::join(panel, token))??;
+    std::fs::write("/etc/systemd/system/tugport-node.service", unit("Tugport node", "node", false))?;
     run(Command::new("systemctl").arg("daemon-reload"))?;
     run(Command::new("systemctl").args(["enable", "--now", "tugport-node.service"]))?;
     println!("\nThis server joined {panel} as {} on the private network. It shows up under Servers within a minute.", config.mesh_ip);
-    if ok(Command::new("sh").args(["-c", "ufw status | grep -q 'Status: active'"])) {
-        println!("ufw is active: allow the mesh and web traffic with `ufw allow 51820/udp && ufw allow 80,443/tcp`.");
-    }
+    ufw_hint("the mesh and web traffic", "ufw allow 51820/udp && ufw allow 80,443/tcp");
     Ok(())
 }
 
@@ -216,26 +200,21 @@ fn write_units() -> Result<()> {
         cores.div_ceil(2) * 100,
         mem_kb / 2
     );
-    let service = "[Unit]\n\
-Description=Tugport\n\
-Documentation=https://tugport.com\n\
-After=network-online.target docker.service\n\
-Wants=network-online.target\n\
-Requires=docker.service\n\
-\n\
-[Service]\n\
-ExecStart=/usr/local/bin/tugport server\n\
-ExecReload=/bin/kill -HUP $MAINPID\n\
-Restart=always\n\
-RestartSec=2\n\
-Environment=RUST_LOG=tugport=info\n\
-LimitNOFILE=1048576\n\
-KillMode=mixed\n\
-TimeoutStopSec=40\n\
-\n\
-[Install]\n\
-WantedBy=multi-user.target\n";
     std::fs::write("/etc/systemd/system/tugport-builds.slice", slice)?;
-    std::fs::write("/etc/systemd/system/tugport.service", service)?;
+    std::fs::write("/etc/systemd/system/tugport.service", unit("Tugport", "server", true))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn units() {
+        let server = super::unit("Tugport", "server", true);
+        assert!(server.contains("\nExecStart=/usr/local/bin/tugport server\nExecReload=/bin/kill -HUP $MAINPID\nRestart=always\n"));
+        assert!(server.ends_with("LimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=40\n\n[Install]\nWantedBy=multi-user.target\n"));
+        let node = super::unit("Tugport node", "node", false);
+        assert!(node.starts_with("[Unit]\nDescription=Tugport node\nDocumentation=https://tugport.com\n"));
+        assert!(node.contains("\nExecStart=/usr/local/bin/tugport node\nRestart=always\n"));
+        assert!(node.ends_with("LimitNOFILE=1048576\n\n[Install]\nWantedBy=multi-user.target\n"));
+    }
 }

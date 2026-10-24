@@ -1,27 +1,107 @@
+use anyhow::Result;
+use futures_util::{Stream, StreamExt};
 use rand::Rng;
-use sha2::{Digest, Sha256};
+use std::time::Duration;
 
-const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+fn random_from(chars: &[u8], len: usize) -> String {
+    let mut rng = rand::rng();
+    (0..len).map(|_| chars[rng.random_range(0..chars.len())] as char).collect()
+}
 
 /// Short random id like `k3j2h1x9q0ab`.
 pub fn id() -> String {
     random_string(12)
 }
 
+/// Random lowercase letters and digits.
 pub fn random_string(len: usize) -> String {
-    let mut rng = rand::rng();
-    (0..len).map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char).collect()
+    random_from(b"0123456789abcdefghijklmnopqrstuvwxyz", len)
 }
 
 /// Random token with mixed case for keys and session ids.
 pub fn token(len: usize) -> String {
-    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut rng = rand::rng();
-    (0..len).map(|_| CHARS[rng.random_range(0..CHARS.len())] as char).collect()
+    random_from(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", len)
 }
 
 pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
-    hex::encode(Sha256::digest(data.as_ref()))
+    hex::encode(ring::digest::digest(&ring::digest::SHA256, data.as_ref()))
+}
+
+pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
+    let tag = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_ref()), data.as_ref());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
+/// Percent-encoding for a URL path segment or query value: everything but A-Z a-z 0-9 - _ . ~.
+pub fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// An HTTP client builder that names Tugport and gives up after `secs`.
+pub fn http(secs: u64) -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(concat!("tugport/", env!("CARGO_PKG_VERSION"))).timeout(Duration::from_secs(secs))
+}
+
+/// Stream a response into `path`; returns the SHA-256 (hex) of what was written.
+pub async fn download(resp: reqwest::Response, path: &std::path::Path) -> Result<String> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut stream = resp.error_for_status()?.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        hash.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(hex::encode(hash.finish()))
+}
+
+/// A broadcast channel as a stream; messages missed by a slow reader are skipped.
+pub fn subscribe<T: Clone + Send + 'static>(rx: tokio::sync::broadcast::Receiver<T>) -> impl Stream<Item = T> + Send + 'static {
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(v) => return Some((v, rx)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+}
+
+/// Run `tick` every `secs` seconds (the first time after one wait), logging what fails.
+/// Each tick's future owns what it uses: one borrowing from the closure would not be `Send`.
+pub async fn every<F: Future<Output = Result<()>>>(secs: u64, what: &str, mut tick: impl FnMut() -> F) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        if let Err(e) = tick().await {
+            tracing::warn!("{what}: {e:#}");
+        }
+    }
+}
+
+/// Write a file only root can read (0600), replacing what was there.
+pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    // The mode above only applies to a new file.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(data)?;
+    Ok(())
+}
+
+/// Ask a question on the terminal; the answer trimmed and lowercased.
+pub fn prompt(question: &str) -> std::io::Result<String> {
+    use std::io::{BufRead, Write};
+    print!("{question} ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_lowercase())
 }
 
 pub fn now() -> i64 {
@@ -64,8 +144,7 @@ pub fn inside(base: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
 }
 
 /// A response body, refused past `limit` bytes (for answers from servers Tugport does not run).
-pub async fn read_capped(resp: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
-    use futures_util::StreamExt;
+pub async fn read_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -77,9 +156,10 @@ pub async fn read_capped(resp: reqwest::Response, limit: usize) -> anyhow::Resul
     Ok(body)
 }
 
-pub fn ct_eq(a: &str, b: &str) -> bool {
+pub fn ct_eq(a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> bool {
     use subtle::ConstantTimeEq;
-    a.len() == b.len() && a.as_bytes().ct_eq(b.as_bytes()).into()
+    let (a, b) = (a.as_ref(), b.as_ref());
+    a.len() == b.len() && a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -106,6 +186,14 @@ mod tests {
         assert!(inside(base, "../x").is_none());
         assert!(inside(base, "a/../../x").is_none());
         assert!(inside(base, "//etc/../..").is_none());
+    }
+
+    #[test]
+    fn hashes() {
+        // RFC 4231 test case 2.
+        assert_eq!(hex::encode(hmac_sha256("Jefe", "what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        assert_eq!(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(urlencode("a b/c~"), "a%20b%2Fc~");
     }
 
     #[test]

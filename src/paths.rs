@@ -45,15 +45,13 @@ impl Paths {
     }
     /// Static copy of this binary that containers mount as their init.
     pub fn init_binary(&self) -> PathBuf {
-        self.data.join("bin").join("tugport-init")
+        self.tools().join("tugport-init")
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {
-        for dir in [&self.etc, &self.data, &self.logs(), &self.sources(), &self.deploy_logs(), &self.tools()] {
+        for dir in [&self.etc, &self.data, &self.logs(), &self.sources(), &self.deploy_logs(), &self.tools(), &self.secrets(), &self.files()] {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::create_dir_all(self.secrets())?;
-        std::fs::create_dir_all(self.files())?;
         restrict(&self.etc, 0o700)?;
         // The database, container and deploy logs and Git checkouts (private code): root only.
         // Containers reach the files mounted into them (the init, Compose folders) regardless.

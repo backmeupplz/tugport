@@ -8,7 +8,7 @@ mod git;
 mod hooks;
 mod nodes;
 mod observe;
-pub mod projects;
+mod projects;
 
 use crate::app::AppState;
 use crate::auth::{self, KeyCheck, Principal};
@@ -16,8 +16,13 @@ use axum::Router;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
+use crate::store::Service;
+use futures_util::{Stream, StreamExt};
+use serde_json::{Value, json};
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 
 pub fn router(app: AppState) -> Router {
@@ -103,11 +108,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/git/providers/{id}/repos", get(git::repos))
         .route("/api/git/github/manifest", post(git::github_manifest))
         .route("/api/git/github/callback", get(git::github_callback))
-        .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
-        .route("/api/hooks/git/{provider}", post(hooks::git_hook))
-        // Easypanel's deploy webhook path, so migrated repositories keep deploying.
-        .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
-        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .merge(hook_routes())
         .fallback(crate::web::static_handler)
         .layer(axum::middleware::from_fn(json_errors))
         .layer(axum::middleware::from_fn(same_origin))
@@ -169,12 +170,44 @@ async fn json_errors(req: axum::extract::Request, next: axum::middleware::Next) 
 
 /// Only the deploy webhooks, for listeners exposed to the internet.
 pub fn hooks_router(app: AppState) -> Router {
+    hook_routes().with_state(app)
+}
+
+fn hook_routes() -> Router<AppState> {
+    let deploy = || post(hooks::deploy_hook).get(hooks::deploy_hook);
     Router::new()
-        .route("/api/hooks/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
+        .route("/api/hooks/deploy/{token}", deploy())
         .route("/api/hooks/git/{provider}", post(hooks::git_hook))
-        .route("/api/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
-        .route("/api/compose/deploy/{token}", post(hooks::deploy_hook).get(hooks::deploy_hook))
-        .with_state(app)
+        // Easypanel's deploy webhook paths, so migrated repositories keep deploying.
+        .route("/api/deploy/{token}", deploy())
+        .route("/api/compose/deploy/{token}", deploy())
+}
+
+/// A failure the caller can fix (a bad token, an unreachable provider): 400 with its reason.
+pub fn bad(e: anyhow::Error) -> ApiError {
+    ApiError::bad_request(format!("{e:#}"))
+}
+
+/// Run `fut` to the end even if the caller goes away (so nothing stops halfway).
+pub async fn detached<T: Send + 'static>(fut: impl Future<Output = anyhow::Result<T>> + Send + 'static) -> ApiResult<anyhow::Result<T>> {
+    Ok(tokio::spawn(fut).await.map_err(anyhow::Error::from)?)
+}
+
+/// A row as a JSON object keyed by column name (text, numbers and nulls; no column listed this way is a blob).
+pub fn row_json(r: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
+    let stmt = r.as_ref();
+    (0..stmt.column_count())
+        .map(|i| {
+            let v = match r.get_ref(i)? {
+                rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
+                rusqlite::types::ValueRef::Text(t) => serde_json::json!(String::from_utf8_lossy(t)),
+                rusqlite::types::ValueRef::Null | rusqlite::types::ValueRef::Blob(_) => serde_json::Value::Null,
+            };
+            Ok((stmt.column_name(i)?.to_string(), v))
+        })
+        .collect::<rusqlite::Result<serde_json::Map<_, _>>>()
+        .map(serde_json::Value::Object)
 }
 
 /// For `Option<Option<T>>` body fields: tells null (`Some(None)`, clear it) from a
@@ -183,10 +216,90 @@ pub fn present<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(d: 
     T::deserialize(d).map(Some)
 }
 
+/// JSON merge patch (RFC 7386).
+fn merge(target: &mut Value, patch: &Value) {
+    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            if v.is_null() {
+                t.remove(k);
+            } else {
+                merge(t.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
+/// `current` with a merge patch applied; a result that no longer parses is the caller's
+/// mistake ("invalid {what}: ...").
+pub fn patched<T: serde::Serialize + serde::de::DeserializeOwned>(current: &T, patch: &Value, what: &str) -> ApiResult<T> {
+    let mut v = serde_json::to_value(current)?;
+    merge(&mut v, patch);
+    serde_json::from_value(v).map_err(|e| ApiError::bad_request(format!("invalid {what}: {e}")))
+}
+
+/// Comma-separated names for the audit log (never the values).
+pub fn names<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
+    keys.into_iter().map(String::as_str).collect::<Vec<_>>().join(",")
+}
+
+/// Argon2 off the async threads (`auth::hashing`).
+pub async fn hash_password(password: String) -> ApiResult<String> {
+    Ok(auth::hashing(move || auth::hash_password(&password)).await.ok_or_else(|| anyhow::anyhow!("hashing the password failed"))??)
+}
+
+/// `{"ok": true}`, the answer of changes that have nothing else to report.
+pub fn ok() -> axum::Json<Value> {
+    axum::Json(json!({ "ok": true }))
+}
+
+/// A ref to deploy, as deploys and deploy hooks accept it.
+pub fn check_ref(r: Option<&str>) -> ApiResult<()> {
+    if r.is_some_and(|r| !crate::git::valid_ref(r)) { Err(ApiError::bad_request("ref is not a branch, tag or commit name")) } else { Ok(()) }
+}
+
+/// A server-sent event stream, kept alive between events.
+pub type Events = Sse<sse::KeepAliveStream<futures_util::stream::BoxStream<'static, Result<sse::Event, Infallible>>>>;
+
+pub fn sse_events(stream: impl Stream<Item = sse::Event> + Send + 'static) -> Events {
+    Sse::new(stream.map(Ok).boxed()).keep_alive(KeepAlive::default())
+}
+
+/// An event named `name` carrying `data` as JSON.
+pub fn sse_json(name: &str, data: &impl serde::Serialize) -> sse::Event {
+    sse::Event::default().event(name).data(serde_json::to_string(data).unwrap_or_default())
+}
+
+/// The services the caller can see, across projects.
+pub fn visible_services(app: &AppState, a: &Auth) -> ApiResult<Vec<Service>> {
+    Ok(crate::store::services(app, None)?.into_iter().filter(|s| a.0.can(&s.project_id, auth::Role::Viewer)).collect())
+}
+
+pub fn project_or_404(app: &AppState, a: &Auth, id: &str, role: auth::Role) -> ApiResult<crate::store::Project> {
+    let p = crate::store::project(app, id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+    a.require(&p.id, role)?;
+    Ok(p)
+}
+
+pub fn service_or_404(app: &AppState, a: &Auth, id: &str, role: auth::Role) -> ApiResult<Service> {
+    let s = crate::store::service(app, id)?.ok_or_else(|| ApiError::not_found("service not found"))?;
+    a.require(&s.project_id, role)?;
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::cross_origin;
+    use super::{cross_origin, merge};
     use axum::http::HeaderMap;
+    use serde_json::json;
+
+    #[test]
+    fn merge_patch() {
+        let mut v = json!({ "a": 1, "b": { "c": 2, "d": 3 } });
+        merge(&mut v, &json!({ "b": { "c": 9, "d": null }, "e": true }));
+        assert_eq!(v, json!({ "a": 1, "b": { "c": 9 }, "e": true }));
+    }
 
     fn h(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
         pairs.iter().map(|(k, v)| (axum::http::HeaderName::from_static(k), v.parse().unwrap())).collect()
@@ -259,13 +372,13 @@ impl From<serde_json::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, axum::Json(serde_json::json!({ "error": self.message }))).into_response()
+        (self.status, axum::Json(json!({ "error": self.message }))).into_response()
     }
 }
 
 /// The client's address. Requests that arrive through our own proxy (loopback)
 /// carry the real address in the last X-Forwarded-For entry.
-pub fn client_ip(parts: &Parts) -> Option<IpAddr> {
+fn client_ip(parts: &Parts) -> Option<IpAddr> {
     let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical())?;
     if peer.is_loopback()
         && let Some(xff) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
@@ -319,9 +432,38 @@ impl FromRequestParts<AppState> for Auth {
     }
 }
 
+/// A caller who is the owner (anyone else gets 403 before the body is read).
+pub struct Owner(pub Auth);
+
+impl FromRequestParts<AppState> for Owner {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, Self::Rejection> {
+        let a = Auth::from_request_parts(parts, app).await?;
+        a.require_owner()?;
+        Ok(Owner(a))
+    }
+}
+
 impl Auth {
+    /// Record a change outside any project in the audit log.
+    pub fn audit(&self, app: &AppState, action: &str, target: Option<&str>, detail: Option<&str>) {
+        app.audit(Some(&self.0), action, None, None, target, detail);
+    }
+    /// Record a change to service `s` in the audit log.
+    pub fn audit_service(&self, app: &AppState, action: &str, s: &Service, detail: Option<&str>) {
+        app.audit(Some(&self.0), action, Some(&s.project_id), Some(&s.id), Some(&s.name), detail);
+    }
     pub fn require_owner(&self) -> ApiResult<()> {
         if self.0.is_owner { Ok(()) } else { Err(ApiError::forbidden("only the owner can do this")) }
+    }
+    /// Server-wide views (servers, metrics, backup targets): the owner or a role on all projects.
+    pub fn require_servers(&self, refusal: &str) -> ApiResult<()> {
+        if self.0.sees_servers() { Ok(()) } else { Err(ApiError::forbidden(refusal)) }
+    }
+    /// The owner, or the operator role on every project (creating projects, seeing registries).
+    pub fn operates_all_projects(&self) -> bool {
+        self.0.is_owner || self.0.all_projects_role.is_some_and(|r| r >= auth::Role::Operator)
     }
     pub fn require(&self, project_id: &str, role: auth::Role) -> ApiResult<()> {
         if self.0.can(project_id, role) {

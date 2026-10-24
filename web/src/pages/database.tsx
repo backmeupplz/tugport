@@ -1,8 +1,8 @@
 // Database read replicas: the list and the add form on a primary, and promotion on a replica.
 import { useState } from "preact/hooks";
 import { atLeast, nodeName, post, useApi, type Event, type ServiceDetail } from "../api";
-import { Card, Empty, ErrorBox, Field, Loaded, Modal, Note, Pill, toast, useSubmit } from "../ui";
-import { parseLabels, varName } from "../util";
+import { Card, ConfirmName, Empty, FormButtons, Loaded, Modal, Note, Pill, toast, useForm, useSubmit } from "../ui";
+import { requireLabels, varName } from "../util";
 import type { Ctx } from "./service";
 import { PlacementFields } from "./service-settings";
 
@@ -49,8 +49,8 @@ export function ReadReplicas({ c }: { c: Ctx }) {
     >
       <div class="space-y-4">
         <p class="text-dim">
-          A read replica is a copy of {s.name} that follows every change. It answers reads, which takes load off {s.name}, and it can run on another server or in another region.
-          If {s.name} is lost, you can promote a replica to take its place.
+          A read replica is a copy of {s.name} that follows every change. It answers reads, which takes load off {s.name}, and it can run on another server or in another region. If{" "}
+          {s.name} is lost, you can promote a replica to take its place.
         </p>
         <Loaded r={r}>
           {(d) =>
@@ -58,7 +58,7 @@ export function ReadReplicas({ c }: { c: Ctx }) {
               <Empty>{s.name} has no read replicas yet.</Empty>
             ) : (
               <>
-                <ul class="divide-y divide-line rounded-md border border-line">
+                <ul class="inset-list">
                   {d.replicas.map((x) => (
                     <li key={x.id} class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
                       <a class="link min-w-0 flex-1 truncate font-medium" href={`/projects/${s.project}/${x.name}`}>
@@ -97,15 +97,14 @@ function AddReplica(props: { c: Ctx; onClose: () => void; onAdded: () => void })
   // A replica with no rules lands on the panel's server, so suggest a server the primary does not run on.
   const here = new Set(c.d.status.replicas.map((x) => x.node));
   const other = nodes?.find((n) => !here.has(n.id) && (n.local || n.status === "online"));
-  const [rules, setRules] = useState({ node: other?.id ?? "", region: "", labels: "" });
+  const { f: rules, set } = useForm({ node: other?.id ?? "", region: "", labels: "" });
   const engine = s.spec.database?.engine ?? "";
   // MongoDB becomes a replica set and MariaDB turns on binary logging, each with one restart.
   const restarts =
     (engine === "mongo" && !(s.spec.entrypoint ?? []).join(" ").includes("--replSet")) ||
     (engine === "mariadb" && !(s.spec.command ?? []).some((a: string) => a.startsWith("--log-bin")));
   const sub = useSubmit(async () => {
-    const labels = parseLabels(rules.labels);
-    if (!labels) throw new Error("Write each label as key=value, separated by commas or new lines.");
+    const labels = requireLabels(rules.labels);
     const placement = { node: rules.node.trim() || null, region: rules.region.trim() || null, labels };
     const res = await post<{ replica: { id: string; name: string }; deploy_id: string }>(`/services/${s.id}/replicas`, { placement });
     toast(`Added ${res.replica.name}. It copies the data first and then follows ${s.name}.`);
@@ -117,10 +116,10 @@ function AddReplica(props: { c: Ctx; onClose: () => void; onAdded: () => void })
     <Modal open onClose={props.onClose} title={`Add a read replica of ${s.name}`} wide>
       <form class="space-y-4" onSubmit={sub.submit}>
         <p class="text-dim">
-          The replica is a database service of its own, named {s.name}-replica-N, in this project. It first copies all of {s.name}'s data, which takes a while for a large
-          database, and then follows every change.
+          The replica is a database service of its own, named {s.name}-replica-N, in this project. It first copies all of {s.name}'s data, which takes a while for a large database,
+          and then follows every change.
         </p>
-        <PlacementFields nodes={nodes} rules={rules} set={(p) => setRules((x) => ({ ...x, ...p }))} />
+        <PlacementFields nodes={nodes} rules={rules} set={set} />
         <p class="text-xs text-muted">
           With no rules, the replica runs on the panel's server. A replica on another server or in another region keeps a copy of the data when the primary's server goes down.
         </p>
@@ -129,15 +128,7 @@ function AddReplica(props: { c: Ctx; onClose: () => void; onAdded: () => void })
             {ENGINES[engine]} needs replication turned on first, so adding the first replica restarts {s.name} once. Connections to it drop for a few seconds.
           </Note>
         )}
-        <ErrorBox error={sub.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={sub.busy}>
-            {sub.busy ? (restarts ? `Restarting ${s.name} and adding the replica…` : "Adding the replica…") : "Add the replica"}
-          </button>
-        </div>
+        <FormButtons s={sub} submit={sub.busy ? (restarts ? `Restarting ${s.name} and adding the replica…` : "Adding the replica…") : "Add the replica"} onCancel={props.onClose} />
       </form>
     </Modal>
   );
@@ -218,18 +209,8 @@ function Promote(props: { c: Ctx; primary: string; onClose: () => void }) {
             If {props.primary} is still running, both databases accept writes afterwards and their data drifts apart for good. Stop {props.primary} before you promote, and keep it
             from coming back.
           </Note>
-          <Field label={`Type ${s.name} to confirm`}>
-            <input class="input font-mono" autoComplete="off" spellcheck={false} value={typed} onInput={(e) => setTyped(e.currentTarget.value)} />
-          </Field>
-          <ErrorBox error={sub.error} />
-          <div class="flex justify-end gap-2">
-            <button type="button" class="btn" onClick={close}>
-              Cancel
-            </button>
-            <button class="btn btn-danger" disabled={typed !== s.name || sub.busy}>
-              {sub.busy ? "Promoting…" : `Promote ${s.name}`}
-            </button>
-          </div>
+          <ConfirmName name={s.name} value={typed} onChange={setTyped} />
+          <FormButtons s={sub} danger submit={sub.busy ? "Promoting…" : `Promote ${s.name}`} onCancel={close} disabled={typed !== s.name} />
         </form>
       )}
     </Modal>

@@ -12,21 +12,23 @@
 //! Each step is recorded in a journal (the `migration` state key), so a rerun resumes where
 //! the last one stopped and `tugport migrate rollback` undoes everything in reverse.
 
-pub mod coolify;
-pub mod easypanel;
+mod coolify;
+mod easypanel;
 
 use crate::app::{App, AppState, Settings};
-use crate::model::{DomainOptions, ServiceSpec, Source};
+use crate::model::{BasicUser, DatabaseSpec, DomainOptions, Engine, Health, HealthKind, Port, Protocol, ServiceSpec, Source, Strategy};
 use crate::store::{self, Service};
-use crate::{deploy, git, runtime, util};
+use crate::{databases, deploy, git, runtime, util};
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::models::{EndpointSettings, NetworkConnectRequest, NetworkDisconnectRequest};
-use bollard::query_parameters::{ListContainersOptions, StopContainerOptions};
-use rusqlite::{OptionalExtension, params};
+use bollard::query_parameters::ListContainersOptions;
+use regex::Regex;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 #[derive(clap::Subcommand)]
@@ -57,7 +59,6 @@ pub enum Command {
 }
 
 /// A panel found on this server, for the installer's "migrate?" question.
-#[derive(Debug, Serialize)]
 pub struct Found {
     pub panel: &'static str,
     pub version: String,
@@ -76,7 +77,6 @@ pub async fn detect() -> Vec<Found> {
 }
 
 pub fn main(cmd: Command) -> Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
         match cmd {
             Command::Detect => {
@@ -94,57 +94,57 @@ pub fn main(cmd: Command) -> Result<()> {
 
 /// Everything one migration moves.
 #[derive(Default)]
-pub struct Plan {
-    pub panel: &'static str,
-    pub version: String,
-    pub projects: Vec<NewProject>,
-    pub services: Vec<NewService>,
-    pub certs: Vec<Cert>,
-    pub github_token: Option<String>,
+struct Plan {
+    panel: &'static str,
+    version: String,
+    projects: Vec<NewProject>,
+    services: Vec<NewService>,
+    certs: Vec<Cert>,
+    github_token: Option<String>,
     /// (host, user, password) for private images.
-    pub registries: Vec<(String, String, String)>,
-    pub acme_email: Option<String>,
-    pub panel_domain: Option<String>,
+    registries: Vec<(String, String, String)>,
+    acme_email: Option<String>,
+    panel_domain: Option<String>,
     /// Tugport also serves its API here after the switch, so old webhook URLs keep working.
-    pub legacy_listen: Option<String>,
-    pub proxy: Old,
-    pub old_panel: Old,
+    legacy_listen: Option<String>,
+    proxy: Old,
+    old_panel: Old,
     /// Instance-wide things that do not move.
-    pub notes: Vec<String>,
+    notes: Vec<String>,
 }
 
-pub struct NewProject {
-    pub name: String,
-    pub vars: BTreeMap<String, String>,
+struct NewProject {
+    name: String,
+    vars: BTreeMap<String, String>,
 }
 
-pub struct NewService {
+struct NewService {
     /// The old panel's name (`project/service`); the journal key.
-    pub key: String,
-    pub project: String,
-    pub name: String,
-    pub kind: &'static str,
-    pub spec: ServiceSpec,
-    pub env: BTreeMap<String, String>,
-    pub files: Vec<(String, String)>,
-    pub domains: Vec<NewDomain>,
+    key: String,
+    project: String,
+    name: String,
+    kind: &'static str,
+    spec: ServiceSpec,
+    env: BTreeMap<String, String>,
+    files: Vec<(String, String)>,
+    domains: Vec<NewDomain>,
     /// The old deploy webhook token; its URL keeps working.
-    pub hook: Option<String>,
+    hook: Option<String>,
     /// The image the old copy runs, deployed as-is so nothing is rebuilt during the move.
-    pub image: Option<String>,
-    pub commit: Option<String>,
-    pub old: Old,
-    pub cutover: Cutover,
+    image: Option<String>,
+    commit: Option<String>,
+    old: Old,
+    cutover: Cutover,
     /// Old networks Tugport's copy joins while old services still run, with the names it answers to.
-    pub overlays: Vec<(String, Vec<String>)>,
+    overlays: Vec<(String, Vec<String>)>,
     /// What does not carry over exactly.
-    pub notes: Vec<String>,
+    notes: Vec<String>,
     /// A token that was inside the old Git URL: (provider base URL, token), stored encrypted.
-    pub git_secret: Option<(String, String)>,
+    git_secret: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cutover {
+enum Cutover {
     /// Old and new must never run together (databases, stop-first services, published ports):
     /// stop the old copy, then start Tugport's.
     Swap,
@@ -156,25 +156,24 @@ pub enum Cutover {
     Unsupported,
 }
 
-pub struct NewDomain {
-    pub host: String,
-    pub path: String,
-    pub port: u16,
-    pub container: Option<String>,
-    pub https: bool,
-    pub options: DomainOptions,
+struct NewDomain {
+    host: String,
+    path: String,
+    port: u16,
+    container: Option<String>,
+    https: bool,
+    options: DomainOptions,
 }
 
-pub struct Cert {
-    pub host: String,
-    pub cert_pem: String,
-    pub key_pem: String,
+struct Cert {
+    host: String,
+    cert_pem: String,
+    key_pem: String,
 }
 
 /// How to stop and start the old copy of something.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Old {
+#[derive(Default, PartialEq)]
+enum Old {
     #[default]
     None,
     /// A swarm service, stopped by scaling it to zero.
@@ -188,7 +187,7 @@ pub enum Old {
 /// Old panels keep Git tokens inside repository URLs (`https://user:token@host/o/r.git`).
 /// Tugport keeps them as encrypted providers instead, so no token sits in a service's
 /// settings or in a printed plan: the URL loses its credentials and points at a provider.
-pub fn lift_git_credentials(plan: &mut Plan) {
+fn lift_git_credentials(plan: &mut Plan) {
     for s in &mut plan.services {
         let Source::Git { provider, repo, .. } = &mut s.spec.source else { continue };
         let Some((base, path, secret)) = credentialed_git(repo) else { continue };
@@ -224,10 +223,10 @@ fn redact_userinfo(url: &str) -> String {
 }
 
 /// Placeholder provider id in planned specs; import swaps in the GitHub provider it creates.
-pub const GITHUB: &str = "$github";
+const GITHUB: &str = "$github";
 
 /// Tugport names are `[a-z][a-z0-9-]*`: `cas_ban_bot` becomes `cas-ban-bot`.
-pub fn tugport_name(old: &str) -> String {
+fn tugport_name(old: &str) -> String {
     let mut n = String::new();
     for c in old.to_lowercase().chars() {
         let c = if c.is_ascii_alphanumeric() { c } else { '-' };
@@ -244,7 +243,7 @@ pub fn tugport_name(old: &str) -> String {
 
 /// Services that mention another project's service by one of its old names join that
 /// project's network, so cross-project references keep resolving.
-pub fn link_projects(services: &mut [NewService], names: impl Fn(&NewService) -> Vec<String>, text: impl Fn(&NewService) -> String) {
+fn link_projects(services: &mut [NewService], names: impl Fn(&NewService) -> Vec<String>, text: impl Fn(&NewService) -> String) {
     let mut joins: Vec<(usize, String)> = vec![];
     for (i, target) in services.iter().enumerate() {
         let qualified = names(target);
@@ -277,13 +276,173 @@ pub fn link_projects(services: &mut [NewService], names: impl Fn(&NewService) ->
 }
 
 /// `host` appears in `text` as a whole host name (not as part of a longer one).
-pub fn mentions(text: &str, host: &str) -> bool {
+fn mentions(text: &str, host: &str) -> bool {
     let part = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-    text.match_indices(host).any(|(i, _)| {
-        let before = text[..i].chars().next_back();
-        let after = text[i + host.len()..].chars().next();
+    text.match_indices(host).any(|(i, m)| {
+        let before = text.get(..i).and_then(|t| t.chars().next_back());
+        let after = text.get(i + m.len()..).and_then(|t| t.chars().next());
         !before.is_some_and(|c| part(c) || c == '.') && !after.is_some_and(part)
     })
+}
+
+impl NewService {
+    /// A planned service with Tugport's defaults. Imported services keep
+    /// `no_new_privileges: false`, so they behave exactly as before.
+    fn new(key: String, project: String, name: &str) -> Self {
+        NewService {
+            key,
+            project,
+            name: tugport_name(name),
+            kind: "app",
+            spec: ServiceSpec { no_new_privileges: false, ..Default::default() },
+            env: BTreeMap::new(),
+            files: vec![],
+            domains: vec![],
+            hook: None,
+            image: None,
+            commit: None,
+            old: Old::None,
+            cutover: Cutover::Parallel,
+            overlays: vec![],
+            notes: vec![],
+            git_secret: None,
+        }
+    }
+
+    /// Old and new must never run together: a running service swaps instead.
+    fn exclusive(&mut self) {
+        if self.cutover == Cutover::Parallel {
+            self.cutover = Cutover::Swap;
+        }
+    }
+
+    /// What both panels' databases share: the engine's health check, a stop-first rollout
+    /// with time to recover, and the public port on the database container.
+    fn database(&mut self, engine: Engine, user: &str, database: &str, public: Option<u16>) {
+        self.kind = "database";
+        let check = match engine {
+            // The official healthcheck.sh needs a user the old panels never created.
+            Engine::Mariadb => "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent",
+            e => databases::preset(e).health,
+        };
+        self.spec.health = Health { kind: HealthKind::Command, command: Some(check.into()), start_period_s: 30, ..Health::default() };
+        self.spec.rollout.strategy = Strategy::StopFirst;
+        self.spec.rollout.health_timeout_s = 600;
+        self.spec.database = Some(DatabaseSpec { engine, user: user.into(), database: database.into(), primary: None });
+        if let Some(port) = public {
+            self.spec.ports.push(Port { container: databases::preset(engine).port, host: port, protocol: Protocol::Tcp });
+        }
+        self.exclusive();
+    }
+}
+
+/// Two old names can map to one Tugport name (`my_app`, `my-app`): number the later ones.
+fn dedupe_names(services: &mut [NewService]) {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for s in services.iter_mut().filter(|s| s.cutover != Cutover::Unsupported) {
+        let base = s.name.clone();
+        let mut i = 2;
+        while !seen.insert((s.project.clone(), s.name.clone())) {
+            s.name = format!("{}-{i}", base.chars().take(37).collect::<String>());
+            i += 1;
+        }
+        if s.name != base {
+            s.notes.push(format!("renamed to {} because {base} is taken", s.name));
+            s.spec.aliases.retain(|a| *a != s.name);
+        }
+    }
+}
+
+/// A trimmed string field of foreign JSON; missing or not a string reads as "".
+fn st<'a>(v: &'a Value, k: &str) -> &'a str {
+    v[k].as_str().unwrap_or("").trim()
+}
+
+fn nonempty(s: &str) -> Option<&str> {
+    Some(s).filter(|s| !s.is_empty())
+}
+
+/// A port number; out-of-range numbers are `None` rather than wrapped onto another port (80, say).
+fn port(v: &Value) -> Option<u16> {
+    v.as_u64().and_then(|p| u16::try_from(p).ok())
+}
+
+/// Set `k` to `v` unless it is set already or `v` is empty.
+fn default_env(env: &mut BTreeMap<String, String>, k: &str, v: &str) {
+    if !v.is_empty() {
+        env.entry(k.into()).or_insert_with(|| v.into());
+    }
+}
+
+/// A basic auth user with its password hashed; a note when it cannot be.
+fn basic_user(user: &str, password: &str, notes: &mut Vec<String>) -> Option<BasicUser> {
+    match crate::auth::hash_password(password) {
+        Ok(hash) => Some(BasicUser { user: user.into(), hash, password: None }),
+        Err(e) => {
+            notes.push(format!("basic auth user {user} was not moved: {e:#}"));
+            None
+        }
+    }
+}
+
+/// Import the certificates Traefik obtained (`acme.json`) for the hosts that move; returns those hosts.
+fn take_certs(plan: &mut Plan, acme: Option<&str>) -> HashSet<String> {
+    use base64::Engine as _;
+    let mut hosts: HashSet<String> = plan.services.iter().flat_map(|s| s.domains.iter().map(|d| d.host.clone())).collect();
+    hosts.extend(plan.panel_domain.clone());
+    let Some(v) = acme.and_then(|a| serde_json::from_str::<Value>(a).ok()) else { return hosts };
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.decode(s).ok().and_then(|b| String::from_utf8(b).ok());
+    let mut best: BTreeMap<String, (Option<i64>, Cert)> = BTreeMap::new();
+    for resolver in v.as_object().into_iter().flat_map(|o| o.values()) {
+        for c in resolver["Certificates"].as_array().into_iter().flatten() {
+            let (Some(cert), Some(key)) = (b64(st(c, "certificate")), b64(st(c, "key"))) else { continue };
+            let not_after = crate::acme::first_cert_not_after(&cert);
+            let names = std::iter::once(st(&c["domain"], "main").to_string()).chain(strings(&c["domain"]["sans"]));
+            for host in names.map(|h| h.to_lowercase()).filter(|h| hosts.contains(h)) {
+                if best.get(&host).is_none_or(|(have, _)| not_after > *have) {
+                    best.insert(host.clone(), (not_after, Cert { host, cert_pem: cert.clone(), key_pem: key.clone() }));
+                }
+            }
+        }
+    }
+    plan.certs = best.into_values().map(|(_, c)| c).collect();
+    hosts
+}
+
+/// A panel's version from the image it runs: `easypanel/easypanel:2.38.0@sha256:...` -> `2.38.0`.
+fn image_tag(image: &str) -> String {
+    runtime::split_image(image.split('@').next().unwrap_or(image)).1.to_string()
+}
+
+/// A Git source without a provider; pushes reach it through the deploy webhook.
+fn git_source(repo: &str, branch: &str, path: &str) -> Source {
+    Source::Git { provider: None, repo: repo.into(), branch: branch.into(), path: path.trim_matches('/').into(), watch_paths: vec![], auto_deploy: false }
+}
+
+/// The strings in a JSON array; anything else reads as empty.
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
+/// `dotenv.parse` as Easypanel runs it (dotenv 16), also used for Coolify's `.env`: `KEY=value`
+/// lines, quotes, `export`, comments; `\n` in double quotes becomes a newline.
+fn dotenv(src: &str) -> BTreeMap<String, String> {
+    static LINE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r#"(?m)^\s*(?:export\s+)?([A-Za-z0-9_.-]+)(?:\s*=\s*?|:\s+?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?$"#).ok()
+    });
+    let mut out = BTreeMap::new();
+    let Some(re) = LINE.as_ref() else { return out };
+    let src = src.replace("\r\n", "\n").replace('\r', "\n");
+    for c in re.captures_iter(&src) {
+        let (Some(key), raw) = (c.get(1), c.get(2).map(|m| m.as_str().trim()).unwrap_or("")) else { continue };
+        let quote = raw.chars().next().filter(|q| matches!(q, '\'' | '"' | '`'));
+        let mut v = quote.and_then(|q| raw.strip_prefix(q)?.strip_suffix(q)).unwrap_or(raw).to_string();
+        if quote == Some('"') {
+            v = v.replace("\\n", "\n").replace("\\r", "\r");
+        }
+        out.insert(key.as_str().to_string(), v);
+    }
+    out
 }
 
 /// What a migration did, so reruns resume and rollback can undo it.
@@ -345,20 +504,7 @@ fn open() -> Result<AppState> {
         bail!("start Tugport once first (it installs the container init at {})", paths.init_binary().display());
     }
     let selflog = crate::logs::SelfLog::new(paths.logs().join("_tugport"));
-    let app = Arc::new(App {
-        paths,
-        db,
-        keys: crate::crypto::Keyring::new(&master),
-        docker,
-        events: tokio::sync::broadcast::channel(4096).0,
-        deployer: deploy::Deployer::default(),
-        build_slots: Arc::new(tokio::sync::Semaphore::new(2)),
-        proxy: crate::proxy::Proxy::new()?,
-        logs: tokio::sync::broadcast::channel(16).0,
-        selflog,
-        metrics: crate::metrics::Metrics::default(),
-        nodes: crate::nodes::Nodes::default(),
-    });
+    let app = App::new(paths, db, crate::crypto::Keyring::new(&master), docker, selflog, 2)?;
     crate::nodes::load(&app)?;
     Ok(app)
 }
@@ -396,15 +542,11 @@ async fn migrate(panel: &'static str, dry_run: bool, yes: bool) -> Result<()> {
 }
 
 fn confirm(question: &str) -> Result<bool> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         bail!("pass --yes to run without a terminal");
     }
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(util::prompt(&format!("{question} [y/N]"))?.as_str(), "y" | "yes"))
 }
 
 /// The old panel may have given services host access that Tugport otherwise leaves to admins
@@ -493,26 +635,9 @@ fn print_plan(plan: &Plan) {
             println!("  {:<22} {:<9} {:<34} {:<22} {}", s.name, kind_label(s), clip(&what, 34), how, extra.join(", "));
         }
     }
-    let attention: Vec<String> = moved.iter().flat_map(|s| s.notes.iter().map(move |n| format!("{}: {n}", s.key))).collect();
-    if !attention.is_empty() {
-        println!("\nNeeds attention:");
-        for a in attention {
-            println!("  - {a}");
-        }
-    }
-    let skipped: Vec<String> = plan
-        .services
-        .iter()
-        .filter(|s| s.cutover == Cutover::Unsupported)
-        .map(|s| format!("{}: {}", s.key, s.notes.join("; ")))
-        .chain(plan.notes.iter().cloned())
-        .collect();
-    if !skipped.is_empty() {
-        println!("\nNot moved:");
-        for s in skipped {
-            println!("  - {s}");
-        }
-    }
+    print_list("Needs attention", moved.iter().flat_map(|s| s.notes.iter().map(move |n| format!("{}: {n}", s.key))).collect());
+    let skipped = plan.services.iter().filter(|s| s.cutover == Cutover::Unsupported).map(|s| format!("{}: {}", s.key, s.notes.join("; ")));
+    print_list("Not moved", skipped.chain(plan.notes.iter().cloned()).collect());
     let hooks = moved.iter().filter(|s| s.hook.is_some()).count();
     println!("\nCertificates: {} imported, so nothing is re-issued", plan.certs.len());
     if hooks > 0 {
@@ -532,25 +657,34 @@ fn print_plan(plan: &Plan) {
             println!("  ! they used {} different tokens and only the first one is kept, so it reads every one of those repositories", list.len());
         }
     }
-    let count = |f: &dyn Fn(&&&NewService) -> bool| moved.iter().filter(f).count();
+    let count = |f: fn(&NewService) -> bool| moved.iter().filter(|s| f(s)).count();
     println!(
         "Cutover: databases move first ({}), then apps start next to their old copies ({}), then services that must not run twice move ({}). \
          Each moved database and service is down for a few seconds; everything else only while the proxy switches (about a second).",
-        count(&|s| s.cutover == Cutover::Swap && s.kind == "database"),
-        count(&|s| s.cutover == Cutover::Parallel),
-        count(&|s| s.cutover == Cutover::Swap && s.kind != "database"),
+        count(|s| s.cutover == Cutover::Swap && s.kind == "database"),
+        count(|s| s.cutover == Cutover::Parallel),
+        count(|s| s.cutover == Cutover::Swap && s.kind != "database"),
     );
+}
+
+fn print_list(title: &str, items: Vec<String>) {
+    if !items.is_empty() {
+        println!("\n{title}:");
+        for i in items {
+            println!("  - {i}");
+        }
+    }
 }
 
 fn kind_label(s: &NewService) -> String {
     match &s.spec.database {
-        Some(d) => crate::databases::engine_name(d.engine).to_string(),
+        Some(d) => crate::databases::preset(d.engine).repo.to_string(),
         None => s.kind.to_string(),
     }
 }
 
 fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n - 1).collect::<String>()) }
+    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>()) }
 }
 
 async fn import(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
@@ -562,40 +696,13 @@ async fn import(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
     settings.acme_email = settings.acme_email.or(plan.acme_email.clone());
     settings.panel_domain = settings.panel_domain.or(plan.panel_domain.clone());
     app.db.set_setting("instance", &settings)?;
-
-    if let (Some(token), None) = (&plan.github_token, &j.provider) {
-        let config = serde_json::json!({ "token": token, "webhook_secret": util::token(40) });
-        j.provider = Some(git::save_provider(app, None, git::Kind::GithubToken, &format!("GitHub (from {})", plan.panel), "https://github.com", &config)?);
-        save(app, j)?;
-    }
-    for (base, secret) in plan.services.iter().filter_map(|s| s.git_secret.as_ref()) {
-        if j.git_providers.contains_key(base) {
-            continue;
-        }
-        let kind = if base == "https://github.com" { git::Kind::GithubToken } else { git::Kind::Forgejo };
-        let config = serde_json::json!({ "token": secret, "webhook_secret": util::token(40) });
-        let name = format!("{} (from {})", base.trim_start_matches("https://").trim_start_matches("http://"), plan.panel);
-        let id = git::save_provider(app, None, kind, &name, base, &config)?;
-        j.git_providers.insert(base.clone(), id);
-        save(app, j)?;
-    }
-    for (host, user, password) in &plan.registries {
-        let exists: bool = app.db.conn().query_row("SELECT COUNT(*) > 0 FROM registries WHERE host = ?1", [host], |r| r.get(0))?;
-        if !exists {
-            app.db.conn().execute(
-                "INSERT INTO registries (id, host, username, password, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![util::id(), host, user, app.keys.seal_str(&format!("registry:{host}"), password)?, util::now()],
-            )?;
-            j.registries.push(host.clone());
-            save(app, j)?;
-        }
-    }
+    import_credentials(app, plan, j)?;
     for p in &plan.projects {
         let project = match store::project(app, &p.name)? {
             Some(p) => p,
             None => {
                 let id = util::id();
-                app.db.conn().execute("INSERT INTO projects (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, p.name, format!("Moved from {}", plan.panel), util::now()])?;
+                app.db.exec("INSERT INTO projects (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, p.name, format!("Moved from {}", plan.panel), util::now()])?;
                 j.projects.push(id.clone());
                 save(app, j)?;
                 store::project(app, &id)?.ok_or_else(|| anyhow!("project {} vanished", p.name))?
@@ -619,14 +726,45 @@ async fn import(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
     Ok(())
 }
 
+/// Git providers and registry logins, each recorded as soon as it exists.
+fn import_credentials(app: &App, plan: &Plan, j: &mut Journal) -> Result<()> {
+    let provider = |kind, name: &str, base: &str, token: &str| {
+        git::save_provider(app, None, kind, &format!("{name} (from {})", plan.panel), base, &serde_json::json!({ "token": token, "webhook_secret": util::token(40) }))
+    };
+    if let (Some(token), None) = (&plan.github_token, &j.provider) {
+        j.provider = Some(provider(git::Kind::GithubToken, "GitHub", "https://github.com", token)?);
+        save(app, j)?;
+    }
+    for (base, secret) in plan.services.iter().filter_map(|s| s.git_secret.as_ref()) {
+        if j.git_providers.contains_key(base) {
+            continue;
+        }
+        let kind = if base == "https://github.com" { git::Kind::GithubToken } else { git::Kind::Forgejo };
+        let id = provider(kind, base.trim_start_matches("https://").trim_start_matches("http://"), base, secret)?;
+        j.git_providers.insert(base.clone(), id);
+        save(app, j)?;
+    }
+    for (host, user, password) in &plan.registries {
+        if app.db.row("SELECT 1 FROM registries WHERE host = ?1", [host], |_| Ok(()))?.is_none() {
+            app.db.exec(
+                "INSERT INTO registries (id, host, username, password, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![util::id(), host, user, app.keys.seal_str(&format!("registry:{host}"), password)?, util::now()],
+            )?;
+            j.registries.push(host.clone());
+            save(app, j)?;
+        }
+    }
+    Ok(())
+}
+
 fn import_service(app: &App, s: &NewService, provider: Option<&str>, j: &mut Journal) -> Result<()> {
     let existing = store::service(app, &format!("{}.{}", s.project, s.name))?;
     let pos = j.services.iter().position(|m| m.key == s.key);
-    match (existing, pos.map(|i| &j.services[i])) {
+    match (existing, pos.and_then(|i| j.services.get(i))) {
         (Some(_), Some(m)) if m.imported => return Ok(()),
         // Half imported by an interrupted run: start over.
         (Some(e), Some(_)) => {
-            app.db.conn().execute("DELETE FROM services WHERE id = ?1", [&e.id])?;
+            app.db.exec("DELETE FROM services WHERE id = ?1", [&e.id])?;
         }
         (Some(_), None) => bail!("Tugport already has a service {}.{}; rename or delete it and run the migration again", s.project, s.name),
         (None, _) => {}
@@ -648,7 +786,7 @@ fn import_service(app: &App, s: &NewService, provider: Option<&str>, j: &mut Jou
         None => j.services.push(moved),
     }
     save(app, j)?;
-    app.db.conn().execute(
+    app.db.exec(
         "INSERT INTO services (id, project_id, name, kind, spec, deploy_token_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![id, project.id, s.name, s.kind, serde_json::to_string(&spec)?, s.hook.as_ref().map(util::sha256_hex), now],
     )?;
@@ -659,7 +797,7 @@ fn import_service(app: &App, s: &NewService, provider: Option<&str>, j: &mut Jou
         store::set_file(app, &id, target, Some(content))?;
     }
     for d in &s.domains {
-        let added = app.db.conn().execute(
+        let added = app.db.exec(
             "INSERT INTO domains (id, service_id, host, path, port, container, https, via_tunnel, options, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)
              ON CONFLICT(host, path) DO NOTHING",
             params![util::id(), id, d.host, d.path, d.port, d.container, d.https, serde_json::to_string(&d.options)?, now],
@@ -680,14 +818,14 @@ fn import_cert(app: &App, c: &Cert, j: &mut Journal) -> Result<()> {
         return Ok(());
     }
     let not_after = crate::acme::first_cert_not_after(&c.cert_pem);
-    let current: Option<Option<i64>> = app.db.conn().query_row("SELECT not_after FROM certificates WHERE host = ?1 AND cert_pem IS NOT NULL", [&c.host], |r| r.get(0)).optional()?;
+    let current: Option<Option<i64>> = app.db.row("SELECT not_after FROM certificates WHERE host = ?1 AND cert_pem IS NOT NULL", [&c.host], |r| r.get(0))?;
     if current.flatten().is_some_and(|have| not_after.is_none_or(|n| have >= n)) {
         return Ok(());
     }
-    app.db.conn().execute(
+    app.db.exec(
         "INSERT INTO certificates (host, cert_pem, key_pem, not_after, source, updated_at) VALUES (?1, ?2, ?3, ?4, 'imported', ?5)
          ON CONFLICT(host) DO UPDATE SET cert_pem = excluded.cert_pem, key_pem = excluded.key_pem, not_after = excluded.not_after, source = 'imported', last_error = NULL, next_attempt_at = NULL, updated_at = excluded.updated_at",
-        params![c.host, c.cert_pem, app.keys.seal_str(&format!("cert:{}", c.host), &c.key_pem)?, not_after, util::now()],
+        params![c.host, c.cert_pem, app.keys.seal_str(&crate::acme::key_context(&c.host), &c.key_pem)?, not_after, util::now()],
     )?;
     if !j.certs.contains(&c.host) {
         j.certs.push(c.host.clone());
@@ -696,13 +834,11 @@ fn import_cert(app: &App, c: &Cert, j: &mut Journal) -> Result<()> {
 }
 
 async fn cutover(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
-    if plan.proxy != Old::None && j.proxy.is_none() && server_pids().is_empty() {
-        bail!("Tugport is not running; start it (systemctl start tugport) and run the migration again. Its proxy takes over ports 80 and 443 at the switch");
+    if plan.proxy != Old::None && j.proxy.is_none() {
+        server_running()?;
     }
     let moved: Vec<&NewService> = plan.services.iter().filter(|s| j.services.iter().any(|m| m.key == s.key && m.imported)).collect();
-    let mut projects: Vec<&str> = moved.iter().map(|s| s.project.as_str()).collect();
-    projects.sort();
-    projects.dedup();
+    let projects: BTreeSet<&str> = moved.iter().map(|s| s.project.as_str()).collect();
     for p in projects {
         runtime::ensure_network(app, p).await?;
     }
@@ -710,7 +846,8 @@ async fn cutover(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
     for s in databases.iter().filter(|s| s.cutover == Cutover::Swap) {
         swap(app, s, j).await?;
     }
-    for s in rest.iter().filter(|s| s.cutover == Cutover::Parallel) {
+    let parallel: Vec<&NewService> = rest.iter().copied().filter(|s| s.cutover == Cutover::Parallel).collect();
+    for s in &parallel {
         let m = moved_mut(j, &s.key)?;
         if !m.deployed {
             println!("{}: starting next to the old copy", s.key);
@@ -734,31 +871,17 @@ async fn cutover(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
 
     switch(app, plan, j).await?;
 
-    for s in rest.iter().filter(|s| s.cutover == Cutover::Parallel) {
-        if moved_mut(j, &s.key)?.stopped.is_none() {
-            moved_mut(j, &s.key)?.stopped = Some(record(&app.docker, &s.old).await?);
-            save(app, j)?;
-        }
-        halt(&app.docker, &s.old, false).await?;
+    for s in &parallel {
+        remember(app, j, |j| Ok(&mut moved_mut(j, &s.key)?.stopped), &s.old).await?;
+        halt(app, &s.old, false).await?;
     }
     if plan.old_panel != Old::None {
-        if j.old_panel.is_none() {
-            j.old_panel = Some(record(&app.docker, &plan.old_panel).await?);
-            save(app, j)?;
-        }
+        remember(app, j, |j| Ok(&mut j.old_panel), &plan.old_panel).await?;
         println!("Stopping the old panel");
-        halt(&app.docker, &plan.old_panel, false).await?;
+        halt(app, &plan.old_panel, false).await?;
     }
     if let Some(listen) = &plan.legacy_listen {
-        let mut settings = app.settings();
-        settings.legacy_listen = Some(listen.clone());
-        app.db.set_setting("instance", &settings)?;
-        let port = listen.rsplit(':').next().unwrap_or("3000");
-        if answers(&format!("http://127.0.0.1:{port}/api/deploy/tugport-migration-probe"), None, Duration::from_secs(30)).await {
-            println!("Old deploy webhook URLs now reach Tugport on {listen}");
-        } else {
-            println!("  ! Tugport does not answer on {listen} yet; restart it to serve the old webhook URLs");
-        }
+        serve_legacy(app, listen).await?;
     }
     // Every old consumer is gone: drop the old networks so removing the old panel later breaks nothing.
     for m in j.services.iter().filter(|m| m.swap) {
@@ -766,51 +889,84 @@ async fn cutover(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
     }
     // Hosts without an imported certificate failed their challenges while the old proxy held
     // port 80; retry them now instead of after the backoff.
-    app.db.conn().execute("DELETE FROM state WHERE key LIKE 'acme_attempts:%'", [])?;
-    app.db.conn().execute("UPDATE certificates SET next_attempt_at = NULL WHERE cert_pem IS NULL", [])?;
+    app.db.exec("DELETE FROM state WHERE key LIKE 'acme_attempts:%'", [])?;
+    app.db.exec("UPDATE certificates SET next_attempt_at = NULL WHERE cert_pem IS NULL", [])?;
     j.done = true;
     save(app, j)
+}
+
+/// Serve the API on the old panel's address too, so its deploy webhook URLs keep working.
+async fn serve_legacy(app: &App, listen: &str) -> Result<()> {
+    let mut settings = app.settings();
+    settings.legacy_listen = Some(listen.into());
+    app.db.set_setting("instance", &settings)?;
+    let port = listen.rsplit(':').next().unwrap_or("3000");
+    if answers(&format!("http://127.0.0.1:{port}/api/deploy/tugport-migration-probe"), None, Duration::from_secs(30)).await {
+        println!("Old deploy webhook URLs now reach Tugport on {listen}");
+    } else {
+        println!("  ! Tugport does not answer on {listen} yet; restart it to serve the old webhook URLs");
+    }
+    Ok(())
 }
 
 fn moved_mut<'a>(j: &'a mut Journal, key: &str) -> Result<&'a mut Moved> {
     j.services.iter_mut().find(|m| m.key == key).ok_or_else(|| anyhow!("{key} is not in the journal"))
 }
 
+/// Record in the journal slot how an old copy runs, unless a record is there already.
+async fn remember<F>(app: &App, j: &mut Journal, slot: F, old: &Old) -> Result<()>
+where
+    F: for<'a> Fn(&'a mut Journal) -> Result<&'a mut Option<Stopped>>,
+{
+    if slot(j)?.is_none() {
+        let stopped = record(&app.docker, old).await?;
+        *slot(j)? = Some(stopped);
+        save(app, j)?;
+    }
+    Ok(())
+}
+
+/// Start the old copy recorded in the journal slot again and clear the slot.
+async fn restore<F>(app: &App, j: &mut Journal, slot: F, say: Option<&str>) -> Result<()>
+where
+    F: for<'a> Fn(&'a mut Journal) -> Result<&'a mut Option<Stopped>>,
+{
+    if let Some(stopped) = slot(j)?.take() {
+        if let Some(say) = say {
+            println!("{say}");
+        }
+        start_old(&app.docker, &stopped).await;
+    }
+    save(app, j)
+}
+
 /// Stop the old copy, then start Tugport's on the same data; on failure the old one comes back.
 async fn swap(app: &AppState, s: &NewService, j: &mut Journal) -> Result<()> {
-    let m = moved_mut(j, &s.key)?.clone();
-    if !m.deployed {
+    let m = moved_mut(j, &s.key)?;
+    let (id, deployed) = (m.id.clone(), m.deployed);
+    if !deployed {
         // Record what to restore before stopping anything; stop again on reruns, since an
         // interrupted run may have recorded without stopping.
-        if m.stopped.is_none() {
-            moved_mut(j, &s.key)?.stopped = Some(record(&app.docker, &s.old).await?);
-            save(app, j)?;
-        }
+        remember(app, j, |j| Ok(&mut moved_mut(j, &s.key)?.stopped), &s.old).await?;
+        // Whatever did stop comes back, so the service is not left down until a rerun.
         println!("{}: stopping the old copy", s.key);
-        if let Err(e) = halt(&app.docker, &s.old, false).await {
-            // Whatever did stop comes back, so the service is not left down until a rerun.
+        if let Err(e) = halt(app, &s.old, false).await {
             println!("{}: could not stop the old copy, starting it again", s.key);
-            if let Some(stopped) = moved_mut(j, &s.key)?.stopped.take() {
-                start_old(&app.docker, &stopped).await;
-            }
-            save(app, j)?;
+            restore(app, j, |j| Ok(&mut moved_mut(j, &s.key)?.stopped), None).await?;
             return Err(e.context(format!("stopping the old copy of {}", s.key)));
         }
         println!("{}: starting on Tugport", s.key);
-        let svc = store::service(app, &m.id)?.ok_or_else(|| anyhow!("{} vanished", s.key))?;
+        let svc = store::service(app, &id)?.ok_or_else(|| anyhow!("{} vanished", s.key))?;
         if let Err(e) = start(app, &svc, s).await {
             println!("{}: failed, starting the old copy again", s.key);
             let _ = runtime::remove_service(app, &svc, false).await;
-            if let Some(stopped) = moved_mut(j, &s.key)?.stopped.take() {
-                start_old(&app.docker, &stopped).await;
-            }
-            save(app, j)?;
+            restore(app, j, |j| Ok(&mut moved_mut(j, &s.key)?.stopped), None).await?;
             return Err(e.context(format!("moving {}", s.key)));
         }
         moved_mut(j, &s.key)?.deployed = true;
         save(app, j)?;
     }
-    join_overlays(app, &m.id, &s.overlays).await;
+    join_overlays(app, &id, &s.overlays).await;
     Ok(())
 }
 
@@ -933,19 +1089,17 @@ async fn record(docker: &Docker, old: &Old) -> Result<Stopped> {
 
 /// Stop the old copy and wait until it is gone (safe to repeat). `fast` gives it one second
 /// instead of a graceful shutdown.
-async fn halt(docker: &Docker, old: &Old, fast: bool) -> Result<()> {
+async fn halt(app: &App, old: &Old, fast: bool) -> Result<()> {
+    let t = if fast { 1 } else { 30 };
     match old {
         Old::None => {}
-        Old::Swarm { service } => scale(docker, service, 0, fast).await?,
+        Old::Swarm { service } => scale(&app.docker, service, 0, fast).await?,
         Old::Labeled { label } => {
-            for id in labeled(docker, label, false).await? {
-                docker.stop_container(&id, Some(StopContainerOptions { t: Some(if fast { 1 } else { 30 }), ..Default::default() })).await?;
+            for id in labeled(&app.docker, label, false).await? {
+                runtime::stop(app, "local", &id, t).await?;
             }
         }
-        Old::Container { name } => match docker.stop_container(name, Some(StopContainerOptions { t: Some(if fast { 1 } else { 30 }), ..Default::default() })).await {
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 304 | 404, .. }) | Ok(()) => {}
-            Err(e) => return Err(e.into()),
-        },
+        Old::Container { name } => runtime::stop(app, "local", name, t).await?,
     }
     Ok(())
 }
@@ -957,10 +1111,9 @@ async fn start_old(docker: &Docker, s: &Stopped) {
         Stopped::Containers { ids } => {
             let mut res = Ok(());
             for id in ids {
-                if let Err(e) = docker.start_container(id, None::<bollard::query_parameters::StartContainerOptions>).await
-                    && !e.to_string().contains("304")
-                {
-                    res = Err(e.into());
+                match docker.start_container(id, None::<bollard::query_parameters::StartContainerOptions>).await {
+                    Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
+                    Err(e) => res = Err(e.into()),
                 }
             }
             res
@@ -976,23 +1129,15 @@ async fn switch(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
     if plan.proxy == Old::None {
         return Ok(());
     }
-    if server_pids().is_empty() {
-        bail!("Tugport is not running; start it (systemctl start tugport) and run the migration again. Its proxy takes over ports 80 and 443 at the switch");
-    }
-    if j.proxy.is_none() {
-        wait_for_reload(j).await;
-        j.proxy = Some(record(&app.docker, &plan.proxy).await?);
-        save(app, j)?;
-    }
+    // cutover() already waited for the server to load the imported routes.
+    server_running()?;
+    remember(app, j, |j| Ok(&mut j.proxy), &plan.proxy).await?;
     println!("Switching the proxy");
-    halt(&app.docker, &plan.proxy, true).await?;
+    halt(app, &plan.proxy, true).await?;
     let port = std::env::var("TUGPORT_HTTP_PORT").unwrap_or_else(|_| "80".into());
     let probe = "tugport-migration.invalid";
     if !answers(&format!("http://127.0.0.1:{port}/"), Some(probe), Duration::from_secs(30)).await {
-        if let Some(p) = j.proxy.take() {
-            start_old(&app.docker, &p).await;
-        }
-        save(app, j)?;
+        restore(app, j, |j| Ok(&mut j.proxy), None).await?;
         bail!("Tugport's proxy did not take over port {port} within 30 seconds, so the old proxy was started again");
     }
     println!("Tugport now serves ports 80 and 443");
@@ -1011,7 +1156,7 @@ async fn wait_for_reload(j: &Journal) {
 /// Poll a URL until Tugport answers it: its proxy's page for `host`, or else its webhook
 /// listener's answer to an unknown token.
 async fn answers(url: &str, host: Option<&str>, timeout: Duration) -> bool {
-    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(2)).redirect(reqwest::redirect::Policy::none()).build() else { return false };
+    let Ok(client) = util::http(2).redirect(reqwest::redirect::Policy::none()).build() else { return false };
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
         let mut req = client.get(url);
@@ -1027,6 +1172,13 @@ async fn answers(url: &str, host: Option<&str>, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+fn server_running() -> Result<()> {
+    if server_pids().is_empty() {
+        bail!("Tugport is not running; start it (systemctl start tugport) and run the migration again. Its proxy takes over ports 80 and 443 at the switch");
+    }
+    Ok(())
 }
 
 /// Processes running `tugport server`.
@@ -1048,12 +1200,7 @@ fn server_pids() -> Vec<String> {
 
 /// Stop Tugport so the old proxy can have ports 80/443 back. Returns whether systemd ran it.
 async fn stop_server() -> bool {
-    let systemd = std::process::Command::new("systemctl")
-        .args(["stop", "tugport"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let systemd = crate::proc::succeeds(std::process::Command::new("systemctl").args(["stop", "tugport"]));
     // However it runs, it must be gone before the old proxy can bind.
     for attempt in 0..100 {
         if server_pids().is_empty() {
@@ -1082,47 +1229,29 @@ async fn rollback(app: &AppState, yes: bool) -> Result<()> {
     for m in j.services.iter().filter(|m| m.swap && m.deployed) {
         join_overlays(app, &m.id, &m.overlays).await;
     }
-    for i in 0..j.services.len() {
-        if !j.services[i].swap
-            && let Some(stopped) = j.services[i].stopped.take()
-        {
-            println!("{}: starting the old copy", j.services[i].key);
-            start_old(&app.docker, &stopped).await;
-            save(app, &j)?;
-        }
+    let keys = |j: &Journal, swap: bool| j.services.iter().filter(|m| m.swap == swap).map(|m| m.key.clone()).collect::<Vec<_>>();
+    for key in keys(&j, false) {
+        restore(app, &mut j, |j| Ok(&mut moved_mut(j, &key)?.stopped), Some(&format!("{key}: starting the old copy"))).await?;
     }
     let mut restart_systemd = false;
-    if let Some(proxy) = j.proxy.clone() {
+    if j.proxy.is_some() {
         println!("Switching the proxy back");
         restart_systemd = stop_server().await;
         if !server_pids().is_empty() {
             bail!("Tugport still runs and holds ports 80 and 443; stop it and run the rollback again");
         }
-        start_old(&app.docker, &proxy).await;
-        j.proxy = None;
-        save(app, &j)?;
+        restore(app, &mut j, |j| Ok(&mut j.proxy), None).await?;
     }
-    for i in (0..j.services.len()).rev() {
-        if !j.services[i].swap {
-            continue;
-        }
-        let key = j.services[i].key.clone();
-        if let Some(svc) = store::service(app, &j.services[i].id)? {
+    for key in keys(&j, true).into_iter().rev() {
+        let m = moved_mut(&mut j, &key)?;
+        m.deployed = false;
+        if let Some(svc) = store::service(app, &m.id)? {
             println!("{key}: stopping Tugport's copy");
             runtime::remove_service(app, &svc, false).await?;
         }
-        j.services[i].deployed = false;
-        if let Some(stopped) = j.services[i].stopped.take() {
-            println!("{key}: starting the old copy");
-            start_old(&app.docker, &stopped).await;
-        }
-        save(app, &j)?;
+        restore(app, &mut j, |j| Ok(&mut moved_mut(j, &key)?.stopped), Some(&format!("{key}: starting the old copy"))).await?;
     }
-    if let Some(panel) = j.old_panel.take() {
-        println!("Starting the old panel");
-        start_old(&app.docker, &panel).await;
-        save(app, &j)?;
-    }
+    restore(app, &mut j, |j| Ok(&mut j.old_panel), Some("Starting the old panel")).await?;
     // Only what the migration changed: later changes (a private panel, trusted proxies...) stay.
     if let Some(before) = j.settings_before.take() {
         let mut settings = app.settings();
@@ -1131,34 +1260,40 @@ async fn rollback(app: &AppState, yes: bool) -> Result<()> {
         settings.legacy_listen = before.legacy_listen;
         app.db.set_setting("instance", &settings)?;
     }
+    delete_imported(app, &j).await?;
+    app.db.del_state(JOURNAL)?;
+    if restart_systemd {
+        let _ = std::process::Command::new("systemctl").args(["start", "tugport"]).status();
+    }
+    println!("Rolled back. The old panel runs again{}.", if restart_systemd { "; Tugport is back to waiting for ports 80/443" } else { "" });
+    Ok(())
+}
+
+/// The rows the import made; volumes stay.
+async fn delete_imported(app: &AppState, j: &Journal) -> Result<()> {
     for m in &j.services {
         if let Some(svc) = store::service(app, &m.id)? {
             runtime::remove_service(app, &svc, false).await?;
-            app.db.conn().execute("DELETE FROM services WHERE id = ?1", [&svc.id])?;
+            app.db.exec("DELETE FROM services WHERE id = ?1", [&svc.id])?;
         }
     }
     for host in &j.certs {
-        app.db.conn().execute("DELETE FROM certificates WHERE host = ?1 AND source = 'imported'", [host])?;
+        app.db.exec("DELETE FROM certificates WHERE host = ?1 AND source = 'imported'", [host])?;
     }
     for p in j.provider.iter().chain(j.git_providers.values()) {
-        app.db.conn().execute("DELETE FROM git_providers WHERE id = ?1", [p])?;
+        app.db.exec("DELETE FROM git_providers WHERE id = ?1", [p])?;
     }
     for host in &j.registries {
-        app.db.conn().execute("DELETE FROM registries WHERE host = ?1", [host])?;
+        app.db.exec("DELETE FROM registries WHERE host = ?1", [host])?;
     }
     for id in &j.projects {
         if let Some(p) = store::project(app, id)?
             && store::services(app, Some(id))?.is_empty()
         {
-            app.db.conn().execute("DELETE FROM projects WHERE id = ?1", [id])?;
+            app.db.exec("DELETE FROM projects WHERE id = ?1", [id])?;
             runtime::remove_project_network(app, &p).await;
         }
     }
-    app.db.conn().execute("DELETE FROM state WHERE key = ?1", [JOURNAL])?;
-    if restart_systemd {
-        let _ = std::process::Command::new("systemctl").args(["start", "tugport"]).status();
-    }
-    println!("Rolled back. The old panel runs again{}.", if restart_systemd { "; Tugport is back to waiting for ports 80/443" } else { "" });
     Ok(())
 }
 
@@ -1192,5 +1327,7 @@ mod tests {
         assert!(mentions("mongodb://u:p@bots_banofbot-db:27017/x", "bots_banofbot-db"));
         assert!(!mentions("mongodb://u:p@bots_banofbot-db-2:27017/x", "bots_banofbot-db"));
         assert!(!mentions("https://x.bots_banofbot-db.com", "bots_banofbot-db"));
+        assert_eq!(image_tag("easypanel/easypanel:2.38.0@sha256:abc"), "2.38.0");
+        assert_eq!(image_tag("localhost:5000/coolify"), "latest");
     }
 }

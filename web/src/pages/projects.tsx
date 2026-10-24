@@ -1,24 +1,10 @@
 import { useRef, useState } from "preact/hooks";
-import { route } from "preact-router";
+import { route } from "../router";
 import { EnvEditor } from "../env-editor";
+import { KindIcon } from "../icons";
 import { NewService } from "./new-service";
-import {
-  ROLES,
-  atLeast,
-  del,
-  hasGrant,
-  patch,
-  post,
-  put,
-  useApi,
-  useMe,
-  type Project,
-  type Role,
-  type Source,
-  type Status,
-  type User,
-} from "../api";
-import { Action, Card, Empty, ErrorBox, Field, Loaded, Modal, NameInput, Page, Pill, Select, toast, useForm, useSubmit } from "../ui";
+import { ROLES, atLeast, del, hasGrant, patch, post, put, useApi, useMe, type Project, type Role, type Source, type Status, type User } from "../api";
+import { Action, Card, Empty, ErrorBox, Field, FormButtons, Input, Loaded, LoadingPage, Modal, NameInput, Page, Pill, Rows, Select, toast, useForm, useSubmit } from "../ui";
 
 export interface ProjectDetail {
   project: { id: string; name: string; description: string | null; created_at: number };
@@ -49,12 +35,9 @@ const STATE_ORDER = ["crashing", "unhealthy", "degraded", "stopped", "asleep", "
 const rank = (s: string) => (STATE_ORDER.includes(s) ? STATE_ORDER.indexOf(s) : STATE_ORDER.length);
 const byState = ([a]: [string, number], [b]: [string, number]) => rank(a) - rank(b);
 
-export function Projects(_: { path?: string }) {
+export function Projects() {
   const me = useMe();
-  const r = useApi<{ projects: Project[] }>(
-    "/projects",
-    (e) => e.kind === "service.status" || (e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? "")),
-  );
+  const r = useApi<{ projects: Project[] }>("/projects", (e) => e.kind === "service.status" || (e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? "")));
   const [open, setOpen] = useState(false);
   const canCreate = me.principal.is_owner || atLeast(me.principal.all_projects_role, "operator");
   return (
@@ -120,24 +103,14 @@ function NewProject(props: { open: boolean; onClose: () => void }) {
         <Field label="Name" hint="Use lowercase letters, digits and dashes. The name becomes part of container and network names, so it cannot change later.">
           <NameInput value={f.name} onChange={(name) => set({ name })} />
         </Field>
-        <Field label="Description (optional)">
-          <input class="input" {...bind("description")} />
-        </Field>
-        <ErrorBox error={s.error} />
-        <div class="flex justify-end gap-2">
-          <button type="button" class="btn" onClick={props.onClose}>
-            Cancel
-          </button>
-          <button class="btn btn-primary" disabled={s.busy}>
-            Create project
-          </button>
-        </div>
+        <Input label="Description (optional)" {...bind("description")} />
+        <FormButtons s={s} submit="Create project" onCancel={props.onClose} />
       </form>
     </Modal>
   );
 }
 
-export function ProjectPage(props: { project?: string; path?: string }) {
+export function ProjectPage(props: { project?: string }) {
   const me = useMe();
   const pid = useRef("");
   // Replicas on a server that drops out vanish from the status without a container event.
@@ -145,27 +118,14 @@ export function ProjectPage(props: { project?: string; path?: string }) {
   pid.current = r.data?.project.id ?? "";
   const [wizard, setWizard] = useState(false);
   const d = r.data;
-  if (!d) {
-    return (
-      <Page title={props.project}>
-        <Loaded r={r}>{() => null}</Loaded>
-      </Page>
-    );
-  }
+  if (!d) return <LoadingPage title={props.project} r={r} />;
   const canOperate = atLeast(d.role, "operator");
   const isAdmin = atLeast(d.role, "admin");
   return (
     <Page
       title={d.project.name}
-      sub={
-        <span>
-          <a class="link" href="/">
-            Projects
-          </a>{" "}
-          / {d.project.name}
-          {d.role && <span class="chip ml-2">your role: {d.role}</span>}
-        </span>
-      }
+      crumbs={[["Projects", "/"]]}
+      meta={d.role && <span class="chip">your role: {d.role}</span>}
       actions={
         canOperate && (
           <button class="btn btn-primary" onClick={() => setWizard(true)}>
@@ -176,45 +136,35 @@ export function ProjectPage(props: { project?: string; path?: string }) {
     >
       <Description project={d.project} canEdit={isAdmin} onSaved={r.reload} />
       <Card title="Services" pad={false} class="mb-6">
-        {d.services.length === 0 ? (
-          <div class="p-4">
-            <Empty title="No services yet">
-              {canOperate
-                ? "Add an app from Git, a Docker image, a Dockerfile, a Compose stack or a database."
-                : "Nobody has added a service to this project yet."}
-            </Empty>
-          </div>
-        ) : (
-          <ul class="divide-y divide-line">
-            {d.services.map((s) => (
-              <li key={s.id}>
-                <a href={`/projects/${d.project.name}/${s.name}`} class="flex items-center gap-3 px-4 py-3 hover:bg-raised">
-                  <div class="min-w-0 flex-1">
-                    <div class="flex flex-wrap items-center gap-2">
-                      <span class="font-medium">{s.name}</span>
-                      <span class="chip">{s.kind}</span>
-                    </div>
-                    <div class="mt-0.5 truncate font-mono text-xs text-muted">{sourceLabel(s.source, s.kind)}</div>
-                  </div>
-                  <div class="flex shrink-0 flex-col items-end gap-1">
-                    <Pill state={s.status.state} />
-                    {s.status.state !== "not deployed" && (
-                      <span class="text-xs text-muted">
-                        {s.status.running} of {s.status.desired} running
-                      </span>
-                    )}
-                  </div>
-                </a>
-              </li>
-            ))}
-          </ul>
-        )}
+        <Rows
+          items={d.services}
+          emptyTitle="No services yet"
+          empty={canOperate ? "Add an app from Git, a Docker image, a Dockerfile, a Compose stack or a database." : "Nobody has added a service to this project yet."}
+        >
+          {(s) => (
+            <li key={s.id}>
+              <a href={`/projects/${d.project.name}/${s.name}`} class="row flex-nowrap hover:bg-raised/60">
+                <KindIcon kind={s.kind} />
+                <div class="min-w-0 flex-1">
+                  <div class="font-medium">{s.name}</div>
+                  <div class="mt-0.5 truncate font-mono text-xs text-muted">{sourceLabel(s.source, s.kind)}</div>
+                </div>
+                <div class="flex shrink-0 flex-col items-end gap-1">
+                  <Pill state={s.status.state} />
+                  {s.status.state !== "not deployed" && (
+                    <span class="text-xs text-muted">
+                      {s.status.running} of {s.status.desired} running
+                    </span>
+                  )}
+                </div>
+              </a>
+            </li>
+          )}
+        </Rows>
       </Card>
       <div class="grid gap-6 lg:grid-cols-2">
         <Card title="Project variables">
-          <p class="mb-4 text-dim">
-            Every service in this project receives these variables. A service variable with the same name takes precedence.
-          </p>
+          <p class="mb-4 text-dim">Every service in this project receives these variables. A service variable with the same name takes precedence.</p>
           <EnvEditor path={`/projects/${d.project.id}/vars`} field="vars" canEdit={canOperate} savedNote="Saved. Redeploy the services that use these variables to apply them." />
         </Card>
         <Members projectId={d.project.id} canManage={isAdmin} />
@@ -222,9 +172,7 @@ export function ProjectPage(props: { project?: string; path?: string }) {
       {isAdmin && hasGrant(me, "destroy") && (
         <Card title="Delete project" class="mt-6 border-bad/40">
           <p class="mb-3 text-dim">
-            {d.services.length
-              ? "A project can be deleted once all of its services are gone."
-              : "This removes the empty project and its private network."}
+            {d.services.length ? "A project can be deleted once all of its services are gone." : "This removes the empty project and its private network."}
           </p>
           <Action
             class="btn btn-danger"

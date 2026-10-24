@@ -9,7 +9,7 @@
 //! - Redis: `replicaof`.
 
 use crate::app::{App, AppState};
-use crate::model::{DatabaseSpec, Engine, Mount, Placement, Source};
+use crate::model::{DatabaseSpec, Engine, Mount, Placement, ServiceSpec, Source};
 use crate::runtime::{self, Replica};
 use crate::store::{self, Service};
 use crate::{databases, deploy, util};
@@ -44,18 +44,62 @@ exec redis-server --requirepass "$REDIS_PASSWORD" --masterauth "$REDIS_PASSWORD"
 /// Root's password, quoted for SQL (`'` doubled).
 const SQL_PW: &str = r#"pw=$(printf %s "${MYSQL_ROOT_PASSWORD:-$MARIADB_ROOT_PASSWORD}" | sed "s/'/''/g")"#;
 
-fn engine(s: &Service) -> Result<Engine> {
-    s.spec.database.as_ref().map(|d| d.engine).ok_or_else(|| anyhow!("{} is not a database", s.name))
+/// What MySQL and MariaDB call the parts of binlog replication.
+struct Binlog {
+    client: &'static str,
+    root_pw: &'static str,
+    dump: &'static str,
+    /// Dump flag that writes where the copy starts following.
+    position: &'static str,
+    start: &'static str,
+    status: &'static str,
+    following: &'static str,
+    promote: &'static str,
+    /// Run after promoting: the MariaDB replica's start script reads it to stay writable.
+    after_promote: &'static str,
 }
 
-/// The running container of a database's live version.
-async fn container(app: &App, s: &Service) -> Result<Replica> {
-    let live = runtime::live_deploy(app, &s.id);
-    runtime::replicas(app, &s.id)
-        .await?
-        .into_iter()
-        .find(|r| r.state == "running" && live.as_deref().is_none_or(|l| r.deploy == l))
-        .ok_or_else(|| anyhow!("{} is not running", s.name))
+const MYSQL: Binlog = Binlog {
+    client: "mysql",
+    root_pw: "MYSQL_ROOT_PASSWORD",
+    dump: "mysqldump",
+    position: "--source-data=1",
+    start: "CHANGE REPLICATION SOURCE TO SOURCE_HOST='$PRIMARY_HOST', SOURCE_PORT=3306, SOURCE_USER='root', SOURCE_PASSWORD='$pw', GET_SOURCE_PUBLIC_KEY=1; START REPLICA; SET PERSIST read_only = ON; SET PERSIST super_read_only = ON;",
+    status: "SHOW REPLICA STATUS",
+    following: "Replica_IO_Running: Yes",
+    promote: "STOP REPLICA; RESET REPLICA ALL; SET PERSIST super_read_only = OFF; SET PERSIST read_only = OFF;",
+    after_promote: "",
+};
+
+const MARIADB: Binlog = Binlog {
+    client: "mariadb",
+    root_pw: "MARIADB_ROOT_PASSWORD",
+    dump: "mariadb-dump",
+    position: "--master-data=1",
+    start: "CHANGE MASTER TO MASTER_HOST='$PRIMARY_HOST', MASTER_PORT=3306, MASTER_USER='root', MASTER_PASSWORD='$pw'; START SLAVE;",
+    status: "SHOW SLAVE STATUS",
+    following: "Slave_IO_Running: Yes",
+    promote: "STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only = OFF;",
+    after_promote: " && touch /var/lib/mysql/.tugport-primary",
+};
+
+impl Binlog {
+    fn of(eng: Engine) -> &'static Binlog {
+        if eng == Engine::Mariadb { &MARIADB } else { &MYSQL }
+    }
+
+    /// `program` (the client or the dump tool) as root.
+    fn root(&self, program: &str, args: &str) -> String {
+        format!("MYSQL_PWD=\"${}\" {program} -uroot {args}", self.root_pw)
+    }
+
+    fn sql(&self, args: &str) -> String {
+        self.root(self.client, args)
+    }
+}
+
+fn database(s: &Service) -> Result<&DatabaseSpec> {
+    s.spec.database.as_ref().ok_or_else(|| anyhow!("{} is not a database", s.name))
 }
 
 async fn run(app: &App, r: &Replica, script: &str) -> Result<String> {
@@ -80,8 +124,9 @@ async fn until(app: &App, r: &Replica, script: &str, want: &str, timeout: Durati
     }
 }
 
-fn mongo_shell(js: &str, user_var: &str, pw_var: &str) -> String {
-    format!("mongosh --quiet -u \"${user_var}\" -p \"${pw_var}\" --authenticationDatabase admin --eval '{js}'")
+/// mongosh as root: a primary has the image's init variables, a replica its renamed copies.
+fn mongo_shell(js: &str) -> String {
+    format!("mongosh --quiet -u \"${{MONGO_INITDB_ROOT_USERNAME:-$MONGO_USER}}\" -p \"${{MONGO_INITDB_ROOT_PASSWORD:-$MONGO_PASSWORD}}\" --authenticationDatabase admin --eval '{js}'")
 }
 
 /// Replicas of a database.
@@ -102,42 +147,35 @@ async fn live(app: &App, deploy_id: &str) -> Result<()> {
 }
 
 async fn redeploy(app: &AppState, s: &Service, why: &str) -> Result<()> {
-    let image = runtime::live_deploy(app, &s.id).and_then(|d| deploy::get(app, &d).ok().flatten()).and_then(|d| d.image);
+    let image = runtime::live_image(app, &s.id);
     let id = deploy::enqueue(app, s, deploy::Request { trigger: why.into(), image, ..Default::default() })?;
     live(app, &id).await
 }
 
-fn save_spec(app: &App, s: &Service) -> Result<()> {
-    app.db.conn().execute("UPDATE services SET spec = ?1, updated_at = ?2 WHERE id = ?3", params![serde_json::to_string(&s.spec)?, util::now(), s.id])?;
-    Ok(())
-}
-
 /// Get the primary ready to be followed (once per database).
 async fn prepare_primary(app: &AppState, p: &Service, eng: Engine) -> Result<()> {
-    let c = container(app, p).await?;
+    let c = runtime::running_replica(app, p).await?;
     match eng {
         Engine::Postgres => {
             run(app, &c, PG_ALLOW).await.context("allowing replication connections")?;
         }
         Engine::Redis => {}
-        Engine::Mysql => {
-            let on = run(app, &c, r#"MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N -e 'select @@log_bin'"#).await?;
-            if on.trim() != "1" {
+        Engine::Mysql | Engine::Mariadb => {
+            let on = run(app, &c, &Binlog::of(eng).sql("-N -e 'select @@log_bin'")).await?;
+            if on.trim() == "1" {
+                return Ok(());
+            }
+            if eng == Engine::Mysql {
                 bail!("binary logging is off on {}; replicas need it", p.name);
             }
-        }
-        Engine::Mariadb => {
-            let on = run(app, &c, r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot -N -e 'select @@log_bin'"#).await?;
-            if on.trim() != "1" {
-                tracing::info!("turning on binary logging for {}/{} (a short restart)", p.project, p.name);
-                let mut s = p.clone();
-                s.spec.command = Some(["mariadbd", "--log-bin=mariadb-bin", "--server-id=1", "--binlog-format=ROW"].map(String::from).to_vec());
-                save_spec(app, &s)?;
-                redeploy(app, &s, "replication").await?;
-            }
+            tracing::info!("turning on binary logging for {}/{} (a short restart)", p.project, p.name);
+            let mut s = p.clone();
+            s.spec.command = Some(["mariadbd", "--log-bin=mariadb-bin", "--server-id=1", "--binlog-format=ROW"].map(String::from).to_vec());
+            store::save_spec(app, &s.id, &s.spec)?;
+            redeploy(app, &s, "replication").await?;
         }
         Engine::Mongo => {
-            let set = run(app, &c, &mongo_shell("db.hello().setName || \"none\"", "MONGO_INITDB_ROOT_USERNAME", "MONGO_INITDB_ROOT_PASSWORD")).await?;
+            let set = run(app, &c, &mongo_shell("db.hello().setName || \"none\"")).await?;
             if set.trim() == "rs0" {
                 return Ok(());
             }
@@ -147,13 +185,12 @@ async fn prepare_primary(app: &AppState, p: &Service, eng: Engine) -> Result<()>
             let mut s = p.clone();
             s.spec.entrypoint = Some(vec!["sh".into(), "-c".into(), MONGO_REPLSET.into()]);
             s.spec.command = None;
-            save_spec(app, &s)?;
+            store::save_spec(app, &s.id, &s.spec)?;
             redeploy(app, &s, "replication").await?;
-            let c = container(app, &s).await?;
+            let c = runtime::running_replica(app, &s).await?;
             let init = format!("rs.initiate({{_id: \"rs0\", members: [{{_id: 0, host: \"{}:27017\"}}]}}).ok", s.name);
-            run(app, &c, &mongo_shell(&init, "MONGO_INITDB_ROOT_USERNAME", "MONGO_INITDB_ROOT_PASSWORD")).await.context("starting the replica set")?;
-            let hello = mongo_shell("db.hello().isWritablePrimary", "MONGO_INITDB_ROOT_USERNAME", "MONGO_INITDB_ROOT_PASSWORD");
-            until(app, &c, &hello, "true", Duration::from_secs(60)).await?;
+            run(app, &c, &mongo_shell(&init)).await.context("starting the replica set")?;
+            until(app, &c, &mongo_shell("db.hello().isWritablePrimary"), "true", Duration::from_secs(60)).await?;
         }
     }
     Ok(())
@@ -162,8 +199,8 @@ async fn prepare_primary(app: &AppState, p: &Service, eng: Engine) -> Result<()>
 /// Add a read replica, placed like any service. Returns it and its first deploy; it
 /// starts following the primary once that deploy is live.
 pub async fn add(app: &AppState, primary: &Service, placement: Placement) -> Result<(Service, String)> {
-    let eng = engine(primary)?;
-    let db = primary.spec.database.clone().ok_or_else(|| anyhow!("not a database"))?;
+    let db = database(primary)?.clone();
+    let eng = db.engine;
     if db.primary.is_some() {
         bail!("{} is itself a replica; add replicas to its primary", primary.name);
     }
@@ -185,6 +222,39 @@ pub async fn add(app: &AppState, primary: &Service, placement: Placement) -> Res
     } else {
         placement
     };
+    let spec = replica_spec(&primary, db, &name, &image, placement);
+    let id = util::id();
+    let now = util::now();
+    app.db.exec(
+        "INSERT INTO services (id, project_id, name, kind, spec, created_at, updated_at) VALUES (?1, ?2, ?3, 'database', ?4, ?5, ?5)",
+        params![id, primary.project_id, name, serde_json::to_string(&spec)?, now],
+    )?;
+    // Same credentials as the primary, plus where to find it.
+    for (k, v) in store::service_env(app, &primary.id)? {
+        let k = match (eng, k.as_str()) {
+            // Users come from the primary; a replica must not create its own.
+            (Engine::Mongo, "MONGO_INITDB_ROOT_USERNAME") => "MONGO_USER".to_string(),
+            (Engine::Mongo, "MONGO_INITDB_ROOT_PASSWORD") => "MONGO_PASSWORD".to_string(),
+            _ => k,
+        };
+        store::set_env(app, &id, &k, Some(&v))?;
+    }
+    store::set_env(app, &id, "PRIMARY_HOST", Some(&primary.name))?;
+    for (target, content) in store::files(app, &primary.id)? {
+        store::set_file(app, &id, &target, Some(&content))?;
+    }
+    let replica = store::service(app, &id)?.ok_or_else(|| anyhow!("the replica was not saved"))?;
+    let deploy_id = deploy::enqueue(app, &replica, deploy::Request { trigger: "replica".into(), image: Some(image), ..Default::default() })?;
+    app.db.set_state(&state_key(&id), "copying")?;
+    let (app2, p, r, d) = (app.clone(), primary.id.clone(), id.clone(), deploy_id.clone());
+    tokio::spawn(async move { follow(app2, p, r, d).await });
+    Ok((replica, deploy_id))
+}
+
+/// The primary's settings for a replica: its own volume, no public ports or aliases, and a
+/// start command that follows the primary.
+fn replica_spec(primary: &Service, db: DatabaseSpec, name: &str, image: &str, placement: Placement) -> ServiceSpec {
+    let eng = db.engine;
     let mut spec = primary.spec.clone();
     spec.placement = placement;
     spec.aliases.clear();
@@ -212,33 +282,7 @@ pub async fn add(app: &AppState, primary: &Service, placement: Placement) -> Res
         ),
         Engine::Mongo => (sh(MONGO_REPLSET), None),
     };
-
-    let id = util::id();
-    let now = util::now();
-    app.db.conn().execute(
-        "INSERT INTO services (id, project_id, name, kind, spec, created_at, updated_at) VALUES (?1, ?2, ?3, 'database', ?4, ?5, ?5)",
-        params![id, primary.project_id, name, serde_json::to_string(&spec)?, now],
-    )?;
-    // Same credentials as the primary, plus where to find it.
-    for (k, v) in store::service_env(app, &primary.id)? {
-        let k = match (eng, k.as_str()) {
-            // Users come from the primary; a replica must not create its own.
-            (Engine::Mongo, "MONGO_INITDB_ROOT_USERNAME") => "MONGO_USER".to_string(),
-            (Engine::Mongo, "MONGO_INITDB_ROOT_PASSWORD") => "MONGO_PASSWORD".to_string(),
-            _ => k,
-        };
-        store::set_env(app, &id, &k, Some(&v))?;
-    }
-    store::set_env(app, &id, "PRIMARY_HOST", Some(&primary.name))?;
-    for (target, content) in store::files(app, &primary.id)? {
-        store::set_file(app, &id, &target, Some(&content))?;
-    }
-    let replica = store::service(app, &id)?.ok_or_else(|| anyhow!("the replica was not saved"))?;
-    let deploy_id = deploy::enqueue(app, &replica, deploy::Request { trigger: "replica".into(), image: Some(image), ..Default::default() })?;
-    app.db.set_state(&format!("replica:{id}"), "copying")?;
-    let (app2, p, r, d) = (app.clone(), primary.id.clone(), id.clone(), deploy_id.clone());
-    tokio::spawn(async move { follow(app2, p, r, d).await });
-    Ok((replica, deploy_id))
+    spec
 }
 
 async fn follow(app: AppState, primary_id: String, replica_id: String, deploy_id: String) {
@@ -253,14 +297,14 @@ async fn follow(app: AppState, primary_id: String, replica_id: String, deploy_id
     let name = store::service(&app, &replica_id).ok().flatten();
     match result {
         Ok(()) => {
-            let _ = app.db.set_state(&format!("replica:{replica_id}"), "following");
+            let _ = app.db.set_state(&state_key(&replica_id), "following");
             if let Some(s) = &name {
                 tracing::info!("{}/{} follows its primary", s.project, s.name);
                 app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "replica", "replica": "following" }));
             }
         }
         Err(e) => {
-            let _ = app.db.set_state(&format!("replica:{replica_id}"), &format!("failed: {e:#}"));
+            let _ = app.db.set_state(&state_key(&replica_id), &format!("failed: {e:#}"));
             if let Some(s) = &name {
                 tracing::warn!("{}/{} could not start following its primary: {e:#}", s.project, s.name);
                 crate::notify::event(&app, "deploy.failed", &format!("{}/{} is not replicating", s.project, s.name), &format!("{e:#}"), Some(s)).await;
@@ -271,65 +315,36 @@ async fn follow(app: AppState, primary_id: String, replica_id: String, deploy_id
 
 /// Start following, once the replica runs.
 async fn attach(app: &AppState, primary: &Service, replica: &Service) -> Result<()> {
-    let eng = engine(primary)?;
-    let src = container(app, primary).await?;
-    let dst = container(app, replica).await?;
+    let eng = database(primary)?.engine;
+    let src = runtime::running_replica(app, primary).await?;
+    let dst = runtime::running_replica(app, replica).await?;
     let wait = Duration::from_secs(300);
     match eng {
         Engine::Postgres => until(app, &dst, r#"psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'select pg_is_in_recovery()'"#, "t", wait).await,
         Engine::Redis => until(app, &dst, r#"redis-cli -a "$REDIS_PASSWORD" --no-auth-warning info replication"#, "master_link_status:up", wait).await,
         Engine::Mysql | Engine::Mariadb => {
-            let maria = eng == Engine::Mariadb;
-            let (dump, load) = if maria {
-                (
-                    r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb-dump -uroot --all-databases --single-transaction --routines --triggers --events --master-data=1"#,
-                    r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot"#,
-                )
-            } else {
-                (
-                    r#"MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqldump -uroot --all-databases --single-transaction --routines --triggers --events --source-data=1"#,
-                    r#"MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot"#,
-                )
-            };
-            let mut producer = crate::nodes::docker_cli(app, &src.node)?;
-            producer.args(["exec", &src.id, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", dump]);
-            let mut consumer = crate::nodes::docker_cli(app, &dst.node)?;
-            consumer.args(["exec", "-i", &dst.id, crate::secrets::INIT_PATH, "exec", "--", "sh", "-c", load]);
+            let b = Binlog::of(eng);
+            let dump = b.root(b.dump, &format!("--all-databases --single-transaction --routines --triggers --events {}", b.position));
+            let producer = crate::backup::exec_cli(app, &src.node, &src.id, false, &dump)?;
+            let consumer = crate::backup::exec_cli(app, &dst.node, &dst.id, true, &b.sql(""))?;
             crate::backup::pipe(producer, consumer).await.context("copying the primary's data")?;
-            let start = if maria {
-                format!(
-                    "{SQL_PW}\nMYSQL_PWD=\"$MARIADB_ROOT_PASSWORD\" mariadb -uroot -e \"CHANGE MASTER TO MASTER_HOST='$PRIMARY_HOST', MASTER_PORT=3306, MASTER_USER='root', MASTER_PASSWORD='$pw'; START SLAVE;\""
-                )
-            } else {
-                format!(
-                    "{SQL_PW}\nMYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\" mysql -uroot -e \"CHANGE REPLICATION SOURCE TO SOURCE_HOST='$PRIMARY_HOST', SOURCE_PORT=3306, SOURCE_USER='root', SOURCE_PASSWORD='$pw', GET_SOURCE_PUBLIC_KEY=1; START REPLICA; SET PERSIST read_only = ON; SET PERSIST super_read_only = ON;\""
-                )
-            };
-            run(app, &dst, &start).await.context("starting replication")?;
-            let status = if maria {
-                r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot -E -e 'SHOW SLAVE STATUS'"#
-            } else {
-                r#"MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -E -e 'SHOW REPLICA STATUS'"#
-            };
-            until(app, &dst, status, if maria { "Slave_IO_Running: Yes" } else { "Replica_IO_Running: Yes" }, wait).await
+            run(app, &dst, &format!("{SQL_PW}\n{}", b.sql(&format!("-e \"{}\"", b.start)))).await.context("starting replication")?;
+            until(app, &dst, &b.sql(&format!("-E -e '{}'", b.status)), b.following, wait).await
         }
         Engine::Mongo => {
             let add = format!("rs.add({{host: \"{}:27017\", priority: 0, votes: 0}}).ok", replica.name);
-            run(app, &src, &mongo_shell(&add, "MONGO_INITDB_ROOT_USERNAME", "MONGO_INITDB_ROOT_PASSWORD")).await.context("adding the replica to the set")?;
+            run(app, &src, &mongo_shell(&add)).await.context("adding the replica to the set")?;
             let state = format!("rs.status().members.filter(m => m.name == \"{}:27017\").map(m => m.stateStr).join()", replica.name);
-            until(app, &src, &mongo_shell(&state, "MONGO_INITDB_ROOT_USERNAME", "MONGO_INITDB_ROOT_PASSWORD"), "SECONDARY", Duration::from_secs(3600)).await
+            until(app, &src, &mongo_shell(&state), "SECONDARY", Duration::from_secs(3600)).await
         }
     }
 }
 
-fn password_var(eng: Engine) -> &'static str {
-    match eng {
-        Engine::Postgres => "POSTGRES_PASSWORD",
-        Engine::Mysql => "MYSQL_PASSWORD",
-        Engine::Mariadb => "MARIADB_PASSWORD",
-        Engine::Mongo => "MONGO_INITDB_ROOT_PASSWORD",
-        Engine::Redis => "REDIS_PASSWORD",
-    }
+/// The password from a service's env (a Mongo replica keeps it under its renamed variable).
+fn password(app: &App, s: &Service, eng: Engine) -> Result<String> {
+    let env = store::service_env(app, &s.id)?;
+    let pw = env.get(databases::preset(eng).password_var).or_else(|| env.get("MONGO_PASSWORD").filter(|_| eng == Engine::Mongo));
+    Ok(pw.map(|p| p.to_string()).unwrap_or_default())
 }
 
 fn var_name(service: &str, suffix: &str) -> String {
@@ -339,10 +354,10 @@ fn var_name(service: &str, suffix: &str) -> String {
 /// `<DB>_READ_URL` for the project (all replicas for Mongo, the first one otherwise) and
 /// each replica's own `<REPLICA>_URL`.
 fn publish_urls(app: &App, primary: &Service) -> Result<()> {
-    let eng = engine(primary)?;
-    let db = primary.spec.database.clone().ok_or_else(|| anyhow!("not a database"))?;
-    let pw = store::service_env(app, &primary.id)?.get(password_var(eng)).map(|p| p.to_string()).unwrap_or_default();
-    let mut replicas: Vec<Service> = of(app, &primary.id)?.into_iter().filter(|r| app.db.get_state(&format!("replica:{}", r.id)).ok().flatten().is_none_or(|s| !s.starts_with("failed"))).collect();
+    let db = database(primary)?;
+    let eng = db.engine;
+    let pw = password(app, primary, eng)?;
+    let mut replicas: Vec<Service> = of(app, &primary.id)?.into_iter().filter(|r| !state(app, &r.id).starts_with("failed")).collect();
     replicas.sort_by(|a, b| a.name.cmp(&b.name));
     for r in &replicas {
         store::set_project_var(app, &primary.project_id, &var_name(&r.name, "URL"), Some(&databases::url(eng, &r.name, &db.user, &pw, &db.database)))?;
@@ -351,9 +366,7 @@ fn publish_urls(app: &App, primary: &Service) -> Result<()> {
         (_, None) => None,
         (Engine::Mongo, Some(_)) => {
             let hosts: Vec<String> = std::iter::once(&primary.name).chain(replicas.iter().map(|r| &r.name)).map(|h| format!("{h}:27017")).collect();
-            let full = databases::url(eng, "HOST", &db.user, &pw, &db.database);
-            let creds = full.trim_start_matches("mongodb://").split('@').next().unwrap_or_default().to_string();
-            Some(format!("mongodb://{creds}@{}/?replicaSet=rs0&readPreference=secondaryPreferred&authSource=admin", hosts.join(",")))
+            Some(format!("mongodb://{}:{}@{}/?replicaSet=rs0&readPreference=secondaryPreferred&authSource=admin", db.user, util::urlencode(&pw), hosts.join(",")))
         }
         (_, Some(first)) => Some(databases::url(eng, &first.name, &db.user, &pw, &db.database)),
     };
@@ -364,37 +377,31 @@ fn publish_urls(app: &App, primary: &Service) -> Result<()> {
 /// Make a replica a primary of its own (the old primary is lost or being retired).
 /// Returns the project variable that now points at it.
 pub async fn promote(app: &AppState, replica: &Service) -> Result<String> {
-    let eng = engine(replica)?;
-    let primary_id = replica.spec.database.as_ref().and_then(|d| d.primary.clone()).ok_or_else(|| anyhow!("{} is not a replica", replica.name))?;
-    let c = container(app, replica).await?;
+    let mut db = database(replica)?.clone();
+    let eng = db.engine;
+    let primary_id = db.primary.take().ok_or_else(|| anyhow!("{} is not a replica", replica.name))?;
+    let c = runtime::running_replica(app, replica).await?;
     let script = match eng {
         Engine::Postgres => r#"psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'select pg_promote()'"#.to_string(),
         Engine::Redis => r#"redis-cli -a "$REDIS_PASSWORD" --no-auth-warning replicaof no one && touch /data/.tugport-primary"#.into(),
-        Engine::Mysql => r#"MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -e 'STOP REPLICA; RESET REPLICA ALL; SET PERSIST super_read_only = OFF; SET PERSIST read_only = OFF;'"#.into(),
-        Engine::Mariadb => {
-            r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot -e 'STOP SLAVE; RESET SLAVE ALL; SET GLOBAL read_only = OFF;' && touch /var/lib/mysql/.tugport-primary"#.into()
+        Engine::Mysql | Engine::Mariadb => {
+            let b = Binlog::of(eng);
+            format!("{}{}", b.sql(&format!("-e '{}'", b.promote)), b.after_promote)
         }
-        Engine::Mongo => {
-            let js = format!(
-                "cfg = rs.conf(); cfg.members = cfg.members.filter(m => m.host == \"{}:27017\"); cfg.members[0].priority = 1; cfg.members[0].votes = 1; rs.reconfig(cfg, {{force: true}}).ok",
-                replica.name
-            );
-            mongo_shell(&js, "MONGO_USER", "MONGO_PASSWORD")
-        }
+        Engine::Mongo => mongo_shell(&format!(
+            "cfg = rs.conf(); cfg.members = cfg.members.filter(m => m.host == \"{}:27017\"); cfg.members[0].priority = 1; cfg.members[0].votes = 1; rs.reconfig(cfg, {{force: true}}).ok",
+            replica.name
+        )),
     };
     run(app, &c, &script).await.context("promoting")?;
     let mut s = replica.clone();
-    if let Some(db) = s.spec.database.as_mut() {
-        db.primary = None;
-    }
-    save_spec(app, &s)?;
-    app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("replica:{}", s.id)])?;
+    s.spec.database = Some(db.clone());
+    store::save_spec(app, &s.id, &s.spec)?;
+    app.db.del_state(&state_key(&s.id))?;
     // The old primary's URL variable now leads here.
     let old = store::service(app, &primary_id)?;
     let var = var_name(old.as_ref().map(|p| p.name.as_str()).unwrap_or(&s.name), "URL");
-    let db = s.spec.database.clone().ok_or_else(|| anyhow!("not a database"))?;
-    let pw_var = if eng == Engine::Mongo { "MONGO_PASSWORD" } else { password_var(eng) };
-    let pw = store::service_env(app, &s.id)?.get(pw_var).map(|p| p.to_string()).unwrap_or_default();
+    let pw = password(app, &s, eng)?;
     store::set_project_var(app, &s.project_id, &var, Some(&databases::url(eng, &s.name, &db.user, &pw, &db.database)))?;
     if let Some(old) = &old {
         publish_urls(app, old)?;
@@ -402,9 +409,13 @@ pub async fn promote(app: &AppState, replica: &Service) -> Result<String> {
     Ok(var)
 }
 
+fn state_key(replica_id: &str) -> String {
+    format!("replica:{replica_id}")
+}
+
 /// Replication state for the panel: copying, following, or failed with the reason.
 pub fn state(app: &App, replica_id: &str) -> String {
-    app.db.get_state(&format!("replica:{replica_id}")).ok().flatten().unwrap_or_else(|| "following".into())
+    app.db.state::<String>(&state_key(replica_id)).unwrap_or_else(|| "following".into())
 }
 
 #[cfg(test)]
@@ -415,5 +426,13 @@ mod tests {
     fn variable_names() {
         assert_eq!(var_name("db-replica-1", "URL"), "DB_REPLICA_1_URL");
         assert_eq!(var_name("db", "READ_URL"), "DB_READ_URL");
+    }
+
+    #[test]
+    fn binlog_scripts() {
+        let (my, maria) = (Binlog::of(Engine::Mysql), Binlog::of(Engine::Mariadb));
+        assert_eq!(my.sql("-N -e 'select @@log_bin'"), r#"MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N -e 'select @@log_bin'"#);
+        assert_eq!(maria.sql(&format!("-E -e '{}'", maria.status)), r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot -E -e 'SHOW SLAVE STATUS'"#);
+        assert_eq!(maria.root(maria.dump, maria.position), r#"MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb-dump -uroot --master-data=1"#);
     }
 }

@@ -91,10 +91,11 @@ fn config_path() -> Result<PathBuf> {
 /// control sequences, which could rewrite the screen or set the clipboard.
 fn shown(text: &str) -> std::borrow::Cow<'_, str> {
     use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() || !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+    let bad = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !std::io::stdout().is_terminal() || !text.chars().any(bad) {
         return text.into();
     }
-    text.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '\u{fffd}' } else { c }).collect::<String>().into()
+    text.chars().map(|c| if bad(c) { '\u{fffd}' } else { c }).collect::<String>().into()
 }
 
 /// Several words for `sh -c`, each quoted, so none is read as shell syntax.
@@ -156,11 +157,13 @@ impl Api {
     async fn events(&self, path: &str, mut f: impl FnMut(&str, &str) -> bool) -> Result<()> {
         let resp = self.http.get(self.url(path)).bearer_auth(&self.cfg.token).send().await?.error_for_status()?;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Bytes until a whole event is in: a character split across chunks must stay whole.
+        let mut buf = Vec::new();
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(end) = buf.find("\n\n") {
-                let block: String = buf.drain(..end + 2).collect();
+            buf.extend_from_slice(&chunk?);
+            while let Some(end) = buf.windows(2).position(|w| w == b"\n\n") {
+                let block: Vec<u8> = buf.drain(..end + 2).collect();
+                let block = String::from_utf8_lossy(&block);
                 let mut event = "message";
                 let mut data = String::new();
                 for line in block.lines() {
@@ -179,105 +182,84 @@ impl Api {
     }
 }
 
-fn print(json: bool, v: &Value, human: impl FnOnce(&Value)) {
+/// Print `v` as JSON, or for people with `human`; exit code 0.
+fn print(json: bool, v: &Value, human: impl FnOnce(&Value)) -> Result<i32> {
     if json {
         println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
     } else {
         human(v);
     }
+    Ok(0)
 }
 
-fn time(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_default()
+/// A string field, or "" when it is missing.
+fn s(v: &Value) -> &str {
+    v.as_str().unwrap_or("")
+}
+
+fn time(ts: &Value) -> String {
+    chrono::DateTime::from_timestamp_millis(ts.as_i64().unwrap_or(0)).map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_default()
 }
 
 /// Run a client command; returns the process exit code.
 pub async fn run(cmd: Client, json: bool) -> Result<i32> {
-    if let Client::Login { url, token } = &cmd {
-        let api = Api::new(Config { url: url.clone(), token: token.clone() })?;
-        let me = api.get("/api/me").await.context("the key was not accepted")?;
-        let path = config_path()?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
-            // The mode above only applies to a new file.
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            f.write_all(serde_json::to_string_pretty(&Config { url: url.clone(), token: token.clone() })?.as_bytes())?;
-        }
-        println!("Logged in to {url} as {}.", me["principal"]["name"].as_str().unwrap_or("?"));
-        return Ok(0);
-    }
-    let api = Api::new(config()?)?;
+    let api = Api::new(match &cmd {
+        Client::Login { url, token } => Config { url: url.clone(), token: token.clone() },
+        _ => config()?,
+    })?;
     match cmd {
-        Client::Login { .. } => Ok(0),
-        Client::Projects => {
-            let v = api.get("/api/projects").await?;
-            print(json, &v, |v| {
-                for p in v["projects"].as_array().into_iter().flatten() {
-                    println!("{:<24} {:>3} services  {}", p["name"].as_str().unwrap_or(""), p["services"], p["role"].as_str().unwrap_or(""));
-                }
-            });
+        Client::Login { url, .. } => {
+            let me = api.get("/api/me").await.context("the key was not accepted")?;
+            let path = config_path()?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            crate::util::write_private(&path, serde_json::to_string_pretty(&api.cfg)?.as_bytes())?;
+            println!("Logged in to {url} as {}.", me["principal"]["name"].as_str().unwrap_or("?"));
             Ok(0)
         }
-        Client::Servers => {
-            let v = api.get("/api/nodes").await?;
-            print(json, &v, |v| {
-                for n in v["nodes"].as_array().into_iter().flatten() {
-                    let i = &n["info"];
-                    println!(
-                        "{:<24} {:<12} {:<15} {:>3} cpus {:>6.1} GB  {}",
-                        n["name"].as_str().unwrap_or(""),
-                        n["status"].as_str().unwrap_or(""),
-                        n["mesh_ip"].as_str().unwrap_or("-"),
-                        i["cpus"].as_u64().unwrap_or(0),
-                        i["memory_total"].as_f64().unwrap_or(0.0) / 1e9,
-                        n["region"].as_str().unwrap_or(""),
-                    );
-                }
-            });
-            Ok(0)
-        }
-        Client::Services { project } => {
-            let v = api.get(&format!("/api/projects/{project}")).await?;
-            print(json, &v, |v| {
-                for s in v["services"].as_array().into_iter().flatten() {
-                    println!(
-                        "{:<24} {:<9} {}",
-                        s["name"].as_str().unwrap_or(""),
-                        s["kind"].as_str().unwrap_or(""),
-                        s["status"]["state"].as_str().unwrap_or("")
-                    );
-                }
-            });
-            Ok(0)
-        }
-        Client::Status { service } => {
-            let v = api.get(&format!("/api/services/{service}")).await?;
-            print(json, &v, |v| {
-                let st = &v["status"];
-                println!("{} is {} ({}/{} running)", service, st["state"].as_str().unwrap_or("?"), st["running"], st["desired"]);
-                for d in v["domains"].as_array().into_iter().flatten() {
-                    println!("  https://{}{}", d["host"].as_str().unwrap_or(""), d["path"].as_str().unwrap_or(""));
-                }
-                for r in st["replicas"].as_array().into_iter().flatten() {
-                    println!("  {} {} {}", r["name"].as_str().unwrap_or(""), r["state"].as_str().unwrap_or(""), r["health"].as_str().unwrap_or(""));
-                }
-                if let Some(d) = v["last_deploy"].as_object() {
-                    println!("  last deploy {} ({})", d.get("status").and_then(|s| s.as_str()).unwrap_or(""), d.get("trigger").and_then(|s| s.as_str()).unwrap_or(""));
-                }
-            });
-            Ok(0)
-        }
+        Client::Projects => print(json, &api.get("/api/projects").await?, |v| {
+            for p in v["projects"].as_array().into_iter().flatten() {
+                println!("{:<24} {:>3} services  {}", s(&p["name"]), p["services"], s(&p["role"]));
+            }
+        }),
+        Client::Servers => print(json, &api.get("/api/nodes").await?, |v| {
+            for n in v["nodes"].as_array().into_iter().flatten() {
+                let i = &n["info"];
+                println!(
+                    "{:<24} {:<12} {:<15} {:>3} cpus {:>6.1} GB  {}",
+                    s(&n["name"]),
+                    s(&n["status"]),
+                    n["mesh_ip"].as_str().unwrap_or("-"),
+                    i["cpus"].as_u64().unwrap_or(0),
+                    i["memory_total"].as_f64().unwrap_or(0.0) / 1e9,
+                    s(&n["region"]),
+                );
+            }
+        }),
+        Client::Services { project } => print(json, &api.get(&format!("/api/projects/{project}")).await?, |v| {
+            for svc in v["services"].as_array().into_iter().flatten() {
+                println!("{:<24} {:<9} {}", s(&svc["name"]), s(&svc["kind"]), s(&svc["status"]["state"]));
+            }
+        }),
+        Client::Status { service } => print(json, &api.get(&format!("/api/services/{service}")).await?, |v| {
+            let st = &v["status"];
+            println!("{} is {} ({}/{} running)", service, st["state"].as_str().unwrap_or("?"), st["running"], st["desired"]);
+            for d in v["domains"].as_array().into_iter().flatten() {
+                println!("  https://{}{}", s(&d["host"]), s(&d["path"]));
+            }
+            for r in st["replicas"].as_array().into_iter().flatten() {
+                println!("  {} {} {}", s(&r["name"]), s(&r["state"]), s(&r["health"]));
+            }
+            if let Some(d) = v["last_deploy"].as_object() {
+                println!("  last deploy {} ({})", d.get("status").map_or("", s), d.get("trigger").map_or("", s));
+            }
+        }),
         Client::Deploy { service, git_ref, detach } => {
             let v = api.post(&format!("/api/services/{service}/deploy"), json!({ "ref": git_ref })).await?;
             let id = v["deploy_id"].as_str().ok_or_else(|| anyhow!("no deploy id returned"))?.to_string();
             if detach {
-                print(json, &v, |_| println!("Deploy {id} queued."));
-                return Ok(0);
+                return print(json, &v, |_| println!("Deploy {id} queued."));
             }
             let mut status = String::from("queued");
             api.events(&format!("/api/deploys/{id}/log"), |event, data| {
@@ -287,7 +269,7 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
                             if json {
                                 println!("{data}");
                             } else {
-                                println!("{} {}", time(l["ts"].as_i64().unwrap_or(0)), shown(l["line"].as_str().unwrap_or("")));
+                                println!("{} {}", time(&l["ts"]), shown(s(&l["line"])));
                             }
                         }
                         true
@@ -308,14 +290,14 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
         Client::Logs { service, follow, q, lines } => {
             let mut path = format!("/api/services/{service}/logs?limit={lines}");
             if let Some(q) = &q {
-                path.push_str(&format!("&q={}", urlencode(q)));
+                path.push_str(&format!("&q={}", crate::util::urlencode(q)));
             }
             let v = api.get(&path).await?;
             let show = |l: &Value| {
                 if json {
                     println!("{l}");
                 } else {
-                    println!("{} {} {}", time(l["ts"].as_i64().unwrap_or(0)), l["replica"].as_str().unwrap_or(""), shown(l["line"].as_str().unwrap_or("")));
+                    println!("{} {} {}", time(&l["ts"]), s(&l["replica"]), shown(s(&l["line"])));
                 }
             };
             for l in v["lines"].as_array().into_iter().flatten() {
@@ -324,9 +306,10 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
             if follow {
                 let svc = api.get(&format!("/api/services/{service}")).await?;
                 let id = svc["service"]["id"].as_str().unwrap_or(&service).to_string();
+                let q = q.map(|q| q.to_lowercase());
                 api.events(&format!("/api/services/{id}/logs/stream"), |_, data| {
                     if let Ok(l) = serde_json::from_str::<Value>(data)
-                        && q.as_ref().is_none_or(|q| l["line"].as_str().unwrap_or("").to_lowercase().contains(&q.to_lowercase()))
+                        && q.as_ref().is_none_or(|q| s(&l["line"]).to_lowercase().contains(q))
                     {
                         show(&l);
                     }
@@ -336,46 +319,36 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
             }
             Ok(0)
         }
-        Client::Env { service, action, pairs } => {
-            match action.as_deref() {
-                None => {
-                    let v = api.get(&format!("/api/services/{service}/env")).await?;
-                    print(json, &v, |v| match &v["env"] {
-                        Value::Object(m) => m.iter().for_each(|(k, val)| println!("{k}={}", val.as_str().unwrap_or(""))),
-                        Value::Array(a) => a.iter().for_each(|k| println!("{}", k.as_str().unwrap_or(""))),
-                        _ => {}
-                    });
-                }
-                Some("set") => {
-                    let mut body = serde_json::Map::new();
-                    for p in &pairs {
-                        let (k, v) = p.split_once('=').ok_or_else(|| anyhow!("use NAME=value, got {p}"))?;
-                        body.insert(k.to_string(), Value::String(v.to_string()));
-                    }
-                    api.send(reqwest::Method::PUT, &format!("/api/services/{service}/env"), Some(Value::Object(body))).await?;
-                    println!("Saved. Redeploy {service} to apply.");
-                }
-                Some("unset") => {
-                    let body: serde_json::Map<String, Value> = pairs.iter().map(|k| (k.clone(), Value::Null)).collect();
-                    api.send(reqwest::Method::PUT, &format!("/api/services/{service}/env"), Some(Value::Object(body))).await?;
-                    println!("Removed. Redeploy {service} to apply.");
-                }
-                Some(other) => bail!("unknown env action {other}; use set or unset"),
+        Client::Env { service, action, pairs } => match action.as_deref() {
+            None => print(json, &api.get(&format!("/api/services/{service}/env")).await?, |v| match &v["env"] {
+                Value::Object(m) => m.iter().for_each(|(k, val)| println!("{k}={}", s(val))),
+                Value::Array(a) => a.iter().for_each(|k| println!("{}", s(k))),
+                _ => {}
+            }),
+            Some(verb @ ("set" | "unset")) => {
+                let body = pairs
+                    .iter()
+                    .map(|p| match verb {
+                        "set" => p.split_once('=').map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).ok_or_else(|| anyhow!("use NAME=value, got {p}")),
+                        _ => Ok((p.clone(), Value::Null)),
+                    })
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
+                api.send(reqwest::Method::PUT, &format!("/api/services/{service}/env"), Some(Value::Object(body))).await?;
+                println!("{}. Redeploy {service} to apply.", if verb == "set" { "Saved" } else { "Removed" });
+                Ok(0)
             }
-            Ok(0)
-        }
-        Client::Rollback { service } => {
-            let v = api.post(&format!("/api/services/{service}/rollback"), json!({})).await?;
-            print(json, &v, |v| println!("Rolling back to {} (deploy {}).", v["image"].as_str().unwrap_or(""), v["deploy_id"].as_str().unwrap_or("")));
-            Ok(0)
-        }
+            Some(other) => bail!("unknown env action {other}; use set or unset"),
+        },
+        Client::Rollback { service } => print(json, &api.post(&format!("/api/services/{service}/rollback"), json!({})).await?, |v| {
+            println!("Rolling back to {} (deploy {}).", s(&v["image"]), s(&v["deploy_id"]))
+        }),
         Client::Restart { service } => action(&api, json, &service, "restart").await,
         Client::Stop { service } => action(&api, json, &service, "stop").await,
         Client::Start { service } => action(&api, json, &service, "start").await,
         Client::Exec { service, command } => {
             let v = api.post(&format!("/api/services/{service}/exec"), json!({ "command": shell_words(&command) })).await?;
-            print(json, &v, |v| print!("{}", shown(v["output"].as_str().unwrap_or(""))));
-            Ok(v["exit_code"].as_i64().unwrap_or(1) as i32)
+            print(json, &v, |v| print!("{}", shown(s(&v["output"]))))?;
+            Ok(v["exit_code"].as_i64().and_then(|c| i32::try_from(c).ok()).unwrap_or(1))
         }
         Client::Agent { name, all, projects, grant, expires_days } => {
             let mut map = serde_json::Map::new();
@@ -387,22 +360,16 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
                 .post("/api/agents", json!({ "name": name, "all_projects_role": all, "projects": map, "grants": grant, "key": { "expires_days": expires_days } }))
                 .await?;
             print(json, &v, |v| {
-                println!("Created agent {name}. Its key is shown only once:\n\n  {}\n", v["key"]["token"].as_str().unwrap_or(""));
-                println!("{}", v["snippets"]["env"].as_str().unwrap_or(""));
-            });
-            Ok(0)
+                println!("Created agent {name}. Its key is shown only once:\n\n  {}\n", s(&v["key"]["token"]));
+                println!("{}", s(&v["snippets"]["env"]));
+            })
         }
     }
 }
 
 async fn action(api: &Api, json: bool, service: &str, verb: &str) -> Result<i32> {
     let v = api.post(&format!("/api/services/{service}/{verb}"), json!({})).await?;
-    print(json, &v, |_| println!("{service}: {verb} done."));
-    Ok(0)
-}
-
-fn urlencode(s: &str) -> String {
-    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+    print(json, &v, |_| println!("{service}: {verb} done."))
 }
 
 #[cfg(test)]

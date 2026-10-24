@@ -21,7 +21,7 @@ fn turn(service_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub fn is_asleep(app: &App, service_id: &str) -> bool {
-    app.db.get_state(&format!("asleep:{service_id}")).ok().flatten().is_some()
+    app.db.state::<String>(&format!("asleep:{service_id}")).is_some()
 }
 
 /// Deploys and wake-ups restart the idle clock.
@@ -34,9 +34,7 @@ pub async fn wake(app: &App, service_id: &str, port: u16) -> Result<Vec<Upstream
     let gate = turn(service_id);
     let _turn = gate.lock().await;
     let s = store::service(app, service_id)?.ok_or_else(|| anyhow!("this service no longer exists"))?;
-    let live = runtime::live_deploy(app, &s.id);
-    let current = |reps: Vec<runtime::Replica>| -> Vec<runtime::Replica> { reps.into_iter().filter(|r| live.as_deref().is_none_or(|l| r.deploy == l)).collect() };
-    let reps = current(runtime::replicas(app, &s.id).await?);
+    let reps = runtime::current(app, &s).await?;
     if reps.is_empty() {
         bail!("there is nothing to start; deploy the service first");
     }
@@ -46,7 +44,7 @@ pub async fn wake(app: &App, service_id: &str, port: u16) -> Result<Vec<Upstream
         for r in reps.iter().filter(|r| r.state != "running") {
             runtime::start(app, &r.node, &r.id).await?;
         }
-        app.db.conn().execute("DELETE FROM state WHERE key = ?1", [format!("asleep:{}", s.id)])?;
+        app.db.del_state(&format!("asleep:{}", s.id))?;
         mark_active(app, &s.id);
         app.emit("service.status", Some(&s.project_id), Some(&s.id), serde_json::json!({ "event": "wake", "state": "running" }));
     }
@@ -54,12 +52,14 @@ pub async fn wake(app: &App, service_id: &str, port: u16) -> Result<Vec<Upstream
     let proxies = crate::nodes::proxy_addresses(app);
     loop {
         let mut up = vec![];
-        for r in current(runtime::replicas(app, &s.id).await?).iter().filter(|r| r.state == "running") {
-            let Some(ip) = r.ip.as_deref().and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) else { continue };
-            if !runtime::probe(app, &r.node, &ip.to_string(), port, None, false).await {
+        for r in runtime::current(app, &s).await?.iter().filter(|r| r.state == "running") {
+            let Some(addr) = r.ip.as_deref() else { continue };
+            let Ok(ip) = addr.parse::<std::net::IpAddr>() else { continue };
+            if !runtime::probe(app, &r.node, addr, port, None, false).await {
                 continue;
             }
-            up.push(if r.node == "local" { Upstream::Local(SocketAddr::new(ip, port)) } else { proxies.get(&r.node).copied().map(Upstream::Node).unwrap_or(Upstream::Local(SocketAddr::new(ip, port))) });
+            let local = Upstream::Local(SocketAddr::new(ip, port));
+            up.push(if r.node == "local" { local } else { proxies.get(&r.node).copied().map(Upstream::Node).unwrap_or(local) });
         }
         if !up.is_empty() {
             if started.elapsed() > Duration::from_millis(50) {
@@ -79,15 +79,11 @@ pub async fn wake(app: &App, service_id: &str, port: u16) -> Result<Vec<Upstream
 /// Put idle services to sleep (checked every 30 seconds).
 pub async fn run(app: AppState) {
     LazyLock::force(&STARTED);
-    loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        if let Err(e) = sleep_idle(&app).await {
-            tracing::warn!("scale to zero: {e:#}");
-        }
-    }
+    crate::util::every(30, "scale to zero", || sleep_idle(app.clone())).await
 }
 
-async fn sleep_idle(app: &AppState) -> Result<()> {
+async fn sleep_idle(app: AppState) -> Result<()> {
+    let app = &app;
     let traffic = app.proxy.all_traffic();
     for s in store::services(app, None)? {
         let Some(cfg) = &s.spec.sleep else { continue };

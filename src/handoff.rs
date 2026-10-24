@@ -39,7 +39,7 @@ impl Drop for ConnGuard {
 fn inherited(key: &str) -> Option<RawFd> {
     std::env::var(ENV).ok()?.split(',').find_map(|pair| {
         let (k, fd) = pair.split_once('=')?;
-        (k == key).then(|| fd.parse().ok()).flatten()
+        if k == key { fd.parse().ok() } else { None }
     })
 }
 
@@ -97,12 +97,13 @@ pub async fn reexec(binary: &std::path::Path, grace: Duration) -> Result<()> {
     while ACTIVE.load(Ordering::SeqCst) > 0 && started.elapsed() < grace {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    for (_, fd) in crate::util::lock(&FDS).iter() {
+    let held = crate::util::lock(&FDS);
+    for (_, fd) in held.iter() {
         // SAFETY: clearing close-on-exec on descriptors this process keeps for the new binary.
         unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) };
     }
-    let fds = crate::util::lock(&FDS).iter().map(|(k, fd)| format!("{k}={fd}")).collect::<Vec<_>>().join(",");
-    tracing::info!("handing {} sockets to {}", fds.matches('=').count(), binary.display());
+    tracing::info!("handing {} sockets to {}", held.len(), binary.display());
+    let fds = held.iter().map(|(k, fd)| format!("{k}={fd}")).collect::<Vec<_>>().join(",");
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(binary).args(std::env::args_os().skip(1)).env(ENV, fds).exec();
     // exec only returns on failure. Listeners have stopped, so exit and let the

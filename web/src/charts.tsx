@@ -138,7 +138,7 @@ export function Chart(props: { title: string; lines: Line[]; fmt: (v: number) =>
   }, [signature, tick, hasData]);
 
   return (
-    <section class="card min-w-0 p-5" aria-label={`${props.title} chart`}>
+    <section class="card min-w-0 p-4 md:p-5" aria-label={`${props.title} chart`}>
       <header class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <h3 class="text-sm font-semibold">{props.title}</h3>
         {summary && <span class="text-xs text-muted tabular-nums">{summary}</span>}

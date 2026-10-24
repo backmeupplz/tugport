@@ -1,7 +1,7 @@
 // Small shared components. Native elements first: <dialog> for modals, confirm() for
 // quick confirmations, <fieldset disabled> for read-only forms.
 import type { ComponentChildren, JSX } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { ApiError } from "./api";
 import { Icon } from "./icons";
 import { copyText, sentence } from "./util";
@@ -53,12 +53,12 @@ export function Card(props: { title?: ComponentChildren; actions?: ComponentChil
   return (
     <section class={`card min-w-0 ${props.class ?? ""}`}>
       {(props.title || props.actions) && (
-        <header class="flex min-h-13 flex-wrap items-center justify-between gap-2 border-b border-line px-5 py-2.5">
+        <header class="flex min-h-13 flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-2.5 md:px-5">
           <h2 class="text-sm font-semibold">{props.title}</h2>
           {props.actions && <div class="flex flex-wrap gap-2">{props.actions}</div>}
         </header>
       )}
-      <div class={props.pad === false ? "" : "p-5"}>{props.children}</div>
+      <div class={props.pad === false ? "" : "p-4 md:p-5"}>{props.children}</div>
     </section>
   );
 }
@@ -292,13 +292,13 @@ export function Modal(props: { open: boolean; onClose: () => void; title: Compon
     >
       {props.open && (
         <div>
-          <header class="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-line bg-surface px-6 py-3.5">
+          <header class="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-line bg-surface px-5 py-3 md:px-6 md:py-3.5">
             <h2 class="min-w-0 truncate text-base font-semibold">{props.title}</h2>
             <button type="button" class="btn btn-ghost -mr-2 px-2" aria-label="Close" onClick={props.onClose}>
               <Icon name="close" />
             </button>
           </header>
-          <div class="p-6">{props.children}</div>
+          <div class="p-5 md:p-6">{props.children}</div>
         </div>
       )}
     </dialog>
@@ -434,16 +434,30 @@ export function Pill(props: { state: string; label?: string; class?: string }) {
   );
 }
 
+/** Page tabs. On phones they scroll sideways, start scrolled to the current one and fade at the edges. */
 export function Tabs(props: { items: [string, string, string][]; current: string; label: string }) {
+  const ref = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const nav = ref.current;
+    const tab = nav?.querySelector<HTMLElement>("[aria-current]");
+    if (!nav || !tab) return;
+    const n = nav.getBoundingClientRect();
+    const t = tab.getBoundingClientRect();
+    nav.scrollLeft += t.left - n.left - (n.width - t.width) / 2;
+  }, [props.current]);
   return (
-    <nav aria-label={props.label} class="-mx-4 mb-7 overflow-x-auto border-b border-line px-4 md:mx-0 md:px-0">
+    <nav
+      ref={ref}
+      aria-label={props.label}
+      class="-mx-4 mb-7 overflow-x-auto border-b border-line px-4 [scrollbar-width:none] max-md:[mask-image:linear-gradient(to_right,transparent,#000_1rem,#000_calc(100%-1rem),transparent)] md:mx-0 md:px-0"
+    >
       <div class="flex gap-0.5">
         {props.items.map(([id, label, href]) => (
           <a
             key={id}
             href={href}
             aria-current={id === props.current ? "page" : undefined}
-            class={`-mb-px whitespace-nowrap border-b-2 px-3 pt-1.5 pb-2.5 text-[13px] font-medium ${
+            class={`-mb-px whitespace-nowrap border-b-2 px-3 pt-2.5 pb-3 text-sm font-medium md:pt-1.5 md:pb-2.5 md:text-[13px] ${
               id === props.current ? "border-accent text-text" : "border-transparent text-muted hover:text-text"
             }`}
           >

@@ -91,7 +91,7 @@
 
 @layer components {
   .btn {
-    @apply inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-line bg-surface px-3 text-[13px] font-medium text-text shadow-(--shadow) transition-colors hover:border-line-strong hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex h-10 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-line bg-surface px-3.5 text-sm md:h-8 md:px-3 md:text-[13px] font-medium text-text shadow-(--shadow) transition-colors hover:border-line-strong hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-primary {
     @apply border-transparent bg-accent text-accent-ink hover:border-transparent hover:bg-accent hover:brightness-110;
@@ -103,13 +103,13 @@
     @apply border-transparent bg-transparent shadow-none hover:border-transparent;
   }
   .btn-sm {
-    @apply h-7 px-2 text-xs;
+    @apply h-8 px-2.5 text-[13px] md:h-7 md:px-2 md:text-xs;
   }
   .input {
-    @apply block h-9 w-full min-w-0 rounded-lg border border-line bg-bg px-3 text-sm text-text transition-colors placeholder:text-muted hover:border-line-strong focus:border-accent/70 focus:outline-none focus-visible:outline-none focus:ring-3 focus:ring-accent/15 disabled:opacity-60;
+    @apply block h-11 w-full min-w-0 rounded-lg border border-line bg-bg px-3 text-base text-text md:h-9 md:text-sm transition-colors placeholder:text-muted hover:border-line-strong focus:border-accent/70 focus:outline-none focus-visible:outline-none focus:ring-3 focus:ring-accent/15 disabled:opacity-60;
   }
   textarea.input {
-    @apply h-auto py-2 font-mono text-[13px] leading-snug;
+    @apply h-auto py-2 font-mono text-base leading-snug md:text-[13px];
   }
   .card {
     @apply rounded-xl border border-line bg-surface shadow-(--shadow);
@@ -125,7 +125,7 @@
   }
   /* One entry of a card's list (see Rows). */
   .row {
-    @apply flex flex-wrap items-center gap-3 px-5 py-3;
+    @apply flex flex-wrap items-center gap-3 px-4 py-3 md:px-5;
   }
   /* A bordered list inside a card. */
   .inset-list {
@@ -133,6 +133,23 @@
   }
   .chip {
     @apply inline-flex items-center gap-1 whitespace-nowrap rounded-md border border-line bg-raised/60 px-1.5 py-px text-xs text-dim;
+  }
+}
+
+/* In a wrapping row, the text keeps at least 12rem on phones, so its buttons move to a line of
+   their own instead of squeezing it into a narrow column. */
+@media (width < 48rem) {
+  .flex-wrap > .min-w-0.flex-1,
+  .row > .min-w-0.flex-1 {
+    flex-basis: 12rem;
+  }
+}
+
+/* Phones zoom into any focused field under 16px; the fields above are 16px there, and so is
+   the terminal's hidden input. */
+@media (width < 48rem) {
+  .xterm-helper-textarea {
+    font-size: 16px !important;
   }
 }
 

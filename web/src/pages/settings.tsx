@@ -453,12 +453,14 @@ function Notifications() {
                   <span class="font-medium">{c.name}</span> <span class="chip">{c.kind}</span>
                   <p class="text-xs text-muted">{c.events.includes("*") ? "All events" : c.events.join(", ")}</p>
                 </div>
-                <Action run={() => post(`/notifications/${c.id}/test`)} done="Test message sent.">
-                  Send test
-                </Action>
-                <Action class="btn btn-ghost text-bad" confirm={`Remove ${c.name}?`} run={() => del(`/notifications/${c.id}`).then(r.reload)}>
-                  Remove
-                </Action>
+                <div class="flex flex-wrap gap-2">
+                  <Action run={() => post(`/notifications/${c.id}/test`)} done="Test message sent.">
+                    Send test
+                  </Action>
+                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${c.name}?`} run={() => del(`/notifications/${c.id}`).then(r.reload)}>
+                    Remove
+                  </Action>
+                </div>
               </li>
             )}
           </Rows>
@@ -636,16 +638,18 @@ function Backups() {
                     </p>
                     {j.last_run?.error && <p class="text-xs text-bad">{j.last_run.error}</p>}
                   </div>
-                  <button class="btn" onClick={() => setRunsOf(j)}>
-                    Runs
-                  </button>
-                  <Action run={() => patch(`/backups/jobs/${j.id}`, { enabled: j.enabled === false }).then(jobs.reload)}>{j.enabled === false ? "Resume" : "Pause"}</Action>
-                  <Action run={() => post(`/backups/jobs/${j.id}/run`).then(jobs.reload)} done="Backup started.">
-                    Run now
-                  </Action>
-                  <Action class="btn btn-ghost text-bad" confirm="Remove this job? Existing backups stay in the target." run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}>
-                    Remove
-                  </Action>
+                  <div class="flex flex-wrap gap-2">
+                    <button class="btn" onClick={() => setRunsOf(j)}>
+                      Runs
+                    </button>
+                    <Action run={() => patch(`/backups/jobs/${j.id}`, { enabled: j.enabled === false }).then(jobs.reload)}>{j.enabled === false ? "Resume" : "Pause"}</Action>
+                    <Action run={() => post(`/backups/jobs/${j.id}/run`).then(jobs.reload)} done="Backup started.">
+                      Run now
+                    </Action>
+                    <Action class="btn btn-ghost text-bad" confirm="Remove this job? Existing backups stay in the target." run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}>
+                      Remove
+                    </Action>
+                  </div>
                 </li>
               )}
             </Rows>

@@ -424,7 +424,7 @@ function Deploys({ c }: { c: Ctx }) {
         {(data) => (
           <Rows items={data.deploys} empty="This service has not been deployed yet.">
             {(d) => (
-              <li key={d.id} class="px-5 py-3">
+              <li key={d.id} class="px-4 py-3 md:px-5">
                 <DeployRow d={d} live={data.live} c={c} actions />
               </li>
             )}

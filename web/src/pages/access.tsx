@@ -607,7 +607,7 @@ export function Audit() {
         <>
           <ul class="card divide-y divide-line">
             {entries.map((e) => (
-              <li key={e.id} class="px-5 py-2.5">
+              <li key={e.id} class="px-4 py-2.5 md:px-5">
                 <div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                   <span class="font-medium">{e.actor ?? "tugport"}</span>
                   {e.actor_kind && e.actor_kind !== "human" && <span class="chip">{e.actor_kind}</span>}

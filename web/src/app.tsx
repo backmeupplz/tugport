@@ -163,7 +163,7 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
               <a
                 href={href}
                 aria-current={active ? "page" : undefined}
-                class={`flex h-9 items-center gap-3 rounded-lg px-3 font-medium ${active ? "bg-raised text-text" : "text-dim hover:bg-raised/60 hover:text-text"}`}
+                class={`flex h-11 items-center gap-3 rounded-lg px-3 text-[15px] font-medium md:h-9 md:text-sm ${active ? "bg-raised text-text" : "text-dim hover:bg-raised/60 hover:text-text"}`}
               >
                 <Icon name={icon} class={`size-4 ${active ? "text-accent" : ""}`} />
                 {label}
@@ -214,9 +214,12 @@ function Drawer(props: { open: boolean; onClose: () => void; children: Component
       onClose={props.onClose}
       onClick={(e) => e.target === ref.current && props.onClose()}
       aria-label="Navigation"
-      class="m-0 h-dvh max-h-none w-64 max-w-[85vw] border-r border-line bg-bg p-0 text-text md:hidden"
+      class="m-0 h-dvh max-h-none w-72 max-w-[85vw] border-r border-line bg-bg p-0 text-text md:hidden"
     >
       {props.children}
+      <button type="button" class="btn btn-ghost absolute top-3.5 right-3 px-2.5" aria-label="Close the menu" onClick={props.onClose}>
+        <Icon name="close" class="size-5" />
+      </button>
     </dialog>
   );
 }

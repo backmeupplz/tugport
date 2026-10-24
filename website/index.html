@@ -183,7 +183,9 @@
   .term + .term { margin-top: 14px; }
   .term .t { display: flex; justify-content: space-between; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--code-line); color: #7C899C; font-size: 12px; }
   .term pre { padding: 14px 16px; white-space: pre; }
-  @media (min-width: 981px) { .term pre.wrap { white-space: pre-wrap; } }
+  /* A log: each line wraps under its own text, after the timestamp. */
+  .term pre.log { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .term pre.log > span { display: block; padding-left: 9ch; text-indent: -9ch; }
   .term .p { color: #FF8A63; user-select: none; }
   .term .c { color: #6E7B8F; }
   .term .ok { color: #4ADE80; }
@@ -246,6 +248,16 @@
     .card .pic { margin-left: 20px; }
     .card ul, .snip { margin-left: 20px; margin-right: 20px; }
     .facts { grid-template-columns: 1fr; }
+    /* The phone shots show the panel at its real phone size, so they fit the card instead of bleeding. */
+    .card .pic { margin-right: 20px; margin-bottom: 20px; border: 1px solid var(--line); border-radius: 12px; }
+    .card .pic img { -webkit-mask-image: none; mask-image: none; }
+    .term { font-size: 12.5px; }
+    .term pre { padding: 12px 14px; }
+    .term-copy { padding: 7px 12px; font-size: 13px; }
+    .steps li { display: grid; grid-template-columns: 30px minmax(0, 1fr); column-gap: 16px; padding: 20px; }
+    .steps li::before { grid-row: span 2; margin: 0; }
+    .steps h3 { align-self: center; }
+    footer nav a { padding: 8px 0; }
   }
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
@@ -264,7 +276,7 @@
         <a class="hide-sm" href="#features">Features</a>
         <a class="hide-sm" href="#agents">Agents</a>
         <a class="hide-sm" href="#install">Install</a>
-        <a class="hide-sm" href="https://github.com/backmeupplz/tugport/tree/main/docs">Docs</a>
+        <a href="https://github.com/backmeupplz/tugport/tree/main/docs">Docs</a>
         <a class="gh" href="https://github.com/backmeupplz/tugport">
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.7 5.39-5.26 5.68.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5Z"/></svg>
           GitHub
@@ -314,6 +326,8 @@
           </div>
           <div class="pic">
             <picture>
+              <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/deploys-light-phone.webp" width="780" height="1040">
+              <source media="(max-width: 640px)" srcset="/shots/deploys-dark-phone.webp" width="780" height="1040">
               <source media="(prefers-color-scheme: light)" srcset="/shots/deploys-light.webp" width="1600" height="960">
               <img src="/shots/deploys-dark.webp" width="1600" height="960" loading="lazy" alt="The deploy history of a service: a release that crashed on start failed its health check and never received traffic, while the previous version kept serving.">
             </picture>
@@ -326,6 +340,8 @@
           </div>
           <div class="pic">
             <picture>
+              <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/metrics-light-phone.webp" width="780" height="1040">
+              <source media="(max-width: 640px)" srcset="/shots/metrics-dark-phone.webp" width="780" height="1040">
               <source media="(prefers-color-scheme: light)" srcset="/shots/metrics-light.webp" width="1600" height="960">
               <img src="/shots/metrics-dark.webp" width="1600" height="960" loading="lazy" alt="CPU, memory and network charts of a service over the last hour.">
             </picture>
@@ -338,6 +354,8 @@
           </div>
           <div class="pic">
             <picture>
+              <source media="(max-width: 640px) and (prefers-color-scheme: light)" srcset="/shots/servers-light-phone.webp" width="780" height="1040">
+              <source media="(max-width: 640px)" srcset="/shots/servers-dark-phone.webp" width="780" height="1040">
               <source media="(prefers-color-scheme: light)" srcset="/shots/servers-light.webp" width="2080" height="1040">
               <img src="/shots/servers-dark.webp" width="2080" height="1040" loading="lazy" alt="Three servers in three regions, each online, with their Tugport and Docker versions, processor, memory and labels.">
             </picture>
@@ -404,14 +422,7 @@ Certificates: 1 imported, so nothing is re-issued</pre>
         </div>
         <div class="term">
           <div class="t"><span>Or deploy from the CLI and wait for the outcome</span></div>
-          <pre class="wrap"><span class="p">$ </span>tugport deploy storefront.api
-<span class="c">04:52:19</span> Fetching main from git@git.example.com:acme/storefront.git
-<span class="c">04:52:19</span> Checked out 5a24391 Cache the product list for a minute
-<span class="c">04:52:21</span> Built tp-storefront-api:z2ukkvwlcfw0 in 1.3s
-<span class="c">04:52:21</span> Running on app-1, app-2
-<span class="c">04:52:22</span> Started 2 containers; checking health
-<span class="c">04:52:22</span> Traffic switched; letting the old version finish requests for 10s
-<span class="c">04:52:33</span> <span class="ok">Live after 13.5s.</span></pre>
+          <pre class="log"><span><span class="p">$ </span>tugport deploy storefront.api</span><span><span class="c">04:52:19</span> Fetching main from git@git.example.com:acme/storefront.git</span><span><span class="c">04:52:19</span> Checked out 5a24391 Cache the product list for a minute</span><span><span class="c">04:52:21</span> Built tp-storefront-api:z2ukkvwlcfw0 in 1.3s</span><span><span class="c">04:52:21</span> Running on app-1, app-2</span><span><span class="c">04:52:22</span> Started 2 containers; checking health</span><span><span class="c">04:52:22</span> Traffic switched; letting the old version finish requests for 10s</span><span><span class="c">04:52:33</span> <span class="ok">Live after 13.5s.</span></span></pre>
         </div>
       </div>
     </div>

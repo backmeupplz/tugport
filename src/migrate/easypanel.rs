@@ -116,13 +116,23 @@ fn map(entries: Vec<(String, Value)>, ctx: &Ctx) -> Plan {
     let legacy_domains = domains.is_empty();
     for svc in &services {
         let (p, s) = (st(svc, "projectName"), st(svc, "name"));
-        let placeholders = |text: &str| {
+        let mine: Vec<&Value> = if legacy_domains {
+            svc["domains"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+        } else {
+            domains
+                .iter()
+                .filter(|d| st(d, "destinationType") == "service" && st(&d["serviceDestination"], "projectName") == p && st(&d["serviceDestination"], "serviceName") == s)
+                .collect()
+        };
+        let basic = |text: &str| {
             let dashed = format!("{p}_{s}").replace('_', "-");
             text.replace("$(EASYPANEL_HOST)", &default_domain)
                 .replace("$(EASYPANEL_DOMAIN)", &format!("{dashed}.{service_domain}"))
                 .replace("$(PROJECT_NAME)", p)
                 .replace("$(SERVICE_NAME)", s)
         };
+        let primary = mine.iter().find(|d| st(d, "id") == st(svc, "primaryDomainId")).or(mine.first()).map(|d| basic(st(d, "host")).to_lowercase()).unwrap_or_default();
+        let placeholders = |text: &str| basic(text).replace("$(PRIMARY_DOMAIN)", &primary);
         let swarm_name = format!("{p}_{s}");
         let mut n = NewService::new(format!("{p}/{s}"), tugport_name(p), s);
         n.hook = nonempty(st(svc, "token")).map(String::from);
@@ -144,14 +154,6 @@ fn map(entries: Vec<(String, Value)>, ctx: &Ctx) -> Plan {
         let mut overlay_aliases = old_names.to_vec();
         overlay_aliases.push(s.to_string());
         n.overlays = vec![("easypanel".into(), old_names.to_vec()), (format!("easypanel-{p}"), overlay_aliases)];
-        let mine: Vec<&Value> = if legacy_domains {
-            svc["domains"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
-        } else {
-            domains
-                .iter()
-                .filter(|d| st(d, "destinationType") == "service" && st(&d["serviceDestination"], "projectName") == p && st(&d["serviceDestination"], "serviceName") == s)
-                .collect()
-        };
         match st(svc, "type") {
             "app" => app(svc, &mut n, ctx, github_token.is_some(), &mut plan.registries),
             "postgres" | "mysql" | "mariadb" | "mongo" | "redis" => database(svc, &mut n),
@@ -160,6 +162,10 @@ fn map(entries: Vec<(String, Value)>, ctx: &Ctx) -> Plan {
                 n.cutover = Cutover::Unsupported;
                 n.notes.push(format!("{other} services are not supported; it keeps running, but its domains stop working after the switch"));
             }
+        }
+        // Easypanel fills these in when it deploys; Tugport passes env through as written.
+        for v in n.env.values_mut() {
+            *v = placeholders(v);
         }
         if n.cutover != Cutover::Unsupported {
             n.domains = map_domains(svc, &mine, &mut n.notes, &placeholders, legacy_domains);
@@ -474,6 +480,12 @@ fn map_domains(svc: &Value, mine: &[&Value], notes: &mut Vec<String>, placeholde
     for d in mine {
         let dest = if legacy { *d } else { &d["serviceDestination"] };
         let host = placeholders(st(d, "host")).to_lowercase();
+        // Easypanel gives every service an address under its own DNS service whether it serves
+        // HTTP or not; moved, it would make the health check wait on a port nothing listens on.
+        if host.ends_with(".easypanel.host") {
+            notes.push(format!("{host} is an address Easypanel made up and is not moved"));
+            continue;
+        }
         if d["wildcard"].as_bool() == Some(true) {
             notes.push(format!("the wildcard domain *.{host} is not supported"));
             continue;
@@ -577,7 +589,7 @@ mod tests {
             ("projects:bots".into(), json!({"name": "bots"})),
             ("services:shop:api".into(), json!({
                 "type": "app", "projectName": "shop", "name": "api", "enabled": true, "token": "tok1",
-                "env": "DB=postgres://u:p@shop_db:5432/shop\nMONGO=mongodb://bots_store:27017", "primaryDomainId": "d1",
+                "env": "DB=postgres://u:p@shop_db:5432/shop\nMONGO=mongodb://bots_store:27017\nCACHE=$(PROJECT_NAME)_cache\nURL=https://$(PRIMARY_DOMAIN)", "primaryDomainId": "d1",
                 "source": {"type": "github", "owner": "o", "repo": "r", "ref": "main", "path": "/", "autoDeploy": true},
                 "build": {"type": "nixpacks", "startCommand": "npm start", "nixpacksVersion": "1.41.0"},
                 "deploy": {"replicas": 1, "command": null, "zeroDowntime": true},
@@ -595,6 +607,10 @@ mod tests {
             ("domains:d1".into(), json!({
                 "id": "d1", "host": "api.example.com", "https": true, "path": "/", "wildcard": false, "middlewares": [], "destinationType": "service",
                 "serviceDestination": {"projectName": "shop", "serviceName": "api", "port": 3000, "path": "/", "protocol": "http"}
+            })),
+            ("domains:d2".into(), json!({
+                "id": "d2", "host": "shop-api.abc.easypanel.host", "https": true, "path": "/", "destinationType": "service",
+                "serviceDestination": {"projectName": "shop", "serviceName": "api", "port": 80, "path": "/", "protocol": "http"}
             })),
             ("databaseBackups:x".into(), json!({})),
         ]
@@ -620,7 +636,10 @@ mod tests {
         assert_eq!(api.env["PORT"], "3000");
         assert!(api.spec.mounts.contains(&Mount::Volume { name: "shop_api_data".into(), target: "/data".into(), readonly: false }));
         assert_eq!(api.files, vec![("/etc/app.conf".to_string(), "x=1".to_string())]);
+        assert_eq!((api.env["CACHE"].as_str(), api.env["URL"].as_str()), ("shop_cache", "https://api.example.com"));
+        assert_eq!(api.domains.len(), 1);
         assert_eq!(api.domains[0].host, "api.example.com");
+        assert!(api.notes.iter().any(|n| n.contains("shop-api.abc.easypanel.host")));
         assert!(crate::auth::verify_password("pw", &api.domains[0].options.basic_auth[0].hash));
         assert_eq!(api.hook.as_deref(), Some("tok1"));
         assert!(!api.spec.no_new_privileges);

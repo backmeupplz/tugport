@@ -21,7 +21,7 @@ use crate::store::{self, Service};
 use crate::{databases, deploy, git, runtime, util};
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
-use bollard::models::{EndpointSettings, NetworkConnectRequest, NetworkDisconnectRequest};
+use bollard::models::{EndpointSettings, NetworkConnectRequest, NetworkCreateRequest, NetworkDisconnectRequest};
 use bollard::query_parameters::ListContainersOptions;
 use regex::Regex;
 use rusqlite::params;
@@ -481,7 +481,13 @@ struct Moved {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Stopped {
     Swarm { service: String, replicas: u64 },
-    Containers { ids: Vec<String> },
+    Containers {
+        ids: Vec<String>,
+        /// Old networks removed so Tugport's copy could take the subnets they held; created
+        /// again before the containers start.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        networks: Vec<NetworkCreateRequest>,
+    },
 }
 
 const JOURNAL: &str = "migration";
@@ -702,7 +708,7 @@ async fn import(app: &AppState, plan: &Plan, j: &mut Journal) -> Result<()> {
             Some(p) => p,
             None => {
                 let id = util::id();
-                app.db.exec("INSERT INTO projects (id, name, description, created_at) VALUES (?1, ?2, ?3, ?4)", params![id, p.name, format!("Moved from {}", plan.panel), util::now()])?;
+                app.db.exec("INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)", params![id, p.name, util::now()])?;
                 j.projects.push(id.clone());
                 save(app, j)?;
                 store::project(app, &id)?.ok_or_else(|| anyhow!("project {} vanished", p.name))?
@@ -955,6 +961,9 @@ async fn swap(app: &AppState, s: &NewService, j: &mut Journal) -> Result<()> {
             restore(app, j, |j| Ok(&mut moved_mut(j, &s.key)?.stopped), None).await?;
             return Err(e.context(format!("stopping the old copy of {}", s.key)));
         }
+        if let Source::Compose { yaml } = &s.spec.source {
+            release_subnets(app, j, &s.key, &pinned_subnets(yaml)).await?;
+        }
         println!("{}: starting on Tugport", s.key);
         let svc = store::service(app, &id)?.ok_or_else(|| anyhow!("{} vanished", s.key))?;
         if let Err(e) = start(app, &svc, s).await {
@@ -1077,12 +1086,12 @@ async fn scale(docker: &Docker, service: &str, n: u64, fast: bool) -> Result<()>
 /// What to restore later: the old copy's replica count or running containers.
 async fn record(docker: &Docker, old: &Old) -> Result<Stopped> {
     Ok(match old {
-        Old::None => Stopped::Containers { ids: vec![] },
+        Old::None => Stopped::Containers { ids: vec![], networks: vec![] },
         Old::Swarm { service } => Stopped::Swarm { service: service.clone(), replicas: swarm_replicas(service).await? },
-        Old::Labeled { label } => Stopped::Containers { ids: labeled(docker, label, false).await? },
+        Old::Labeled { label } => Stopped::Containers { ids: labeled(docker, label, false).await?, networks: vec![] },
         Old::Container { name } => {
             let running = docker.inspect_container(name, None::<bollard::query_parameters::InspectContainerOptions>).await.ok().and_then(|c| c.state?.running);
-            Stopped::Containers { ids: if running == Some(true) { vec![name.clone()] } else { vec![] } }
+            Stopped::Containers { ids: if running == Some(true) { vec![name.clone()] } else { vec![] }, networks: vec![] }
         }
     })
 }
@@ -1104,23 +1113,118 @@ async fn halt(app: &App, old: &Old, fast: bool) -> Result<()> {
     Ok(())
 }
 
+/// Subnets a Compose file pins (`networks.<name>.ipam.config[].subnet`).
+fn pinned_subnets(yaml: &str) -> Vec<String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap_or_default();
+    doc.get("networks")
+        .and_then(|n| n.as_mapping())
+        .into_iter()
+        .flat_map(|n| n.values())
+        .filter_map(|n| n.get("ipam")?.get("config")?.as_sequence())
+        .flatten()
+        .filter_map(|c| c.get("subnet")?.as_str().map(String::from))
+        .collect()
+}
+
+/// The stopped old stack's networks keep the subnets Tugport's copy pins, and Docker refuses
+/// overlapping pools. Record those networks in the journal, then remove them; `start_old`
+/// creates them again.
+async fn release_subnets(app: &App, j: &mut Journal, key: &str, subnets: &[String]) -> Result<()> {
+    let Some(Stopped::Containers { ids, .. }) = moved_mut(j, key)?.stopped.clone() else { return Ok(()) };
+    if subnets.is_empty() {
+        return Ok(());
+    }
+    let mut names = BTreeSet::new();
+    for id in &ids {
+        let c = app.docker.inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>).await?;
+        names.extend(c.network_settings.and_then(|n| n.networks).into_iter().flat_map(|n| n.into_keys()));
+    }
+    for name in names {
+        let Ok(n) = app.docker.inspect_network(&name, None::<bollard::query_parameters::InspectNetworkOptions>).await else { continue };
+        let ipam = n.ipam.clone().unwrap_or_default();
+        if !ipam.config.iter().flatten().any(|c| c.subnet.as_ref().is_some_and(|s| subnets.contains(s))) {
+            continue;
+        }
+        if let Some(Stopped::Containers { networks, .. }) = &mut moved_mut(j, key)?.stopped
+            && !networks.iter().any(|r| r.name == name)
+        {
+            networks.push(NetworkCreateRequest {
+                name: name.clone(),
+                driver: n.driver,
+                internal: n.internal,
+                attachable: n.attachable,
+                ipam: Some(ipam),
+                enable_ipv4: n.enable_ipv4,
+                enable_ipv6: n.enable_ipv6,
+                options: n.options,
+                labels: n.labels,
+                ..Default::default()
+            });
+            save(app, j)?;
+        }
+        println!("{key}: removing the old network {name}, which holds a subnet the stack pins");
+        app.docker.remove_network(&name).await.with_context(|| format!("removing the old network {name}"))?;
+    }
+    Ok(())
+}
+
 /// Start an old copy again. Problems are printed, not returned: undoing continues.
 async fn start_old(docker: &Docker, s: &Stopped) {
     let res = match s {
         Stopped::Swarm { service, replicas } => scale(docker, service, *replicas, false).await,
-        Stopped::Containers { ids } => {
-            let mut res = Ok(());
-            for id in ids {
-                match docker.start_container(id, None::<bollard::query_parameters::StartContainerOptions>).await {
-                    Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
-                    Err(e) => res = Err(e.into()),
-                }
-            }
-            res
+        Stopped::Containers { ids, networks } => {
+            recreate_networks(docker, ids, networks).await;
+            start_all(docker, ids).await
         }
     };
     if let Err(e) = res {
         println!("  ! could not start {s:?} again: {e:#}");
+    }
+}
+
+/// Create the networks `release_subnets` removed and attach the old containers again with the
+/// aliases and addresses they had (a container still names a removed network and cannot start).
+async fn recreate_networks(docker: &Docker, ids: &[String], networks: &[NetworkCreateRequest]) {
+    for req in networks {
+        if docker.inspect_network(&req.name, None::<bollard::query_parameters::InspectNetworkOptions>).await.is_err()
+            && let Err(e) = docker.create_network(req.clone()).await
+        {
+            println!("  ! could not create the network {} again: {e}", req.name);
+            continue;
+        }
+        for id in ids {
+            let Ok(c) = docker.inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>).await else { continue };
+            let Some(old) = c.network_settings.and_then(|n| n.networks).and_then(|mut n| n.remove(&req.name)) else { continue };
+            let endpoint = EndpointSettings { aliases: old.aliases, ipam_config: old.ipam_config, links: old.links, ..Default::default() };
+            let connect = NetworkConnectRequest { container: Some(id.clone()), endpoint_config: Some(endpoint) };
+            if let Err(e) = docker.connect_network(&req.name, connect).await {
+                println!("  ! could not attach {id} to {}: {e}", req.name);
+            }
+        }
+    }
+}
+
+/// Start containers, retrying the ones that fail while others still come up: a container
+/// sharing another's PID or network namespace starts only after that one runs.
+async fn start_all(docker: &Docker, ids: &[String]) -> Result<()> {
+    let mut left: Vec<&String> = ids.iter().collect();
+    loop {
+        let mut failed = vec![];
+        let mut last = None;
+        for id in &left {
+            match docker.start_container(id, None::<bollard::query_parameters::StartContainerOptions>).await {
+                Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
+                Err(e) => {
+                    failed.push(*id);
+                    last = Some(e);
+                }
+            }
+        }
+        match last {
+            None => return Ok(()),
+            Some(e) if failed.len() == left.len() => return Err(e.into()),
+            Some(_) => left = failed,
+        }
     }
 }
 
@@ -1316,6 +1420,14 @@ mod git_url_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_pinned_subnets() {
+        let yaml = "services:\n  a:\n    image: x\nnetworks:\n  ci:\n    ipam:\n      config:\n        - subnet: 172.31.250.0/24\n  plain: {}\n  other:\n";
+        assert_eq!(pinned_subnets(yaml), vec!["172.31.250.0/24".to_string()]);
+        assert!(pinned_subnets("services: {}").is_empty());
+        assert!(pinned_subnets("{not yaml").is_empty());
+    }
 
     #[test]
     fn names_and_mentions() {

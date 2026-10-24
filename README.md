@@ -24,6 +24,7 @@ The installer sets up Docker if it is missing, starts Tugport as a system servic
 - **Secrets that stay secret:** encrypted at rest, delivered only to the containers that use them, and masked everywhere else.
 - **More servers and regions** joined by an encrypted WireGuard mesh, with cloud servers created at Hetzner or AWS, autoscaling, scale to zero and database replicas.
 - **Backups** of databases and volumes to S3-compatible storage or a disk, with test restores.
+- **Automatic updates** of Tugport itself without dropping traffic, on by default and off with one setting.
 - **Moving from Easypanel or Coolify** in one command while the apps keep running, with a rollback.
 
 There is deliberately no app store, no one-click templates, no teams or organizations and no telemetry.

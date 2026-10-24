@@ -235,7 +235,7 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
             checked={f.upAuto}
             onChange={(upAuto) => set({ upAuto })}
             label="Install new Tugport releases automatically"
-            hint="Updates restart Tugport without dropping traffic."
+            hint="Tugport checks for a new release every 6 hours and switches to it without dropping traffic."
           />
           <Field label="Channel">
             <Select value={f.upChannel} onChange={(upChannel) => set({ upChannel })} options={["stable", "beta"]} />

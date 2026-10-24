@@ -241,7 +241,7 @@ pub struct UpdateSettings {
 
 impl Default for UpdateSettings {
     fn default() -> Self {
-        UpdateSettings { auto: false, channel: "stable".into() }
+        UpdateSettings { auto: true, channel: "stable".into() }
     }
 }
 

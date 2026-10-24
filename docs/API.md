@@ -228,7 +228,7 @@ The settings fields are:
 - `trusted_proxies`
 - `builds: {max_parallel, cpus, memory_mb}`
 - `alerts: {cpu_percent, memory_percent, disk_percent, gpu_temp_c, for_minutes}`
-- `updates: {auto, channel}`
+- `updates: {auto, channel}`: `auto` (on by default) installs new releases by itself, checking every 6 hours
 
 ## Logs
 

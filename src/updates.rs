@@ -98,7 +98,26 @@ async fn install(app: &AppState, r: Release) -> Result<()> {
 
 /// Install new releases automatically when enabled in settings.
 pub async fn auto(app: AppState) {
+    if let Err(e) = default_on(&app.db) {
+        tracing::warn!("turning on automatic updates: {e:#}");
+    }
     crate::util::every(6 * 3600, "automatic update", || auto_tick(app.clone())).await
+}
+
+/// Automatic updates became the default in 0.1.7. Installs from before kept `auto: false` in their
+/// saved settings without anyone choosing it, so turn it on once; turning it off later sticks.
+fn default_on(db: &crate::db::Db) -> Result<()> {
+    const DONE: &str = "updates:auto_default_on";
+    if db.state::<String>(DONE).is_some() {
+        return Ok(());
+    }
+    let mut s: crate::app::Settings = db.get_setting("instance")?.unwrap_or_default();
+    if !s.updates.auto {
+        s.updates.auto = true;
+        db.set_setting("instance", &s)?;
+        tracing::info!("automatic updates are now on; turn them off under Settings if you prefer");
+    }
+    db.set_state(DONE, "1")
 }
 
 async fn auto_tick(app: AppState) -> Result<()> {
@@ -114,6 +133,22 @@ async fn auto_tick(app: AppState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_updates_turn_on_once() {
+        let db = crate::db::Db::memory().unwrap();
+        let mut s = crate::app::Settings::default();
+        assert!(s.updates.auto, "new installs update themselves");
+        s.updates.auto = false;
+        db.set_setting("instance", &s).unwrap();
+        default_on(&db).unwrap();
+        let on: crate::app::Settings = db.get_setting("instance").unwrap().unwrap();
+        assert!(on.updates.auto, "an old install's untouched setting turns on");
+        db.set_setting("instance", &s).unwrap();
+        default_on(&db).unwrap();
+        let off: crate::app::Settings = db.get_setting("instance").unwrap().unwrap();
+        assert!(!off.updates.auto, "turning it off afterwards sticks");
+    }
 
     #[test]
     fn checksums_and_versions() {

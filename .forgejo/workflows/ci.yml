@@ -35,11 +35,16 @@ jobs:
       - name: Web panel, clippy and tests
         run: |
           rustc --version; node --version
-          # The web build runs beside the Rust compile; the debug build reads web/dist at run time, not compile time.
+          # The web build, clippy (own target dir, so it doesn't wait on the build lock) and the test build run side
+          # by side; the debug build reads web/dist at run time, so it only has to exist while compiling.
           mkdir -p web/dist
-          (cd web && npm ci --no-audit --no-fund && npm run build) > web.log 2>&1 &
+          (cd web && npm ci --no-audit --no-fund && npm run build) > /ramdisk/web.log 2>&1 &
           web=$!
-          cargo clippy --locked -- -D clippy::unwrap_used -D clippy::expect_used
+          CARGO_TARGET_DIR=/ramdisk/target/clippy cargo clippy --locked -- -D clippy::unwrap_used -D clippy::expect_used > /ramdisk/clippy.log 2>&1 &
+          clippy=$!
           cargo test --locked --no-run
-          wait $web && cat web.log || { cat web.log; exit 1; }
+          ok=0
+          wait $clippy || ok=1; cat /ramdisk/clippy.log
+          wait $web || ok=1; cat /ramdisk/web.log
+          [ $ok = 0 ]
           cargo test --locked

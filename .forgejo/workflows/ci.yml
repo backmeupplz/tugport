@@ -31,8 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: . -> ../../../ramdisk/target # = CARGO_TARGET_DIR, relative to /workspace/<owner>/<repo>
-          key: clippy-target-split
-          save-if: true # TEMP: measure warm runs on the PR
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Web panel, clippy and tests
         run: |
           rustc --version; node --version

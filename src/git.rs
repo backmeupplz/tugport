@@ -650,6 +650,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn signs_github_app_jwt() {
+        // Throwaway key generated for this test only. jsonwebtoken 10 panics at signing time
+        // when no crypto backend feature is enabled, so this guards the Cargo.toml features.
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEogIBAAKCAQEA1ATxd6ef6QobMzro4IvKTcy0my+5lSuKfS6vWhSXESnFdKMZ\ndUebG8dyCaVX6ybyDCNBiogjQDp6W11Ap8TQKnrtcmGp4n+hsybmsIpxOlWD1zrB\nNbact1oLhwFaM6M7fNTaQtOh1OlFrur39SAX1yF23Isp0RSXrKZn37j7e6SS81bv\nh2XUp54AL50D78/VRyssylU3JGZxtCSgi4K9owNVNx+rLew0WbDXSMtjn3ZIqeSs\nVCPhq2qPe9k/EWK5zmA+ptw7fIBfNCuDzMVsGpO4JCtwS6V6K8UWw0tBVNg/kXkD\nWwMY9eNsQO9RhR+Rd/BKi2rLTyceaTKg9K4nYQIDAQABAoH/Hm+XOlYV3p5UyUXr\nqFBo+kIoqx5uxbs6Zj4NbiEGjrAwaE4BmZRt787xz/CsblVo6dUl0303kkDSz8rT\nPUJDn9WFwKXEfX9U9yLeevlkx7r+8ia9FbjhRnDmtrq6+C62m3Ty4CUBVk8mcbXJ\nYqb4xSlIpuBTYHBUVbSNtNAZSeZTPcwR3LyxEE5AtISpqw42ouBznVuqW/14nIFw\n1hNZE9AEJfs01PkvyvLzcNidJZnGPgOspscXItCEiPLVhZ6vEJ6bF6O07LYOvkNN\nD76LkGwqqZ7xqoRkjbLPPtN0sorEdZdc0+aAH1PsnvN1ainEHsZGpb30gIBw/+7T\nUYABAoGBAPN/N/G2IuhebOdEjianmg3VM3n8sIyqNWCa0Uom01LuC3d2jJ8dP9ky\nEtihE3CLTarxrmw0TKXIxNV1fWeBlR239AVnVhN+esxK61KkumtowExG1Gg1VEUi\n8ggSdwDK4P0mpQNVqUH75kOnex47oqTD+YJDjjHwatq0UXAyo9dhAoGBAN7n8wcn\n8LJ2fUKjgrknV7E2IOHiIBoo/76Kr0YUdmfmWnrCVV15pwB8AU3KOHCD3Inqcgq5\nbQ81KQJ5iEq0sg29PAOG9UUmpepNxDzUIqP872tFkX/+NO7h4DOnLWhuHdE103+2\n5J1ZOcksm7NaDfNvw0K6rN1UlliYJlOUPFABAoGAONptb4x9XhAeEWmaX0Am4i/z\nkvoDJvTe/a1oTI4ALY7TMpOFhelIbSgZ6mbBqTd9bPp9JVqYwuS7wLNsEmzZKlU3\nLsPP/0E63tRnWaaIuGd+7tBi6+n3wSTFqkjVbGPyYGlTghHQMU3ll8pVHtwBv8La\nUSYA33wpFuOfWDkatEECgYEAo0d4p/dDwxY0bwnjCcmd3LtvnsbLCR6bJ3HjLgxz\nJ2x/Poj3iv8/q4UqV1cXvKN6erP3UY++KXOhVKS9hyuRearyOQs0wrCqvFS2uHAT\n59excPyGtiD5mTpvxqZhBqwSv1sUT+siz3e6cnhwnRIMQhPODiU71uzNLJxXBsYA\n4AECgYEAm2c/OVQzzlkZiKKos/C6IQi4qM+YZrdhE0PgWt0C58xFjAXOwDn4up8Y\nyr4TgXilwIdVBc4jlJggIUuu5oA0DcePumEJ9BftHsT5dWzkbBCrxHx0mY/IPjBB\n7pctdHyUsyUlw5rmrsjneELy4REEntBkmDz4gP+WO7np4S9kE7M=\n-----END RSA PRIVATE KEY-----";
+        let p = Provider { id: "p".into(), kind: Kind::GithubApp, name: "gh".into(), base_url: "https://github.com".into(), config: json!({ "app_id": 1, "pem": pem }) };
+        assert_eq!(app_jwt(&p).unwrap().split('.').count(), 3);
+    }
+
+    #[test]
     fn globs() {
         assert!(path_matches("frontend", "frontend/src/app.ts"));
         assert!(path_matches("frontend/", "frontend/x"));

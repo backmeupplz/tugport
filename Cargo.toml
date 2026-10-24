@@ -26,7 +26,7 @@ hmac = "0.12"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
 ipnet = { version = "2", features = ["serde"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname"] }

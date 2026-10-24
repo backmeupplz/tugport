@@ -290,14 +290,16 @@ The `config` for each kind:
 
 | Method | Path | Notes |
 |---|---|---|
-| GET / POST | `/api/backups/targets` | POST takes `{name, kind: s3\|local, config}`. S3 config: `{endpoint, bucket, prefix?, access_key, secret_key, region?}`. Local config: `{path}`. |
+| GET / POST | `/api/backups/targets` | POST takes `{name, kind: s3\|local, config}`. S3 config: `{endpoint, bucket, prefix?, access_key, secret_key, region?, storage_class?}`. Local config: `{path}`. GET adds each target's `storage_class` (null for Standard). |
 | DELETE | `/api/backups/targets/{id}` | |
 | GET / POST | `/api/backups/jobs` | GET returns jobs with `enabled` and `last_run`. POST takes `{service_id?, target_id, kind: database\|volume\|state, volume?, schedule (cron), keep_last}`. |
 | PATCH / DELETE | `/api/backups/jobs/{id}` | |
 | POST | `/api/backups/jobs/{id}/run` | |
 | GET | `/api/backups/jobs/{id}/runs` | `{runs: [{id, kind, status, snapshot, size_bytes, error, started_at, finished_at}]}` |
 | GET | `/api/backups/runs` | The latest 100 backup and restore runs across the jobs the caller can see: `{runs: [{id, job_id, kind, status, size_bytes, error, started_at, finished_at, job_kind, service_id, volume, service, project}]}` |
-| POST | `/api/backups/runs/{id}/restore` | `{test?: true}` restores into a throwaway copy and reports. Returns `{ok, message}`. |
+| POST | `/api/backups/runs/{id}/restore` | `{test?: true}` restores into a throwaway copy and reports. Returns `{ok, message}`. A Deep Archive restore returns as soon as it starts, and its run reports the result. |
+
+`storage_class` is where S3 targets keep backup data: `STANDARD` (the default), `STANDARD_IA`, `GLACIER_IR` or `DEEP_ARCHIVE`. Standard-IA and Glacier Instant Retrieval are cheaper to store, read instantly and bill each file for at least 30 and 90 days. Deep Archive is the cheapest: restic puts only file data there and keeps its config, index, snapshots and folder trees in Standard, so backups and retention never read archived data. A restore first has S3 thaw the data (it waits up to 48 hours, and the key needs `s3:RestoreObject`), a test restore checks only the index and folder trees, and every file is billed for at least 180 days. Set the class here instead of using a bucket lifecycle rule: a rule would also archive the files that backups read and break them.
 
 ## Cloudflare Tunnel
 

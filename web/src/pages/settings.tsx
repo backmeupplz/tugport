@@ -592,7 +592,24 @@ interface Target {
   id: string;
   name: string;
   kind: string;
+  storage_class?: string | null;
 }
+
+const storageClasses: [string, string][] = [
+  ["STANDARD", "Standard"],
+  ["STANDARD_IA", "Standard-IA"],
+  ["GLACIER_IR", "Glacier Instant Retrieval"],
+  ["DEEP_ARCHIVE", "Glacier Deep Archive"],
+];
+const storageHints: Record<string, string> = {
+  STANDARD: "Standard costs the most to store, but reads are instant and there is no retrieval fee or minimum storage period.",
+  STANDARD_IA: "Standard-IA costs less to store and is still instant to read, but every gigabyte read has a retrieval fee and every file is billed for at least 30 days.",
+  GLACIER_IR:
+    "Glacier Instant Retrieval costs less still and is instant to read, but its retrieval fee is higher and every file is billed for at least 90 days. Not every S3-compatible provider offers it.",
+  DEEP_ARCHIVE:
+    "Deep Archive is by far the cheapest. Restores wait up to 48 hours while S3 thaws the data, every file is billed for at least 180 days, test restores check only the index and not the data itself, and the access key needs the s3:RestoreObject permission. Choose it here instead of adding a bucket lifecycle rule, because a rule would also archive the files that backups read and break them.",
+};
+
 interface Job {
   id: string;
   service_id: string | null;
@@ -622,7 +639,8 @@ function Backups() {
   const [addJob, setAddJob] = useState(false);
   const [runsOf, setRunsOf] = useState<Job | null>(null);
   const services = useServices();
-  const targetName = (id: string) => targets.data?.targets.find((t) => t.id === id)?.name ?? id;
+  const target = (id: string) => targets.data?.targets.find((t) => t.id === id);
+  const targetName = (id: string) => target(id)?.name ?? id;
   const serviceName = (id: string | null) => {
     const s = services?.find((x) => x.id === id);
     return s ? `${s.project}.${s.name}` : "a deleted service";
@@ -650,7 +668,8 @@ function Backups() {
               {(t) => (
                 <li key={t.id} class="row flex-nowrap">
                   <span class="min-w-0 flex-1">
-                    <span class="font-medium">{t.name}</span> <span class="chip">{t.kind}</span>
+                    <span class="font-medium">{t.name}</span> <span class="chip">{t.kind}</span>{" "}
+                    {t.storage_class && <span class="chip">{storageClasses.find(([c]) => c === t.storage_class)?.[1] ?? t.storage_class}</span>}
                   </span>
                   <Action class="btn btn-ghost text-bad" confirm={`Remove ${t.name}?`} run={() => del(`/backups/targets/${t.id}`).then(targets.reload)}>
                     Remove
@@ -707,13 +726,13 @@ function Backups() {
       </Card>
       {addTarget && <TargetForm onClose={() => setAddTarget(false)} onSaved={targets.reload} />}
       {addJob && targets.data && <JobForm targets={targets.data.targets} services={services} onClose={() => setAddJob(false)} onSaved={jobs.reload} />}
-      {runsOf && <Runs job={runsOf} onClose={() => setRunsOf(null)} />}
+      {runsOf && <Runs job={runsOf} archived={target(runsOf.target_id)?.storage_class === "DEEP_ARCHIVE"} onClose={() => setRunsOf(null)} />}
     </>
   );
 }
 
 function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
-  const { f, set } = useForm<Record<string, string>>({ name: "", kind: "s3" });
+  const { f, set } = useForm<Record<string, string>>({ name: "", kind: "s3", storage_class: "STANDARD" });
   const s3: [string, string, string?][] = [
     ["endpoint", "Endpoint (optional, empty for AWS)", "url"],
     ["bucket", "Bucket"],
@@ -724,7 +743,8 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
   ];
   const s = useSubmit(async () => {
     const fields = f.kind === "s3" ? s3.map(([k]) => k) : ["path"];
-    const config = Object.fromEntries(fields.filter((k) => f[k]?.trim()).map((k) => [k, f[k].trim()]));
+    const config: Record<string, string> = Object.fromEntries(fields.filter((k) => f[k]?.trim()).map((k) => [k, f[k].trim()]));
+    if (f.kind === "s3" && f.storage_class !== "STANDARD") config.storage_class = f.storage_class;
     await post("/backups/targets", { name: f.name.trim(), kind: f.kind, config });
     props.onSaved();
     props.onClose();
@@ -747,6 +767,11 @@ function TargetForm(props: { onClose: () => void; onSaved: () => void }) {
           </Field>
         </div>
         {f.kind === "s3" ? s3.map(([k, label, type]) => input(k, label, type)) : input("path", "Folder")}
+        {f.kind === "s3" && (
+          <Field label="Storage class" hint={storageHints[f.storage_class]}>
+            <Select value={f.storage_class} onChange={(storage_class) => set({ storage_class })} options={storageClasses} />
+          </Field>
+        )}
         <FormButtons s={s} submit="Add target" onCancel={props.onClose} />
       </form>
     </Modal>
@@ -814,7 +839,7 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
   );
 }
 
-function Runs(props: { job: Job; onClose: () => void }) {
+function Runs(props: { job: Job; archived: boolean; onClose: () => void }) {
   const r = useApi<{ runs: Run[] }>(`/backups/jobs/${props.job.id}/runs`);
   const restore = async (id: string, test: boolean) => {
     const res = await post<{ message?: string }>(`/backups/runs/${id}/restore`, { test });
@@ -842,7 +867,11 @@ function Runs(props: { job: Job; onClose: () => void }) {
                   {run.snapshot && (
                     <>
                       <Action run={() => restore(run.id, true)}>Test restore</Action>
-                      <Action class="btn btn-danger" confirm="Restore this backup? It replaces the current data." run={() => restore(run.id, false)}>
+                      <Action class="btn btn-danger" confirm={
+                          props.archived
+                            ? "Restore this backup? It replaces the current data. It is in Glacier Deep Archive, so S3 first thaws it, which can take up to 48 hours."
+                            : "Restore this backup? It replaces the current data."
+                        } run={() => restore(run.id, false)}>
                         Restore
                       </Action>
                     </>

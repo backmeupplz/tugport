@@ -17,10 +17,21 @@ use tokio::process::Command;
 
 const RESTIC: &str = "restic/restic:0.19.1";
 
+/// S3 storage classes a target can keep its backup data in; Standard when none is set.
+pub const STORAGE_CLASSES: [&str; 4] = ["STANDARD", "STANDARD_IA", "GLACIER_IR", "DEEP_ARCHIVE"];
+const DEEP_ARCHIVE: &str = "DEEP_ARCHIVE";
+
 pub struct Target {
     id: String,
     kind: String,
     config: Value,
+}
+
+impl Target {
+    /// The S3 storage class backup data goes to, None for Standard (and local targets).
+    pub fn storage_class(&self) -> Option<&str> {
+        self.config.get("storage_class").and_then(|v| v.as_str()).filter(|c| self.kind == "s3" && *c != "STANDARD")
+    }
 }
 
 pub struct Job {
@@ -51,6 +62,13 @@ pub fn job(app: &App, id: &str) -> Result<Job> {
 struct Repo {
     env_file: PathBuf,
     mounts: Vec<String>,
+    class: Option<String>,
+}
+
+impl Repo {
+    fn archived(&self) -> bool {
+        self.class.as_deref() == Some(DEEP_ARCHIVE)
+    }
 }
 
 impl Drop for Repo {
@@ -86,7 +104,7 @@ fn repo(app: &App, t: &Target) -> Result<Repo> {
         other => bail!("unknown target kind {other}"),
     }
     // Made first, so a failed write is cleaned up too.
-    let repo = Repo { env_file: app.paths.run.join(format!("restic-{}.env", util::id())), mounts };
+    let repo = Repo { env_file: app.paths.run.join(format!("restic-{}.env", util::id())), mounts, class: t.storage_class().map(String::from) };
     let lines: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     util::write_private(&repo.env_file, lines.as_bytes())?;
     Ok(repo)
@@ -102,8 +120,52 @@ fn restic_on(mut c: Command, repo: &Repo, extra_mounts: &[String], args: &[&str]
     for m in repo.mounts.iter().chain(extra_mounts) {
         c.arg("-v").arg(m);
     }
-    c.arg(RESTIC).args(args).kill_on_drop(true);
+    c.args(restic_args(repo.class.as_deref(), args)).kill_on_drop(true);
     c
+}
+
+/// What follows the mounts in `docker run`: the image and restic's arguments, with the target's
+/// storage class. In Deep Archive restic keeps only file data (its config, keys, snapshots, index
+/// and folder trees stay in Standard, so backups work as usual), and so:
+/// - retention repacks only the Standard tree packs with `--repack-cacheable-only`, never reading
+///   archived data (`--max-unused unlimited` would not do: prune still repacks small data packs);
+/// - restores ask S3 to thaw the archived packs they need and wait for them, up to 48 hours.
+fn restic_args(class: Option<&str>, args: &[&str]) -> Vec<String> {
+    let deep = class == Some(DEEP_ARCHIVE);
+    let thaw = deep && args.first() == Some(&"restore");
+    let mut out = vec![];
+    if thaw {
+        out.extend(["-e".to_string(), "RESTIC_FEATURES=s3-restore".into()]);
+    }
+    out.push(RESTIC.to_string());
+    if let Some(class) = class {
+        out.extend(["-o".to_string(), format!("s3.storage-class={class}")]);
+    }
+    if thaw {
+        for o in ["s3.enable-restore=true", "s3.restore-days=7", "s3.restore-timeout=48h"] {
+            out.extend(["-o".to_string(), o.into()]);
+        }
+    }
+    out.extend(args.iter().map(|a| a.to_string()));
+    if deep && args.first() == Some(&"forget") {
+        out.push("--repack-cacheable-only".into());
+    }
+    out
+}
+
+/// Deep Archive: have S3 thaw what a restore of `include` needs and wait for it (up to 48 hours) by
+/// restoring it into the throwaway restic container. It then stays readable for 7 days, so the real
+/// restore after it (and any downtime around that) does not wait.
+async fn thaw(cli: Command, repo: &Repo, snapshot: &str, include: &str) -> Result<()> {
+    if repo.archived() {
+        crate::proc::output(restic_on(cli, repo, &[], &["restore", snapshot, "--target", "/thaw", "--include", include])).await.context("thawing the backup from Deep Archive")?;
+    }
+    Ok(())
+}
+
+/// Whether a job's backups are in Deep Archive, where a restore first waits up to 48 hours for S3.
+pub fn archived(app: &App, j: &Job) -> bool {
+    target(app, &j.target_id).is_ok_and(|t| t.storage_class() == Some(DEEP_ARCHIVE))
 }
 
 async fn ensure_repo(repo: &Repo) -> Result<()> {
@@ -273,6 +335,8 @@ pub async fn restore(app: &AppState, run_id: &str, test: bool) -> Result<String>
     let repo = repo(app, &t)?;
     let restore_id = start_run(app, &j.id, if test { "test-restore" } else { "restore" }, Some(&snapshot))?;
     let result = match j.kind.as_str() {
+        // Reading archived data takes S3 up to 48 hours, so a test checks only what is in Standard.
+        _ if test && repo.archived() => verify_snapshot(&repo, &snapshot).await,
         "database" => restore_database(app, &j, &repo, &snapshot, test).await,
         "volume" if !test => restore_volume(app, &j, &repo, &snapshot).await,
         "volume" => verify_snapshot(&repo, &snapshot).await,
@@ -284,8 +348,13 @@ pub async fn restore(app: &AppState, run_id: &str, test: bool) -> Result<String>
 }
 
 async fn verify_snapshot(repo: &Repo, snapshot: &str) -> Result<String> {
-    crate::proc::output(restic_cmd(repo, &[], &["check", "--read-data-subset=5%"])).await?;
+    // Without --read-data, check reads only the index and folder trees, which stay in Standard.
+    let check: &[&str] = if repo.archived() { &["check"] } else { &["check", "--read-data-subset=5%"] };
+    crate::proc::output(restic_cmd(repo, &[], check)).await?;
     crate::proc::output(restic_cmd(repo, &[], &["ls", snapshot])).await?;
+    if repo.archived() {
+        return Ok("The snapshot is listed and the repository's index and folder trees passed their integrity check. The data itself is in S3 Glacier Deep Archive, so it was not read; a real restore thaws it first, which takes up to 48 hours.".into());
+    }
     Ok("The snapshot is readable and the repository passed its integrity check.".into())
 }
 
@@ -296,6 +365,8 @@ async fn restore_database(app: &AppState, j: &Job, repo: &Repo, snapshot: &str, 
     }
     let db = databases::preset(engine);
     let path = format!("/{}/{}", s.name, db.dump_file);
+    // `restic dump` cannot thaw archived data itself.
+    thaw(Command::new("docker"), repo, snapshot, &path).await?;
     let (node, container, scratch_name) = if test {
         let (node, id, name) = scratch_database(app, &s).await?;
         (node, id, Some(name))
@@ -362,6 +433,8 @@ fn volume_name(j: &Job) -> Result<&str> {
 
 async fn restore_volume(app: &AppState, j: &Job, repo: &Repo, snapshot: &str) -> Result<String> {
     let vol = volume_name(j)?;
+    // Before anything stops, so the service keeps running while S3 thaws the data.
+    thaw(crate::nodes::docker_cli(app, &volume_node(app, j))?, repo, snapshot, &format!("/data/{vol}")).await?;
     let users: Vec<runtime::Replica> = match &j.service_id {
         Some(sid) => runtime::replicas(app, sid).await?.into_iter().filter(|r| r.state == "running").collect(),
         None => vec![],
@@ -452,6 +525,27 @@ mod tests {
         assert_eq!(summary(out), (Some("abc123".into()), Some(42)));
         assert!(valid_schedule("0 3 * * *"));
         assert!(!valid_schedule("every day"));
+    }
+
+    #[test]
+    fn deep_archive_args() {
+        let s3 = |class: &str| Target { id: "t".into(), kind: "s3".into(), config: serde_json::json!({ "storage_class": class }) };
+        let local = Target { id: "t".into(), kind: "local".into(), config: serde_json::json!({ "storage_class": "DEEP_ARCHIVE" }) };
+        assert_eq!(s3("STANDARD").storage_class(), None);
+        assert_eq!(local.storage_class(), None);
+        let forget = ["forget", "--tag", "job:x", "--keep-last", "7", "--prune"];
+        let deep = restic_args(s3("DEEP_ARCHIVE").storage_class(), &forget);
+        assert!(deep.windows(2).any(|w| w == ["-o", "s3.storage-class=DEEP_ARCHIVE"]), "{deep:?}");
+        assert!(deep.ends_with(&["--prune".to_string(), "--repack-cacheable-only".to_string()]), "{deep:?}");
+        let restore = restic_args(Some("DEEP_ARCHIVE"), &["restore", "abc"]);
+        assert_eq!(restore[..2], ["-e", "RESTIC_FEATURES=s3-restore"]);
+        assert!(restore.contains(&"s3.enable-restore=true".to_string()), "{restore:?}");
+        assert_eq!(restic_args(Some("GLACIER_IR"), &forget)[..3], [RESTIC, "-o", "s3.storage-class=GLACIER_IR"]);
+        for plain in [s3("STANDARD"), local] {
+            let args = restic_args(plain.storage_class(), &forget);
+            assert_eq!(args[0], RESTIC);
+            assert!(!args.iter().any(|a| a.contains("storage-class") || a == "--repack-cacheable-only"), "{args:?}");
+        }
     }
 
     /// A consumer that talks a lot before reading (restic's progress) must not deadlock the pipe.

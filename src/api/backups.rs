@@ -14,7 +14,14 @@ use serde_json::{Value, json};
 
 pub async fn list_targets(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
     a.require_servers("needs the owner or a role on all projects")?;
-    let rows = app.db.rows("SELECT id, name, kind, created_at FROM backup_targets ORDER BY created_at", [], row_json)?;
+    let mut rows = app.db.rows("SELECT id, name, kind, created_at FROM backup_targets ORDER BY created_at", [], row_json)?;
+    for row in &mut rows {
+        if let Some(id) = row["id"].as_str()
+            && let Ok(t) = backup::target(&app, id)
+        {
+            row["storage_class"] = json!(t.storage_class());
+        }
+    }
     Ok(Json(json!({ "targets": rows })))
 }
 
@@ -35,6 +42,12 @@ pub async fn create_target(State(app): State<AppState>, Owner(a): Owner, Json(b)
         if b.config.get(*k).and_then(|v| v.as_str()).is_none_or(|v| v.is_empty()) {
             return Err(ApiError::bad_request(format!("{} targets need {k}", b.kind)));
         }
+    }
+    if let Some(class) = b.config.get("storage_class")
+        && !class.is_null()
+        && !(b.kind == "s3" && class.as_str().is_some_and(|c| backup::STORAGE_CLASSES.contains(&c)))
+    {
+        return Err(ApiError::bad_request("storage_class is STANDARD, STANDARD_IA, GLACIER_IR or DEEP_ARCHIVE, and only s3 targets have one"));
     }
     if b.kind == "local" && !b.config["path"].as_str().unwrap_or("").starts_with('/') {
         return Err(ApiError::bad_request("local targets need an absolute path"));
@@ -219,6 +232,16 @@ pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<St
     }
     app.audit(Some(&a.0), if test { "backup.test_restore" } else { "backup.restore" }, project.as_deref(), j.service_id.as_deref(), Some(&run_id), None);
     let (app2, rid) = (app.clone(), run_id.clone());
+    if !test && backup::archived(&app, &j) {
+        // S3 takes up to 48 hours to thaw the data, longer than a request should wait; the run records how it went.
+        tokio::spawn(async move {
+            if let Err(e) = backup::restore(&app2, &rid, false).await {
+                tracing::warn!("restoring backup run {rid} failed: {e:#}");
+            }
+        });
+        let msg = "The restore started. This backup is in S3 Glacier Deep Archive, so S3 first thaws it, which can take up to 48 hours. It shows up in the job's runs and gets its result there when it finishes.";
+        return Ok(Json(json!({ "ok": true, "message": msg })));
+    }
     let msg = detached(async move { backup::restore(&app2, &rid, test).await }).await?.map_err(bad)?;
     Ok(Json(json!({ "ok": true, "message": msg })))
 }

@@ -6,23 +6,33 @@ on:
     paths-ignore: [website/**, "*.md", docs/**]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-24.04
+    # act image + Rust (clippy included) and Node 24 preinstalled: no toolchain download or setup-node per run
+    container: ghcr.io/catthehacker/ubuntu:rust-24.04
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 24
-      - name: Build the web panel
-        run: |
-          if [ -f web/package.json ]; then cd web && npm ci && npm run build; else mkdir -p web/dist && echo '<!doctype html><title>Tugport</title>' > web/dist/index.html; fi
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-          components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo clippy --locked -- -D clippy::unwrap_used -D clippy::expect_used
-      - run: cargo test --locked
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Web panel, clippy and tests
+        run: |
+          rustc --version; node --version
+          # The web build runs beside the Rust compile; the debug build reads web/dist at run time, not compile time.
+          mkdir -p web/dist
+          (cd web && npm ci --no-audit --no-fund && npm run build) > web.log 2>&1 &
+          web=$!
+          cargo clippy --locked -- -D clippy::unwrap_used -D clippy::expect_used
+          cargo test --locked --no-run
+          wait $web && cat web.log || { cat web.log; exit 1; }
+          cargo test --locked

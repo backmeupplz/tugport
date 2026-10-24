@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { ApiError, MeContext, canSeeServers, clearCache, del, get, onUnauthorized, post, put, startEvents, stopEvents, useNodes, type Me } from "./api";
 import { useUrl } from "./router";
 import { Icon, type IconName } from "./icons";
-import { CodeBlock, CodeInput, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useDialog, useSubmit } from "./ui";
+import { CodeBlock, CodeInput, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useDialog, useStoredChoice, useSubmit } from "./ui";
 import { copyText, matchPath } from "./util";
 import { Access, Audit, NewAgent, NewPerson, UserPage } from "./pages/access";
 import { Actions } from "./pages/actions";
@@ -135,23 +135,8 @@ const THEMES: [Theme, string, IconName][] = [
 
 /** Whether the desktop sidebar is folded to icons, remembered per browser. */
 function useCollapsed(): [boolean, () => void] {
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem("tugport-sidebar") === "collapsed";
-    } catch {
-      return false;
-    }
-  });
-  const toggle = () => {
-    try {
-      if (collapsed) localStorage.removeItem("tugport-sidebar");
-      else localStorage.setItem("tugport-sidebar", "collapsed");
-    } catch {
-      // Without storage the choice lasts until the page reloads.
-    }
-    setCollapsed(!collapsed);
-  };
-  return [collapsed, toggle];
+  const [state, set] = useStoredChoice<"open" | "collapsed">("tugport-sidebar", "open");
+  return [state === "collapsed", () => set(state === "collapsed" ? "open" : "collapsed")];
 }
 
 /** The public address of the panel's server, copied with a tap (people who see servers only). */

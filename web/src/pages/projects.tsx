@@ -5,7 +5,7 @@ import { Icon, KindIcon } from "../icons";
 import { NewService } from "./new-service";
 import { ROLES, atLeast, del, hasGrant, patch, post, put, useApi, useMe, useNodes, type Event, type Project, type Role, type Source, type Status, type User } from "../api";
 import { ServerSummary } from "./observe";
-import { Action, Card, CardSkeleton, Empty, ErrorBox, Field, FormButtons, IconButton, Input, Loaded, LoadingPage, Modal, NameInput, Page, Pill, Rows, RowsSkeleton, Select, Skel, StateDot, toast, useForm, useSubmit } from "../ui";
+import { Action, Card, CardSkeleton, Empty, ErrorBox, Field, FormButtons, IconButton, Input, Loaded, LoadingPage, Modal, NameInput, Page, Pill, Rows, RowsSkeleton, Select, Skel, StateDot, toast, useForm, useStoredChoice, useSubmit } from "../ui";
 
 export interface ProjectDetail {
   project: { id: string; name: string; description: string | null; created_at: number };
@@ -56,16 +56,40 @@ export function Projects() {
   const services = useApi<{ services: ServiceItem[] }>("/services", PROJECTS_LIVE);
   const nodes = useNodes();
   const [open, setOpen] = useState(false);
+  const [layout, setLayout] = useStoredChoice<"grid" | "list">("tugport-projects", "grid");
   const canCreate = me.principal.is_owner || atLeast(me.principal.all_projects_role, "operator");
+  const of = (p: Project) => services.data?.services.filter((x) => x.project_id === p.id);
   return (
     <Page
       title="Projects"
       actions={
-        canCreate && (
-          <button class="btn btn-primary" onClick={() => setOpen(true)}>
-            New project
-          </button>
-        )
+        <>
+          <div role="group" aria-label="Layout" class="flex rounded-lg border border-line p-0.5">
+            {(
+              [
+                ["grid", "Grid"],
+                ["list", "List"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                aria-pressed={layout === id}
+                aria-label={`Show as a ${label.toLowerCase()}`}
+                title={label}
+                class={`grid size-8 place-items-center rounded-md ${layout === id ? "bg-raised text-text" : "text-muted hover:text-text"}`}
+                onClick={() => setLayout(id)}
+              >
+                <Icon name={id} />
+              </button>
+            ))}
+          </div>
+          {canCreate && (
+            <button class="btn btn-primary" onClick={() => setOpen(true)}>
+              New project
+            </button>
+          )}
+        </>
       }
     >
       {nodes && nodes.nodes.length > 0 && (
@@ -75,7 +99,18 @@ export function Projects() {
           ))}
         </section>
       )}
-      <Loaded r={r} skeleton={<ProjectsSkeleton />}>
+      <Loaded
+        r={r}
+        skeleton={
+          layout === "list" ? (
+            <CardSkeleton>
+              <RowsSkeleton n={8} />
+            </CardSkeleton>
+          ) : (
+            <ProjectsSkeleton />
+          )
+        }
+      >
         {(d) =>
           d.projects.length === 0 ? (
             <Empty title="No projects yet">
@@ -83,10 +118,16 @@ export function Projects() {
                 ? "A project groups services that work together, and services in the same project reach each other by name on a private network."
                 : "You do not have access to any project yet, so ask the owner to add you to one."}
             </Empty>
+          ) : layout === "list" ? (
+            <Card pad={false}>
+              {d.projects.map((p) => (
+                <ProjectRows key={p.id} project={p} services={of(p)} />
+              ))}
+            </Card>
           ) : (
             <div class="gap-3 sm:columns-2 xl:columns-3">
               {d.projects.map((p) => (
-                <ProjectCard key={p.id} project={p} services={services.data?.services.filter((x) => x.project_id === p.id)} />
+                <ProjectCard key={p.id} project={p} services={of(p)} />
               ))}
             </div>
           )
@@ -103,8 +144,7 @@ const limitedRole = (role: Role | null) => (role && role !== "admin" ? role : nu
 function ProjectCard(props: { project: Project; services?: ServiceItem[] }) {
   const p = props.project;
   const role = limitedRole(p.role);
-  // Problems first, so they stand out.
-  const list = props.services && [...props.services].sort((a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name));
+  const list = sorted(props.services);
   return (
     <section class="card mb-3 break-inside-avoid">
       <a href={`/projects/${p.name}`} class="flex items-center gap-2 rounded-t-xl px-4 pt-3.5 pb-2 hover:text-accent-text">
@@ -132,6 +172,38 @@ function ProjectCard(props: { project: Project; services?: ServiceItem[] }) {
               </li>
             ))}
         {list?.length === 0 && <li class="px-4 py-1.5 text-[13px] text-muted">No services yet.</li>}
+      </ul>
+    </section>
+  );
+}
+
+/** Problems first, so they stand out; then by name. */
+const sorted = (list?: ServiceItem[]) => list && [...list].sort((a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name));
+
+/** One project in the list layout: a heading row, then a row per service. */
+function ProjectRows(props: { project: Project; services?: ServiceItem[] }) {
+  const p = props.project;
+  const role = limitedRole(p.role);
+  const list = sorted(props.services);
+  return (
+    <section class="border-b border-line last:border-b-0">
+      <a href={`/projects/${p.name}`} class="flex items-center gap-2 bg-raised/40 px-4 py-2.5 hover:text-accent-text md:px-5">
+        <h2 class="min-w-0 flex-1 truncate font-semibold">{p.name}</h2>
+        {role && <span class="chip">{role}</span>}
+        <span class="text-xs text-muted">{p.services === 1 ? "1 service" : `${p.services} services`}</span>
+      </a>
+      {list?.length === 0 && <p class="px-4 py-2 text-[13px] text-muted md:px-5">No services yet.</p>}
+      <ul class="divide-y divide-line/60">
+        {(list ?? []).map((x) => (
+          <li key={x.id}>
+            <a href={`/projects/${p.name}/${x.name}`} class="grid grid-cols-[auto_1fr_auto] items-center gap-x-3 px-4 py-2 text-sm hover:bg-raised/60 sm:grid-cols-[auto_1fr_7rem_8rem] md:px-5">
+              <StateDot state={x.state} />
+              <span class="min-w-0 truncate">{x.name}</span>
+              <span class="hidden text-xs text-muted sm:block">{x.kind}</span>
+              <span class="text-right text-xs text-muted">{x.state === "running" ? `${x.running} of ${x.desired} running` : x.state}</span>
+            </a>
+          </li>
+        ))}
       </ul>
     </section>
   );

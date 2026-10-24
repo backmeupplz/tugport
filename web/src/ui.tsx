@@ -552,6 +552,27 @@ export function StateDot(props: { state: string }) {
   return <span class={`size-2 shrink-0 rounded-full ${bg}`} title={props.state} aria-label={props.state} role="img" />;
 }
 
+/** A small choice remembered per browser (a layout, a folded sidebar); `fallback` until set. */
+export function useStoredChoice<T extends string>(key: string, fallback: T): [T, (v: T) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      return (localStorage.getItem(key) as T | null) ?? fallback;
+    } catch {
+      return fallback;
+    }
+  });
+  const choose = (v: T) => {
+    try {
+      if (v === fallback) localStorage.removeItem(key);
+      else localStorage.setItem(key, v);
+    } catch {
+      // Without storage the choice lasts until the page reloads.
+    }
+    setValue(v);
+  };
+  return [value, choose];
+}
+
 /** Page tabs. On phones they scroll sideways, start scrolled to the current one and fade at the edges. */
 export function Tabs(props: { items: [string, string, string][]; current: string; label: string }) {
   const ref = useRef<HTMLElement>(null);

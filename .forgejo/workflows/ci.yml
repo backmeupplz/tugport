@@ -14,16 +14,23 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     # act image + Rust (clippy included) and Node 24 preinstalled: no toolchain download or setup-node per run
-    container: ghcr.io/catthehacker/ubuntu:rust-24.04
+    container:
+      image: ghcr.io/catthehacker/ubuntu:rust-24.04
+      # Build output and crates live in RAM: the runner's disk is the bottleneck, and a big container layer
+      # also makes the runner's cleanup after the job slow.
+      options: --tmpfs /ramdisk:exec
     env:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_HOME: /ramdisk/cargo
+      CARGO_TARGET_DIR: /ramdisk/target
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          workspaces: . -> ../../../ramdisk/target # = CARGO_TARGET_DIR, relative to /workspace/<owner>/<repo>
           save-if: true # TEMP: measure warm runs on the PR
       - name: Web panel, clippy and tests
         run: |

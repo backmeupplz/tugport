@@ -1,12 +1,14 @@
 // Cloud accounts, the machines Tugport creates in them, and server pools. Owner only: these spend money.
 import { useRef, useState } from "preact/hooks";
 import { del, patch, post, useApi, useMe, type Event } from "../api";
+import { Icon } from "../icons";
 import {
   Action,
   Card,
   ErrorBox,
   Field,
   FormButtons,
+  IconButton,
   Input,
   Loaded,
   Loading,
@@ -143,12 +145,13 @@ export function CloudPage() {
                       <span class="block text-xs text-muted">Added {ago(a.created_at)}</span>
                     </span>
                     <Action
-                      class="btn btn-ghost text-bad"
+                      class="btn btn-ghost btn-sm px-2 text-bad"
+                      label={`Remove the account ${a.name}`}
                       confirm={`Remove the account ${a.name}? Tugport forgets its credentials. An account that still has machines or pools cannot be removed.`}
                       run={() => del(`/cloud/accounts/${a.id}`).then(accounts.reload)}
                       done="Removed the account."
                     >
-                      Remove
+                      <Icon name="trash" />
                     </Action>
                   </li>
                 )}
@@ -217,16 +220,15 @@ export function CloudPage() {
                         </p>
                       </div>
                       <span class="flex gap-2">
-                        <button class="btn" onClick={() => setDialog({ pool: p })}>
-                          Edit
-                        </button>
+                        <IconButton icon="edit" label={`Edit the pool ${p.name}`} onClick={() => setDialog({ pool: p })} />
                         <Action
-                          class="btn btn-ghost text-bad"
+                          class="btn btn-ghost btn-sm px-2 text-bad"
+                          label={`Delete the pool ${p.name}`}
                           confirm={`Delete the pool ${p.name}? Its servers stay and keep costing money, and Tugport stops adding or removing servers for it. To remove the servers as well, set the fewest and most servers to 0 first and wait until the pool has shrunk.`}
                           run={() => del(`/cloud/pools/${p.id}`).then(pools.reload)}
                           done="Deleted the pool. Its servers stay."
                         >
-                          Delete
+                          <Icon name="trash" />
                         </Action>
                       </span>
                     </li>
@@ -272,12 +274,13 @@ function MachineRow(props: { m: Machine; accounts: Account[]; pools: Pool[] | un
       </div>
       {!m.node_id && (
         <Action
-          class="btn btn-ghost text-bad"
+          class="btn btn-ghost btn-sm px-2 text-bad"
+          label={`Delete ${m.name}`}
           confirm={`Delete ${m.name} at ${provider}? It has not joined, so nothing runs on it.`}
           run={() => del(`/cloud/servers/${m.id}`).then(props.onChanged)}
           done="Deleted the machine."
         >
-          Delete
+          <Icon name="trash" />
         </Action>
       )}
     </li>

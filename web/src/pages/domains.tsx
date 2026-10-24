@@ -1,7 +1,8 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { atLeast, del, patch, post, type Domain } from "../api";
-import { Action, Card, Check, Empty, Field, FormButtons, Input, Modal, Select, TextArea, useForm, useSubmit } from "../ui";
+import { Icon } from "../icons";
+import { Action, Card, Check, Empty, Field, FormButtons, IconButton, Input, Modal, Select, TextArea, useForm, useSubmit } from "../ui";
 import { lines, num, patchAt, removeAt, str } from "../util";
 import type { Ctx } from "./service";
 
@@ -130,11 +131,14 @@ export function Domains({ c }: { c: Ctx }) {
                 </div>
                 {canEdit && (
                   <span class="flex gap-2">
-                    <button class="btn" onClick={() => setEdit({ id: d.id, f: toForm(d) })}>
-                      Edit
-                    </button>
-                    <Action class="btn btn-ghost text-bad" confirm={`Remove ${d.host}${d.path === "/" ? "" : d.path}?`} run={() => del(`/domains/${d.id}`).then(c.reload)}>
-                      Remove
+                    <IconButton icon="edit" label={`Edit ${d.host}`} onClick={() => setEdit({ id: d.id, f: toForm(d) })} />
+                    <Action
+                      class="btn btn-ghost btn-sm px-2 text-bad"
+                      label={`Remove ${d.host}`}
+                      confirm={`Remove ${d.host}${d.path === "/" ? "" : d.path}?`}
+                      run={() => del(`/domains/${d.id}`).then(c.reload)}
+                    >
+                      <Icon name="trash" />
                     </Action>
                   </span>
                 )}
@@ -227,9 +231,7 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
                 <input type="checkbox" checked={r.permanent} onChange={(e) => redirect(i, { permanent: e.currentTarget.checked })} />
                 Permanent
               </label>
-              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ redirects: removeAt(f.redirects, i) })}>
-                Remove
-              </button>
+              <IconButton icon="trash" label="Remove this redirect" class="mb-1 text-bad" onClick={() => set({ redirects: removeAt(f.redirects, i) })} />
             </div>
           ))}
           <button type="button" class="btn" onClick={() => set({ redirects: [...f.redirects, { from: "", to: "", permanent: false }] })}>
@@ -251,9 +253,7 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
                 value={b.password}
                 onInput={(e) => basic(i, { password: e.currentTarget.value })}
               />
-              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ basic: removeAt(f.basic, i) })}>
-                Remove
-              </button>
+              <IconButton icon="trash" label="Remove this login" class="mb-1 text-bad" onClick={() => set({ basic: removeAt(f.basic, i) })} />
             </div>
           ))}
           <button type="button" class="btn" onClick={() => set({ basic: [...f.basic, { user: "", password: "" }] })}>

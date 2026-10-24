@@ -222,3 +222,27 @@ pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<St
     let msg = detached(async move { backup::restore(&app2, &rid, test).await }).await?.map_err(bad)?;
     Ok(Json(json!({ "ok": true, "message": msg })))
 }
+
+/// The latest backup and restore runs across every job the caller can see, for the Actions page.
+pub async fn recent_runs(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    let rows = app.db.rows(
+        "SELECT r.id, r.job_id, r.kind, r.status, r.size_bytes, r.error, r.started_at, r.finished_at, j.kind AS job_kind, j.service_id, j.volume
+         FROM backup_runs r JOIN backup_jobs j ON j.id = r.job_id ORDER BY r.started_at DESC LIMIT 300",
+        [],
+        row_json,
+    )?;
+    let mut out = vec![];
+    for mut run in rows {
+        let service = run["service_id"].as_str().and_then(|sid| crate::store::service(&app, sid).ok().flatten());
+        if require_job(&a, &service.as_ref().map(|s| s.project_id.clone()), Role::Viewer).is_err() {
+            continue;
+        }
+        run["service"] = json!(service.as_ref().map(|s| &s.name));
+        run["project"] = json!(service.as_ref().map(|s| &s.project));
+        out.push(run);
+        if out.len() == 100 {
+            break;
+        }
+    }
+    Ok(Json(json!({ "runs": out })))
+}

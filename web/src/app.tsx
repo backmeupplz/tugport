@@ -1,11 +1,12 @@
 import type { ComponentChildren, ComponentType } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { ApiError, MeContext, canSeeServers, del, get, onUnauthorized, post, put, startEvents, stopEvents, type Me } from "./api";
+import { ApiError, MeContext, canSeeServers, clearCache, del, get, onUnauthorized, post, put, startEvents, stopEvents, useNodes, type Me } from "./api";
 import { useUrl } from "./router";
 import { Icon, type IconName } from "./icons";
 import { CodeBlock, CodeInput, Empty, ErrorBox, Field, Modal, Page, Toasts, toast, useDialog, useSubmit } from "./ui";
-import { matchPath } from "./util";
+import { copyText, matchPath } from "./util";
 import { Access, Audit, NewAgent, NewPerson, UserPage } from "./pages/access";
+import { Actions } from "./pages/actions";
 import { Login, Setup } from "./pages/auth";
 import { CloudPage } from "./pages/cloud";
 import { ProjectPage, Projects } from "./pages/projects";
@@ -20,6 +21,7 @@ const ROUTES: [string, ComponentType<any>][] = [
   ["/", Projects],
   ["/projects/:project", ProjectPage],
   ["/projects/:project/:service/:tab?", ServicePage],
+  ["/actions", Actions],
   ["/servers", Servers],
   ["/servers/cloud", CloudPage],
   ["/servers/:id", ServerPage],
@@ -91,6 +93,7 @@ export function App() {
         reloadMe={load}
         signOut={async () => {
           await post("/auth/logout").catch(() => {});
+          clearCache();
           setMe(null);
           setGate("login");
         }}
@@ -130,10 +133,52 @@ const THEMES: [Theme, string, IconName][] = [
   ["dark", "Dark", "moon"],
 ];
 
+/** Whether the desktop sidebar is folded to icons, remembered per browser. */
+function useCollapsed(): [boolean, () => void] {
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("tugport-sidebar") === "collapsed";
+    } catch {
+      return false;
+    }
+  });
+  const toggle = () => {
+    try {
+      if (collapsed) localStorage.removeItem("tugport-sidebar");
+      else localStorage.setItem("tugport-sidebar", "collapsed");
+    } catch {
+      // Without storage the choice lasts until the page reloads.
+    }
+    setCollapsed(!collapsed);
+  };
+  return [collapsed, toggle];
+}
+
+/** The public address of the panel's server, copied with a tap (people who see servers only). */
+function ServerAddress(props: { compact: boolean }) {
+  const address = useNodes()?.nodes.find((n) => n.local)?.address;
+  if (!address) return null;
+  const copy = async () => toast((await copyText(address)) ? `Copied ${address}.` : "Copying did not work; select the address instead.", "ok");
+  return props.compact ? (
+    <button type="button" class="mx-auto grid size-9 place-items-center rounded-lg text-dim hover:bg-raised hover:text-text" title={`Server address ${address}, click to copy`} aria-label={`Copy the server address ${address}`} onClick={copy}>
+      <Icon name="copy" />
+    </button>
+  ) : (
+    <button type="button" class="group mx-3 flex w-[calc(100%-1.5rem)] items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-raised" title="Click to copy" onClick={copy}>
+      <span class="min-w-0 flex-1">
+        <span class="block text-xs text-muted">Server address</span>
+        <span class="block truncate font-mono text-[13px]">{address}</span>
+      </span>
+      <Icon name="copy" class="size-4 text-muted group-hover:text-text" />
+    </button>
+  );
+}
+
 function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => void }) {
   const { me } = props;
   const url = useUrl();
   const [drawer, setDrawer] = useState(false);
+  const [collapsed, toggleCollapsed] = useCollapsed();
   const [twofa, setTwofa] = useState(false);
   const [theme, setTheme] = useTheme();
   const path = url.split("?")[0];
@@ -146,33 +191,67 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
   }, [url]);
   const nav: [string, string, IconName, boolean][] = [
     ["Projects", "/", "projects", path === "/" || path.startsWith("/projects")],
+    ["Actions", "/actions", "actions", path.startsWith("/actions")],
     ...(canSeeServers(me) ? [["Servers", "/servers", "servers", path.startsWith("/server")] as [string, string, IconName, boolean]] : []),
     ["Access", "/access", "access", path.startsWith("/access")],
     ["Settings", "/settings", "settings", path.startsWith("/settings")],
   ];
-  const sidebar = (
+  // `compact`: the folded desktop sidebar, icons only.
+  const sidebar = (compact: boolean) => (
     <div class="flex h-full flex-col">
-      <a href="/" class="flex items-center gap-2.5 px-5 pt-5 pb-5">
-        <img src="/logo.svg" alt="" class="size-7" />
-        <span class="text-[15px] font-semibold tracking-tight">Tugport</span>
-      </a>
-      <nav aria-label="Main" class="flex-1 px-3">
+      <div class={`flex items-center gap-2.5 pt-5 pb-5 ${compact ? "flex-col px-2" : "px-5"}`}>
+        <a href="/" class="flex min-w-0 flex-1 items-center gap-2.5" aria-label="Tugport">
+          <img src="/logo.svg" alt="" class="size-7" />
+          {!compact && <span class="text-[15px] font-semibold tracking-tight">Tugport</span>}
+        </a>
+        <button
+          type="button"
+          class="hidden size-8 place-items-center rounded-lg text-muted hover:bg-raised hover:text-text md:grid"
+          aria-label={compact ? "Expand the sidebar" : "Collapse the sidebar"}
+          title={compact ? "Expand the sidebar" : "Collapse the sidebar"}
+          onClick={toggleCollapsed}
+        >
+          <Icon name="sidebar" />
+        </button>
+      </div>
+      <nav aria-label="Main" class={`flex-1 ${compact ? "px-2" : "px-3"}`}>
         <ul class="space-y-0.5">
           {nav.map(([label, href, icon, active]) => (
             <li key={href}>
               <a
                 href={href}
                 aria-current={active ? "page" : undefined}
-                class={`flex h-11 items-center gap-3 rounded-lg px-3 text-[15px] font-medium md:h-9 md:text-sm ${active ? "bg-raised text-text" : "text-dim hover:bg-raised/60 hover:text-text"}`}
+                aria-label={compact ? label : undefined}
+                title={compact ? label : undefined}
+                class={`flex h-11 items-center gap-3 rounded-lg text-[15px] font-medium md:h-9 md:text-sm ${compact ? "justify-center" : "px-3"} ${active ? "bg-raised text-text" : "text-dim hover:bg-raised/60 hover:text-text"}`}
               >
                 <Icon name={icon} class={`size-4 ${active ? "text-accent" : ""}`} />
-                {label}
+                {!compact && label}
               </a>
             </li>
           ))}
         </ul>
       </nav>
-      <Account me={me} theme={theme} setTheme={setTheme} openTwofa={() => setTwofa(true)} signOut={props.signOut} />
+      <div class="space-y-0.5 pb-2">
+        <ServerAddress compact={compact} />
+        <a
+          href="https://github.com/backmeupplz/tugport/issues"
+          target="_blank"
+          rel="noreferrer"
+          title={compact ? "Support: report a problem or ask on GitHub" : undefined}
+          aria-label={compact ? "Support" : undefined}
+          class={`flex h-9 items-center gap-3 rounded-lg text-sm text-dim hover:bg-raised hover:text-text ${compact ? "mx-auto w-9 justify-center" : "mx-3 px-3"}`}
+        >
+          <Icon name="help" />
+          {!compact && (
+            <>
+              <span class="flex-1">Support</span>
+              <Icon name="external" class="size-3.5 text-muted" />
+            </>
+          )}
+        </a>
+      </div>
+      <Account me={me} compact={compact} theme={theme} setTheme={setTheme} openTwofa={() => setTwofa(true)} signOut={props.signOut} />
     </div>
   );
 
@@ -181,9 +260,9 @@ function Shell(props: { me: Me; reloadMe: () => Promise<void>; signOut: () => vo
       <a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:left-2 focus:top-2 focus:z-50 focus:rounded focus:bg-surface focus:px-3 focus:py-2">
         Skip to content
       </a>
-      <aside class="hidden w-60 shrink-0 border-r border-line md:sticky md:top-0 md:block md:h-dvh md:overflow-y-auto">{sidebar}</aside>
+      <aside class={`hidden shrink-0 border-r border-line md:sticky md:top-0 md:block md:h-dvh md:overflow-y-auto ${collapsed ? "w-16" : "w-60"}`}>{sidebar(collapsed)}</aside>
       <Drawer open={drawer} onClose={() => setDrawer(false)}>
-        {sidebar}
+        {sidebar(false)}
       </Drawer>
       <div class="min-w-0 flex-1">
         <header class="sticky top-0 z-30 flex items-center justify-between border-b border-line bg-bg/85 px-4 py-2.5 backdrop-blur md:hidden">
@@ -228,7 +307,7 @@ function Drawer(props: { open: boolean; onClose: () => void; children: Component
  * Who is signed in, with a menu (a popover, so it closes on Escape or an outside click) for
  * two-factor sign-in, the theme and signing out.
  */
-function Account(props: { me: Me; theme: Theme; setTheme: (t: Theme) => void; openTwofa: () => void; signOut: () => void }) {
+function Account(props: { me: Me; compact: boolean; theme: Theme; setTheme: (t: Theme) => void; openTwofa: () => void; signOut: () => void }) {
   const { principal } = props.me;
   const menu = useRef<HTMLDivElement>(null);
   const item = "flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left hover:bg-raised";
@@ -237,21 +316,26 @@ function Account(props: { me: Me; theme: Theme; setTheme: (t: Theme) => void; op
     f();
   };
   return (
-    <div class="border-t border-line p-3">
+    <div class={`border-t border-line ${props.compact ? "p-2" : "p-3"}`}>
       <button
         type="button"
-        class="flex w-full items-center gap-2.5 rounded-lg p-2 text-left hover:bg-raised"
+        class={`flex w-full items-center gap-2.5 rounded-lg p-2 text-left hover:bg-raised ${props.compact ? "justify-center" : ""}`}
         aria-label={`Account: ${principal.name}`}
+        title={props.compact ? principal.name : undefined}
         onClick={() => menu.current?.togglePopover?.()}
       >
         <span class="grid size-8 shrink-0 place-items-center rounded-full bg-accent text-sm font-semibold text-accent-ink" aria-hidden="true">
           {principal.name.slice(0, 1).toUpperCase()}
         </span>
-        <span class="min-w-0 flex-1">
-          <span class="block truncate font-medium">{principal.name}</span>
-          <span class="block text-xs text-muted">{principal.is_owner ? "Owner" : principal.kind === "agent" ? "Agent" : "Member"}</span>
-        </span>
-        <Icon name="updown" class="size-4 text-muted" />
+        {!props.compact && (
+          <>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate font-medium">{principal.name}</span>
+              <span class="block text-xs text-muted">{principal.is_owner ? "Owner" : principal.kind === "agent" ? "Agent" : "Member"}</span>
+            </span>
+            <Icon name="updown" class="size-4 text-muted" />
+          </>
+        )}
       </button>
       <div
         ref={menu}

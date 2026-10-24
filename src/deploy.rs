@@ -85,6 +85,11 @@ pub fn recent(app: &App, service_id: &str, limit: u32) -> Result<Vec<Deploy>> {
     Ok(app.db.rows(&format!("{SELECT} WHERE service_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2"), params![service_id, limit], row)?)
 }
 
+/// The newest deploys of every service, newest first.
+pub fn recent_all(app: &App, limit: u32) -> Result<Vec<Deploy>> {
+    Ok(app.db.rows(&format!("{SELECT} ORDER BY created_at DESC, rowid DESC LIMIT ?1"), params![limit], row)?)
+}
+
 pub const FINAL: &[&str] = &["live", "failed", "cancelled", "superseded"];
 
 #[derive(Default, Clone)]

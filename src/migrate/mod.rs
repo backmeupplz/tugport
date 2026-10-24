@@ -16,7 +16,7 @@ mod coolify;
 mod easypanel;
 
 use crate::app::{App, AppState, Settings};
-use crate::model::{BasicUser, DatabaseSpec, DomainOptions, Engine, Health, HealthKind, Port, Protocol, ServiceSpec, Source, Strategy};
+use crate::model::{BasicUser, DatabaseSpec, DomainOptions, Engine, Health, Port, Protocol, ServiceSpec, Source, Strategy};
 use crate::store::{self, Service};
 use crate::{databases, deploy, git, runtime, util};
 use anyhow::{Context, Result, anyhow, bail};
@@ -325,7 +325,7 @@ impl NewService {
             Engine::Mariadb => "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent",
             e => databases::preset(e).health,
         };
-        self.spec.health = Health { kind: HealthKind::Command, command: Some(check.into()), start_period_s: 30, ..Health::default() };
+        self.spec.health = Health::database(check);
         self.spec.rollout.strategy = Strategy::StopFirst;
         self.spec.rollout.health_timeout_s = 600;
         self.spec.database = Some(DatabaseSpec { engine, user: user.into(), database: database.into(), primary: None });
@@ -644,7 +644,7 @@ fn print_plan(plan: &Plan) {
     print_list("Needs attention", moved.iter().flat_map(|s| s.notes.iter().map(move |n| format!("{}: {n}", s.key))).collect());
     let skipped = plan.services.iter().filter(|s| s.cutover == Cutover::Unsupported).map(|s| format!("{}: {}", s.key, s.notes.join("; ")));
     print_list("Not moved", skipped.chain(plan.notes.iter().cloned()).collect());
-    let hooks = moved.iter().filter(|s| s.hook.is_some()).count();
+    let hooks = moved.iter().filter(|s| s.hook.is_some() && s.kind != "database").count();
     println!("\nCertificates: {} imported, so nothing is re-issued", plan.certs.len());
     if hooks > 0 {
         println!("Deploy webhooks: {hooks} old URLs keep working{}", plan.legacy_listen.as_ref().map(|l| format!(" (Tugport answers on {l} after the switch)")).unwrap_or_default());
@@ -792,10 +792,17 @@ fn import_service(app: &App, s: &NewService, provider: Option<&str>, j: &mut Jou
         None => j.services.push(moved),
     }
     save(app, j)?;
+    // A database has no source to deploy from, so its old webhook does not move.
+    let hook = s.hook.as_ref().filter(|_| s.kind != "database");
     app.db.exec(
         "INSERT INTO services (id, project_id, name, kind, spec, deploy_token_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-        params![id, project.id, s.name, s.kind, serde_json::to_string(&spec)?, s.hook.as_ref().map(util::sha256_hex), now],
+        params![id, project.id, s.name, s.kind, serde_json::to_string(&spec)?, hook.map(util::sha256_hex), now],
     )?;
+    if let Some(token) = hook {
+        // Kept sealed like a new service's, so the panel can show the URL.
+        let key = format!("hook:{id}");
+        app.set_sealed_state(&key, &key, token)?;
+    }
     for (k, v) in &s.env {
         store::set_env(app, &id, k, Some(v))?;
     }

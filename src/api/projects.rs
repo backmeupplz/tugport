@@ -5,7 +5,7 @@ use super::{ApiError, ApiResult, Auth, base_url, names, ok, project_or_404, visi
 use crate::app::AppState;
 use crate::auth::Role;
 use crate::databases;
-use crate::model::{Build, DatabaseSpec, DomainOptions, Engine, Health, HealthKind, Mount, ServiceSpec, Source, Strategy};
+use crate::model::{Build, DatabaseSpec, DomainOptions, Engine, Health, Mount, ServiceSpec, Source, Strategy};
 use crate::store::{self, Domain, Service};
 use crate::util;
 use axum::Json;
@@ -370,7 +370,8 @@ pub async fn create_service(State(app): State<AppState>, a: Auth, headers: Heade
         store::set_project_var(&app, &p.id, var, Some(url))?;
     }
     app.audit(Some(&a.0), "service.create", Some(&p.id), Some(&id), Some(&name), Some(&b.kind));
-    let hook = new_hook_url(&app, &id, &headers)?;
+    // A database has no source to deploy from, so no deploy webhook either.
+    let hook = if b.kind == "database" { None } else { Some(new_hook_url(&app, &id, &headers)?) };
     super::git::ensure_hook_soon(&app, &headers, &id)?;
     let database = database.map(|(url, var)| json!({ "url": url, "project_var": var }));
     Ok(Json(json!({ "id": id, "name": name, "kind": b.kind, "spec": spec, "deploy_hook": hook, "database": database })))
@@ -411,7 +412,7 @@ async fn prepare_database(p: &store::Project, name: &str, mut db: DatabaseSpec, 
     spec.source = Source::Image { image };
     spec.build = Build::Auto;
     spec.command = databases::command(db.engine);
-    spec.health = Health { kind: HealthKind::Command, command: Some(databases::preset(db.engine).health.into()), start_period_s: 30, ..Health::default() };
+    spec.health = Health::database(databases::preset(db.engine).health);
     // Two copies of a database must never share a data directory.
     spec.rollout.strategy = Strategy::StopFirst;
     spec.replicas = 1;
@@ -694,6 +695,9 @@ pub async fn get_hook(State(app): State<AppState>, a: Auth, headers: HeaderMap, 
 /// Replace the service's deploy webhook URL (the old one stops working).
 pub async fn rotate_hook(State(app): State<AppState>, a: Auth, headers: HeaderMap, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Operator)?;
+    if s.kind == "database" {
+        return Err(ApiError::bad_request("databases have no deploy webhook; redeploy or restart them from the panel"));
+    }
     let url = new_hook_url(&app, &s.id, &headers)?;
     a.audit_service(&app, "service.hook_rotated", &s, None);
     Ok(Json(json!({ "url": url })))

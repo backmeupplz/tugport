@@ -1,9 +1,9 @@
 // Logs, charts and the console of services, and the charts of servers.
 import type { JSX } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { get, useApi, type Replica, type Service } from "../api";
+import { get, useApi, type Node, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
-import { Card, Empty, ErrorBox, Field, Input, Loaded, Loading, Note, Select, errText } from "../ui";
+import { Card, Empty, ErrorBox, Field, Input, Loaded, Loading, Note, Pill, Select, Skel, errText } from "../ui";
 import { ago, bytes, clock, qs, sentence, toMs } from "../util";
 
 /** A log box that stays scrolled to the newest line, unless the reader scrolled up. `lines` changes as lines arrive. */
@@ -304,6 +304,63 @@ export interface Now {
   temp?: number | null;
   gpus: { index: number; name: string; util: number; mem_used: number; mem_total: number; temp: number | null; power: number | null }[];
   services: { id: string; cpu: number; memory: number; net_rx: number; net_tx: number; restarts: number }[];
+}
+
+/** One server's current numbers in a compact card, for the dashboard; links to its page. */
+export function ServerSummary(props: { node: Node }) {
+  const n = props.node;
+  const now = useMetrics<Now>(`/metrics/now${qs({ node: n.local ? null : n.id })}`);
+  const d = now.data?.at ? now.data : null;
+  const disk = d?.disks.find((x) => x.mount === "/") ?? d?.disks[0];
+  const stat = (label: string, value: string, sub: string, pct?: number) => {
+    const p = pct == null ? null : Math.min(100, Math.max(0, pct));
+    return (
+      <div class="min-w-0">
+        <p class="text-xs text-muted">{label}</p>
+        <p class="mt-0.5 truncate font-semibold tabular-nums">{value}</p>
+        <p class="truncate text-xs text-muted tabular-nums">{sub}</p>
+        {p != null && (
+          <div class="mt-1.5 h-1 overflow-hidden rounded-full bg-raised" role="meter" aria-valuenow={Math.round(p)} aria-valuemin={0} aria-valuemax={100} aria-label={label}>
+            <div class={`h-full rounded-full ${p >= 90 ? "bg-bad" : p >= 75 ? "bg-warn" : "bg-accent"}`} style={{ width: `${p}%` }} />
+          </div>
+        )}
+      </div>
+    );
+  };
+  return (
+    <a href={`/servers/${n.id}`} class="card block p-4 hover:border-accent/60">
+      <div class="mb-3 flex items-center gap-2">
+        <h2 class="min-w-0 truncate font-semibold">{n.name}</h2>
+        {n.address && <span class="truncate font-mono text-xs text-muted">{n.address}</span>}
+        {n.status !== "online" && <Pill state={n.status} class="ml-auto" />}
+      </div>
+      {!d ? (
+        <div class="grid grid-cols-2 gap-4 sm:grid-cols-4" aria-hidden="true">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} class="space-y-1.5">
+              <Skel class="h-3 w-12" />
+              <Skel class="h-4 w-16" />
+              <Skel class="h-1 w-full" />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div class={`grid grid-cols-2 gap-4 ${d.gpus.length ? "sm:grid-cols-5" : "sm:grid-cols-4"}`}>
+          {stat("CPU", fmt.pct(d.cpu), `${d.cores.length} cores · load ${d.load[0]?.toFixed(1) ?? "?"}`, d.cpu)}
+          {stat("Memory", bytes(d.memory.used), `of ${bytes(d.memory.total)}`, (100 * d.memory.used) / (d.memory.total || 1))}
+          {disk ? stat("Disk", bytes(disk.used), `of ${bytes(disk.total)}`, (100 * disk.used) / (disk.total || 1)) : stat("Disk", "Unknown", "")}
+          {stat("Network", `↓ ${fmt.rate(d.net.rx)}`, `↑ ${fmt.rate(d.net.tx)}`)}
+          {d.gpus.length > 0 &&
+            stat(
+              d.gpus.length === 1 ? "GPU" : `${d.gpus.length} GPUs`,
+              fmt.pct(d.gpus.reduce((a, g) => a + g.util, 0) / d.gpus.length),
+              d.gpus[0].temp != null ? `${Math.round(Math.max(...d.gpus.map((g) => g.temp ?? 0)))} °C` : `${bytes(d.gpus.reduce((a, g) => a + g.mem_used, 0))} memory`,
+              d.gpus.reduce((a, g) => a + g.util, 0) / d.gpus.length,
+            )}
+        </div>
+      )}
+    </a>
+  );
 }
 
 /** Live tiles and history charts of one server ("local" is the panel's own). */

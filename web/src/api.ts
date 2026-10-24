@@ -200,6 +200,8 @@ export interface Node {
   name: string;
   local: boolean;
   ingress: boolean;
+  /** The address it joined through; for the panel's own server, its public address. */
+  address: string | null;
   mesh_ip: string | null;
   region: string | null;
   labels: Record<string, string>;
@@ -315,6 +317,19 @@ export function useEvent(fn: (e: Event) => void) {
 /** The projects the caller can see; `enabled: false` skips the request. */
 export const useProjects = (enabled = true) => useApi<{ projects: Project[] }>(enabled ? "/projects" : null);
 
+/**
+ * The last answer for each path, shown at once when a page opens again while a fresh copy
+ * loads: every request crosses the network, which is slow from far away.
+ */
+const cache = new Map<string, unknown>();
+const remember = (path: string, data: unknown) => {
+  cache.delete(path);
+  cache.set(path, data);
+  if (cache.size > 200) cache.delete(cache.keys().next().value as string);
+};
+/** Forget everything (on sign out, so the next person never sees it). */
+export const clearCache = () => cache.clear();
+
 export function useApi<T = any>(path: string | null, live?: (e: Event) => boolean, poll?: number) {
   const [state, setState] = useState<{ path?: string | null; data?: T; error?: ApiError }>({});
   const latest = useRef(path);
@@ -323,6 +338,7 @@ export function useApi<T = any>(path: string | null, live?: (e: Event) => boolea
     if (!path) return;
     try {
       const data = await get<T>(path);
+      remember(path, data);
       if (latest.current === path) setState({ path, data });
     } catch (e) {
       const error = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -351,11 +367,15 @@ export function useApi<T = any>(path: string | null, live?: (e: Event) => boolea
   }, [state, poll, reload]);
 
   const mine = state.path === path;
+  const data = mine && state.data !== undefined ? state.data : path ? (cache.get(path) as T | undefined) : undefined;
   return {
-    data: mine ? state.data : undefined,
+    data,
     error: mine ? state.error : undefined,
     loading: !!path && !(mine && (state.data !== undefined || state.error)),
     reload,
-    set: (data: T) => setState({ path, data }),
+    set: (data: T) => {
+      if (path) remember(path, data);
+      setState({ path, data });
+    },
   };
 }

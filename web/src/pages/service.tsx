@@ -7,12 +7,14 @@ import { route } from "../router";
 import {
   Action,
   Card,
+  CardSkeleton,
   Check,
   CodeBlock,
   ConfirmName,
   Empty,
   ErrorBox,
   FormButtons,
+  IconButton,
   Input,
   Loaded,
   LoadingPage,
@@ -21,6 +23,8 @@ import {
   Page,
   Pill,
   Rows,
+  RowsSkeleton,
+  Skel,
   Tabs,
   TextArea,
   errText,
@@ -100,7 +104,7 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
   const nodes = useNodes();
   const [logId, setLogId] = useState<string | null>(null);
   const d = r.data;
-  if (!d) return <LoadingPage title={props.service} r={r} />;
+  if (!d) return <LoadingPage title={props.service} crumbs={[["Projects", "/"], [props.project ?? "", `/projects/${props.project}`]]} r={r} skeleton={<ServiceSkeleton />} />;
   const s = d.service;
   // Read replicas belong to primary databases; a replica follows one instead.
   const tabs = TABS.filter(([id]) => id !== "replicas" || (s.kind === "database" && !s.spec.database?.primary));
@@ -236,7 +240,7 @@ function Overview({ c }: { c: Ctx }) {
             Change source and build
           </a>
         </Card>
-        <Webhook c={c} />
+        {s.kind !== "database" && <Webhook c={c} />}
         {src.type === "git" && !src.provider && atLeast(d.role, "operator") && (
           <Card title="Deploy key">
             <p class="mb-3 text-dim">A private repository reached by an SSH URL needs a deploy key that Tugport generates for this service.</p>
@@ -299,12 +303,42 @@ function Replicas({ c }: { c: Ctx }) {
             ))}
           <Pill state={r.health && r.state === "running" ? r.health : r.state} />
           {st.live_deploy && r.deploy !== st.live_deploy && <span class="chip">previous deploy</span>}
-          <span class="w-full truncate text-xs text-muted">{[r.ip, r.image, r.created ? `started ${ago(r.created)}` : ""].filter(Boolean).join(" · ")}</span>
+          <span class="w-full break-all text-xs text-muted">{[r.ip, shortImage(r.image), r.created ? `started ${ago(r.created)}` : ""].filter(Boolean).join(" · ")}</span>
         </li>
       ))}
     </ul>
   );
 }
+
+/** An image by digest is long and says little; its first 12 characters identify it. */
+const shortImage = (image: string) => image.replace(/^(sha256:[0-9a-f]{12})[0-9a-f]+$/, "$1");
+
+/** The overview's shape (tabs, the status card and the cards beside it) while it loads. */
+const ServiceSkeleton = () => (
+  <div role="status" aria-label="Loading">
+    <div class="mb-7 flex gap-5 border-b border-line pb-3" aria-hidden="true">
+      {["w-16", "w-14", "w-10", "w-14", "w-16", "w-20"].map((w, i) => (
+        <Skel key={i} class={`h-4 ${w}`} />
+      ))}
+    </div>
+    <div class="grid gap-6 lg:grid-cols-3">
+      <div class="space-y-6 lg:col-span-2">
+        <CardSkeleton>
+          <div class="space-y-4 p-4 md:p-5">
+            <Skel class="h-5 w-40" />
+            <Skel class="h-14 w-full rounded-lg" />
+            <Skel class="h-4 w-2/3" />
+          </div>
+        </CardSkeleton>
+        <CardSkeleton />
+      </div>
+      <div class="space-y-6">
+        <CardSkeleton />
+        <CardSkeleton />
+      </div>
+    </div>
+  </div>
+);
 
 function LastDeploy({ c }: { c: Ctx }) {
   const last = c.d.last_deploy;
@@ -420,7 +454,7 @@ function Deploys({ c }: { c: Ctx }) {
       }
       pad={false}
     >
-      <Loaded r={r}>
+      <Loaded r={r} skeleton={<RowsSkeleton />}>
         {(data) => (
           <Rows items={data.deploys} empty="This service has not been deployed yet.">
             {(d) => (
@@ -569,11 +603,10 @@ function Files({ c }: { c: Ctx }) {
                   <code class="min-w-0 flex-1 truncate">{f.target}</code>
                   {canEdit && (
                     <>
-                      <button class="btn" onClick={() => setEdit({ target: f.target, content: f.content ?? "", known: data.values_visible, isNew: false })}>
-                        Edit
-                      </button>
+                      <IconButton icon="edit" label={`Edit ${f.target}`} onClick={() => setEdit({ target: f.target, content: f.content ?? "", known: data.values_visible, isNew: false })} />
                       <Action
-                        class="btn btn-ghost text-bad"
+                        class="btn btn-ghost btn-sm px-2 text-bad"
+                        label={`Remove ${f.target}`}
                         confirm={`Remove ${f.target}?`}
                         run={async () => {
                           await put(`/services/${id}/files`, { target: f.target, content: null });
@@ -581,7 +614,7 @@ function Files({ c }: { c: Ctx }) {
                           await r.reload();
                         }}
                       >
-                        Remove
+                        <Icon name="trash" />
                       </Action>
                     </>
                   )}

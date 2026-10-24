@@ -3,7 +3,7 @@
 import type { ComponentChildren, JSX } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { ApiError } from "./api";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
 import { copyText, sentence } from "./util";
 
 export const errText = (e: unknown) => (e instanceof Error ? sentence(e.message) : "Something went wrong.");
@@ -63,32 +63,73 @@ export function Card(props: { title?: ComponentChildren; actions?: ComponentChil
   );
 }
 
-/** A labelled control. The label wraps the control, which associates them without ids. */
-export function Field(props: { label: ComponentChildren; hint?: ComponentChildren; children: ComponentChildren; class?: string }) {
+/**
+ * The "i" beside a label that shows what a setting does. It sits inside the <label>, so it is a
+ * span (not a labelable button, which would take the label's clicks from the control).
+ */
+function InfoToggle(props: { open: boolean; onToggle: () => void }) {
+  const toggle = (e: Event) => {
+    e.preventDefault();
+    e.stopPropagation();
+    props.onToggle();
+  };
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      aria-expanded={props.open}
+      aria-label="What this does"
+      title="What this does"
+      class={`inline-grid size-5 cursor-pointer place-items-center rounded-full align-middle hover:text-text ${props.open ? "text-accent" : "text-muted"}`}
+      onClick={toggle}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && toggle(e)}
+    >
+      <Icon name="info" class="size-3.5" />
+    </span>
+  );
+}
+
+const InfoText = (props: { children: ComponentChildren }) => <span class="mb-2 block rounded-lg bg-raised px-3 py-2 text-xs leading-relaxed text-dim">{props.children}</span>;
+
+/**
+ * A labelled control. The label wraps the control, which associates them without ids. `info`
+ * explains the setting behind an "i"; `hint` stays visible under the control.
+ */
+export function Field(props: { label: ComponentChildren; hint?: ComponentChildren; info?: ComponentChildren; children: ComponentChildren; class?: string }) {
+  const [open, setOpen] = useState(false);
   return (
     <label class={`block min-w-0 ${props.class ?? ""}`}>
-      <span class="label">{props.label}</span>
+      <span class="label">
+        {props.label}
+        {props.info && (
+          <>
+            {" "}
+            <InfoToggle open={open} onToggle={() => setOpen(!open)} />
+          </>
+        )}
+      </span>
+      {open && <InfoText>{props.info}</InfoText>}
       {props.children}
       {props.hint && <span class="hint">{props.hint}</span>}
     </label>
   );
 }
 
-type Labelled = { label: ComponentChildren; hint?: ComponentChildren; fieldClass?: string };
+type Labelled = { label: ComponentChildren; hint?: ComponentChildren; info?: ComponentChildren; fieldClass?: string };
 
 /** A labelled text input. `mono` suits names, paths and commands: monospace and no spellcheck. */
-export function Input({ label, hint, fieldClass, mono, ...rest }: Labelled & { mono?: boolean } & JSX.IntrinsicElements["input"]) {
+export function Input({ label, hint, info, fieldClass, mono, ...rest }: Labelled & { mono?: boolean } & JSX.IntrinsicElements["input"]) {
   return (
-    <Field label={label} hint={hint} class={fieldClass}>
+    <Field label={label} hint={hint} info={info} class={fieldClass}>
       <input spellcheck={mono ? false : undefined} {...rest} class={`input${mono ? " font-mono" : ""}${rest.class ? ` ${rest.class}` : ""}`} />
     </Field>
   );
 }
 
 /** A labelled textarea for lists, files and code, so without spellcheck. `class` sets its height. */
-export function TextArea({ label, hint, fieldClass, ...rest }: Labelled & JSX.IntrinsicElements["textarea"]) {
+export function TextArea({ label, hint, info, fieldClass, ...rest }: Labelled & JSX.IntrinsicElements["textarea"]) {
   return (
-    <Field label={label} hint={hint} class={fieldClass}>
+    <Field label={label} hint={hint} info={info} class={fieldClass}>
       <textarea spellcheck={false} {...rest} class={`input ${rest.class ?? ""}`} />
     </Field>
   );
@@ -106,15 +147,37 @@ export function ConfirmName(props: { name: string; value: string; onChange: (v: 
   );
 }
 
-export function Check(props: { checked: boolean; onChange: (v: boolean) => void; label: ComponentChildren; hint?: ComponentChildren; disabled?: boolean }) {
+export function Check(props: { checked: boolean; onChange: (v: boolean) => void; label: ComponentChildren; hint?: ComponentChildren; info?: ComponentChildren; disabled?: boolean }) {
+  const [open, setOpen] = useState(false);
   return (
     <label class="flex items-start gap-2.5">
       <input type="checkbox" class="mt-0.5 size-4 shrink-0" checked={props.checked} disabled={props.disabled} onChange={(e) => props.onChange(e.currentTarget.checked)} />
       <span class="min-w-0">
         <span class="font-medium">{props.label}</span>
+        {props.info && (
+          <>
+            {" "}
+            <InfoToggle open={open} onToggle={() => setOpen(!open)} />
+          </>
+        )}
+        {open && <span class="mt-1.5 block">{<InfoText>{props.info}</InfoText>}</span>}
         {props.hint && <span class="hint">{props.hint}</span>}
       </span>
     </label>
+  );
+}
+
+/** A square button with just an icon; `label` is its accessible name and tooltip. */
+export function IconButton(props: { icon: IconName; label: string; onClick?: () => void; class?: string; disabled?: boolean; href?: string }) {
+  const cls = `btn btn-ghost btn-sm px-2 ${props.class ?? ""}`;
+  return props.href ? (
+    <a class={cls} href={props.href} aria-label={props.label} title={props.label}>
+      <Icon name={props.icon} />
+    </a>
+  ) : (
+    <button type="button" class={cls} aria-label={props.label} title={props.label} disabled={props.disabled} onClick={props.onClick}>
+      <Icon name={props.icon} />
+    </button>
   );
 }
 
@@ -243,14 +306,18 @@ export function UnsavedBar(props: { s: { busy: boolean; error: string }; onDisca
   );
 }
 
-/** A button that runs an API call, disables itself meanwhile and reports the outcome as a toast. */
-export function Action(props: { run: () => Promise<unknown>; children: ComponentChildren; class?: string; confirm?: string; done?: string; disabled?: boolean; title?: string }) {
+/**
+ * A button that runs an API call, disables itself meanwhile and reports the outcome as a toast.
+ * `label` names an icon-only button.
+ */
+export function Action(props: { run: () => Promise<unknown>; children: ComponentChildren; class?: string; confirm?: string; done?: string; disabled?: boolean; title?: string; label?: string }) {
   const [busy, setBusy] = useState(false);
   return (
     <button
       type="button"
       class={props.class ?? "btn"}
-      title={props.title}
+      title={props.title ?? props.label}
+      aria-label={props.label}
       disabled={busy || props.disabled}
       onClick={async () => {
         if (props.confirm && !window.confirm(props.confirm)) return;
@@ -375,19 +442,63 @@ export function Note(props: { tone?: "info" | "warn" | "bad" | "ok"; children: C
   return <div class={`rounded-lg border px-3 py-2 text-sm ${tone} ${props.class ?? ""}`}>{props.children}</div>;
 }
 
-export const Loading = () => <p class="py-6 text-muted">Loading…</p>;
+// ---- Skeletons: the shape of what is loading, so the page does not jump when it arrives ----
 
-/** Shows the right state for a useApi result: an error, a loading line or the content. */
-export function Loaded<T>(props: { r: { data?: T; error?: ApiError }; children: (d: T) => ComponentChildren }) {
+/** One gray placeholder block; `class` gives it its size. */
+export const Skel = (props: { class?: string }) => <span aria-hidden="true" class={`block animate-pulse rounded-md bg-raised ${props.class ?? "h-4 w-full"}`} />;
+
+/** A few lines of text, for blocks inside a padded card. */
+export const Loading = () => (
+  <div class="space-y-3 py-1" role="status" aria-label="Loading">
+    <Skel class="h-4 w-2/3" />
+    <Skel class="h-4 w-full" />
+    <Skel class="h-4 w-1/2" />
+  </div>
+);
+
+/** List rows (icon, two lines, a status), for cards without padding. */
+export const RowsSkeleton = (props: { n?: number }) => (
+  <ul role="status" aria-label="Loading" class="divide-y divide-line">
+    {Array.from({ length: props.n ?? 3 }, (_, i) => (
+      <li key={i} class="flex items-center gap-3 px-4 py-3.5 md:px-5">
+        <Skel class="size-8 shrink-0 rounded-lg" />
+        <span class="min-w-0 flex-1 space-y-2">
+          <Skel class="h-3.5 w-1/3" />
+          <Skel class="h-3 w-2/3" />
+        </span>
+        <Skel class="h-5 w-16 rounded-full" />
+      </li>
+    ))}
+  </ul>
+);
+
+/** A card's outline with a title bar, filled with `children` (skeleton lines by default). */
+export const CardSkeleton = (props: { children?: ComponentChildren; class?: string }) => (
+  <div class={`card ${props.class ?? ""}`} aria-hidden="true">
+    <div class="flex min-h-13 items-center border-b border-line px-4 md:px-5">
+      <Skel class="h-4 w-28" />
+    </div>
+    {props.children ?? (
+      <div class="p-4 md:p-5">
+        <Loading />
+      </div>
+    )}
+  </div>
+);
+
+/** Shows the right state for a useApi result: an error, a skeleton or the content. */
+export function Loaded<T>(props: { r: { data?: T; error?: ApiError }; children: (d: T) => ComponentChildren; skeleton?: ComponentChildren }) {
   if (props.r.data !== undefined) return <>{props.children(props.r.data)}</>;
   if (props.r.error) return <ErrorBox error={props.r.error} />;
-  return <Loading />;
+  return <>{props.skeleton ?? <Loading />}</>;
 }
 
-/** A detail page before its data arrives, or with the error when it does not. */
-export const LoadingPage = (props: { title?: string; r: { data?: unknown; error?: ApiError } }) => (
-  <Page title={props.title}>
-    <Loaded r={props.r}>{() => null}</Loaded>
+/** A detail page before its data arrives (`skeleton` is its shape), or with the error when it does not. */
+export const LoadingPage = (props: { title?: string; crumbs?: [string, string][]; r: { data?: unknown; error?: ApiError }; skeleton?: ComponentChildren }) => (
+  <Page title={props.title} crumbs={props.crumbs}>
+    <Loaded r={props.r} skeleton={props.skeleton}>
+      {() => null}
+    </Loaded>
   </Page>
 );
 
@@ -432,6 +543,13 @@ export function Pill(props: { state: string; label?: string; class?: string }) {
       {props.label ?? props.state}
     </span>
   );
+}
+
+/** Just the colored dot of a state, for dense lists; `title` carries the state's name. */
+export function StateDot(props: { state: string }) {
+  const tone = TONE[props.state] ?? "muted";
+  const bg = { ok: "bg-ok", warn: "bg-warn", bad: "bg-bad", info: "bg-info" }[tone] ?? "bg-muted";
+  return <span class={`size-2 shrink-0 rounded-full ${bg}`} title={props.state} aria-label={props.state} role="img" />;
 }
 
 /** Page tabs. On phones they scroll sideways, start scrolled to the current one and fade at the edges. */

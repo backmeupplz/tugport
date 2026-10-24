@@ -1,10 +1,11 @@
 import { useRef, useState } from "preact/hooks";
 import { route } from "../router";
 import { EnvEditor } from "../env-editor";
-import { KindIcon } from "../icons";
+import { Icon, KindIcon } from "../icons";
 import { NewService } from "./new-service";
-import { ROLES, atLeast, del, hasGrant, patch, post, put, useApi, useMe, type Project, type Role, type Source, type Status, type User } from "../api";
-import { Action, Card, Empty, ErrorBox, Field, FormButtons, Input, Loaded, LoadingPage, Modal, NameInput, Page, Pill, Rows, Select, toast, useForm, useSubmit } from "../ui";
+import { ROLES, atLeast, del, hasGrant, patch, post, put, useApi, useMe, useNodes, type Event, type Project, type Role, type Source, type Status, type User } from "../api";
+import { ServerSummary } from "./observe";
+import { Action, Card, CardSkeleton, Empty, ErrorBox, Field, FormButtons, IconButton, Input, Loaded, LoadingPage, Modal, NameInput, Page, Pill, Rows, RowsSkeleton, Select, Skel, StateDot, toast, useForm, useSubmit } from "../ui";
 
 export interface ProjectDetail {
   project: { id: string; name: string; description: string | null; created_at: number };
@@ -33,11 +34,27 @@ export function sourceLabel(src: Source, kind?: string): string {
 /** Problems first, so they stand out on the project cards; unknown states go last. */
 const STATE_ORDER = ["crashing", "unhealthy", "degraded", "stopped", "asleep", "not deployed", "running"];
 const rank = (s: string) => (STATE_ORDER.includes(s) ? STATE_ORDER.indexOf(s) : STATE_ORDER.length);
-const byState = ([a]: [string, number], [b]: [string, number]) => rank(a) - rank(b);
 
+/** A service as the full list (GET /services) returns it. */
+interface ServiceItem {
+  id: string;
+  name: string;
+  project: string;
+  project_id: string;
+  kind: string;
+  state: string;
+  running: number;
+  desired: number;
+}
+
+const PROJECTS_LIVE = (e: Event) => e.kind === "service.status" || (e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? ""));
+
+/** The dashboard: every server's numbers, then every project with its services. */
 export function Projects() {
   const me = useMe();
-  const r = useApi<{ projects: Project[] }>("/projects", (e) => e.kind === "service.status" || (e.kind === "audit" && /^(project|service)\./.test(e.data?.action ?? "")));
+  const r = useApi<{ projects: Project[] }>("/projects", PROJECTS_LIVE);
+  const services = useApi<{ services: ServiceItem[] }>("/services", PROJECTS_LIVE);
+  const nodes = useNodes();
   const [open, setOpen] = useState(false);
   const canCreate = me.principal.is_owner || atLeast(me.principal.all_projects_role, "operator");
   return (
@@ -51,7 +68,14 @@ export function Projects() {
         )
       }
     >
-      <Loaded r={r}>
+      {nodes && nodes.nodes.length > 0 && (
+        <section aria-label="Servers" class={`mb-8 grid gap-3 ${nodes.nodes.length > 1 ? "xl:grid-cols-2" : ""}`}>
+          {nodes.nodes.map((n) => (
+            <ServerSummary key={n.id} node={n} />
+          ))}
+        </section>
+      )}
+      <Loaded r={r} skeleton={<ProjectsSkeleton />}>
         {(d) =>
           d.projects.length === 0 ? (
             <Empty title="No projects yet">
@@ -60,25 +84,9 @@ export function Projects() {
                 : "You do not have access to any project yet, so ask the owner to add you to one."}
             </Empty>
           ) : (
-            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <div class="gap-3 sm:columns-2 xl:columns-3">
               {d.projects.map((p) => (
-                <a key={p.id} href={`/projects/${p.name}`} class="card block p-4 hover:border-accent/60">
-                  <div class="flex items-start justify-between gap-2">
-                    <h2 class="min-w-0 truncate font-semibold">{p.name}</h2>
-                    {p.role && <span class="chip">{p.role}</span>}
-                  </div>
-                  <p class="mt-1 line-clamp-2 min-h-10 text-dim">{p.description || "This project has no description yet."}</p>
-                  <div class="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-muted">
-                    <span class="mr-1">
-                      {p.services} {p.services === 1 ? "service" : "services"}
-                    </span>
-                    {Object.entries(p.states ?? {})
-                      .sort(byState)
-                      .map(([state, n]) => (
-                        <Pill key={state} state={state} label={`${n} ${state}`} />
-                      ))}
-                  </div>
-                </a>
+                <ProjectCard key={p.id} project={p} services={services.data?.services.filter((x) => x.project_id === p.id)} />
               ))}
             </div>
           )
@@ -88,6 +96,75 @@ export function Projects() {
     </Page>
   );
 }
+
+/** A role worth pointing out: anything short of admin limits what the card's links allow. */
+const limitedRole = (role: Role | null) => (role && role !== "admin" ? role : null);
+
+function ProjectCard(props: { project: Project; services?: ServiceItem[] }) {
+  const p = props.project;
+  const role = limitedRole(p.role);
+  // Problems first, so they stand out.
+  const list = props.services && [...props.services].sort((a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name));
+  return (
+    <section class="card mb-3 break-inside-avoid">
+      <a href={`/projects/${p.name}`} class="flex items-center gap-2 rounded-t-xl px-4 pt-3.5 pb-2 hover:text-accent-text">
+        <h2 class="min-w-0 flex-1 truncate font-semibold">{p.name}</h2>
+        {role && <span class="chip">{role}</span>}
+        <span class="text-xs text-muted">{p.services === 1 ? "1 service" : `${p.services} services`}</span>
+      </a>
+      {p.description && <p class="line-clamp-2 px-4 pb-2 text-[13px] text-dim">{p.description}</p>}
+      <ul class="pb-2">
+        {!list
+          ? Array.from({ length: Math.min(p.services, 4) }, (_, i) => (
+              <li key={i} class="flex items-center gap-2.5 px-4 py-1.5">
+                <Skel class="size-2 rounded-full" />
+                <Skel class="h-3.5 w-32" />
+              </li>
+            ))
+          : list.map((x) => (
+              <li key={x.id}>
+                <a href={`/projects/${p.name}/${x.name}`} class="flex items-center gap-2.5 px-4 py-2 text-sm hover:bg-raised/60 md:py-1.5 md:text-[13px]">
+                  <StateDot state={x.state} />
+                  <span class="min-w-0 flex-1 truncate">{x.name}</span>
+                  {x.kind !== "app" && <span class="text-xs text-muted">{x.kind}</span>}
+                  {x.state !== "running" && <span class="text-xs text-muted">{x.state}</span>}
+                </a>
+              </li>
+            ))}
+        {list?.length === 0 && <li class="px-4 py-1.5 text-[13px] text-muted">No services yet.</li>}
+      </ul>
+    </section>
+  );
+}
+
+const ProjectsSkeleton = () => (
+  <div class="gap-3 sm:columns-2 xl:columns-3" role="status" aria-label="Loading">
+    {[3, 5, 2, 4, 3, 6].map((n, i) => (
+      <div key={i} class="card mb-3 break-inside-avoid px-4 pt-4 pb-3" aria-hidden="true">
+        <Skel class="mb-3 h-4 w-28" />
+        {Array.from({ length: n }, (_, j) => (
+          <div key={j} class="flex items-center gap-2.5 py-1.5">
+            <Skel class="size-2 rounded-full" />
+            <Skel class="h-3.5 w-36" />
+          </div>
+        ))}
+      </div>
+    ))}
+  </div>
+);
+
+/** A project page before it arrives: its services list and the two cards under it. */
+const ProjectSkeleton = () => (
+  <div class="space-y-6" role="status" aria-label="Loading">
+    <CardSkeleton>
+      <RowsSkeleton n={4} />
+    </CardSkeleton>
+    <div class="grid gap-6 lg:grid-cols-2">
+      <CardSkeleton />
+      <CardSkeleton />
+    </div>
+  </div>
+);
 
 function NewProject(props: { open: boolean; onClose: () => void }) {
   const { f, set, bind, reset } = useForm({ name: "", description: "" });
@@ -118,14 +195,14 @@ export function ProjectPage(props: { project?: string }) {
   pid.current = r.data?.project.id ?? "";
   const [wizard, setWizard] = useState(false);
   const d = r.data;
-  if (!d) return <LoadingPage title={props.project} r={r} />;
+  if (!d) return <LoadingPage title={props.project} crumbs={[["Projects", "/"]]} r={r} skeleton={<ProjectSkeleton />} />;
   const canOperate = atLeast(d.role, "operator");
   const isAdmin = atLeast(d.role, "admin");
   return (
     <Page
       title={d.project.name}
       crumbs={[["Projects", "/"]]}
-      meta={d.role && <span class="chip">your role: {d.role}</span>}
+      meta={limitedRole(d.role) && <span class="chip">your role: {d.role}</span>}
       actions={
         canOperate && (
           <button class="btn btn-primary" onClick={() => setWizard(true)}>
@@ -215,20 +292,21 @@ function Description(props: { project: ProjectDetail["project"]; canEdit: boolea
       </form>
     );
   }
+  const edit = () => {
+    setText(props.project.description ?? "");
+    setEditing(true);
+  };
+  if (!props.project.description) {
+    return props.canEdit ? (
+      <button class="link mb-6 block text-sm" onClick={edit}>
+        Add a description
+      </button>
+    ) : null;
+  }
   return (
-    <p class="mb-6 text-dim">
-      {props.project.description || "This project has no description yet."}{" "}
-      {props.canEdit && (
-        <button
-          class="link"
-          onClick={() => {
-            setText(props.project.description ?? "");
-            setEditing(true);
-          }}
-        >
-          Edit
-        </button>
-      )}
+    <p class="mb-6 flex items-start gap-1 text-dim">
+      <span class="min-w-0 py-1">{props.project.description}</span>
+      {props.canEdit && <IconButton icon="edit" label="Edit the description" onClick={edit} />}
     </p>
   );
 }
@@ -274,8 +352,8 @@ function Members(props: { projectId: string; canManage: boolean }) {
                           options={ROLES}
                           onChange={(v) => setRole(m.id, v).catch((e) => toast(String(e.message), "bad"))}
                         />
-                        <Action class="btn btn-ghost text-bad" confirm={`Remove ${m.name} from this project?`} run={() => setRole(m.id, null)}>
-                          Remove
+                        <Action class="btn btn-ghost btn-sm px-2 text-bad" label={`Remove ${m.name}`} confirm={`Remove ${m.name} from this project?`} run={() => setRole(m.id, null)}>
+                          <Icon name="trash" />
                         </Action>
                       </>
                     ) : (

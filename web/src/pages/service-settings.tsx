@@ -1,7 +1,8 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { atLeast, patch, useApi, type Node, type Spec } from "../api";
-import { Card, Check, ErrorBox, Field, Input, Note, Select, TextArea, UnsavedBar, toast, useForm, useSubmit } from "../ui";
+import { Icon } from "../icons";
+import { Card, Check, ErrorBox, Field, IconButton, Input, Note, Select, TextArea, UnsavedBar, toast, useForm, useSubmit } from "../ui";
 import { LABELS_HINT, joinArgs, labelsText, lines, matchServers, mergePatch, num, parseLabels, patchAt, pinReasons, removeAt, splitArgs, str } from "../util";
 import { BuildFields, buildSpec, gitSource, providerOptions } from "./new-service";
 import { RedeployNote, type Ctx } from "./service";
@@ -137,12 +138,11 @@ export function ServiceSettings({ c }: { c: Ctx }) {
           <RedeployNote c={c}>Saved. The new settings take effect with the next deploy.</RedeployNote>
         </Note>
       )}
-      <div class="flex justify-end">
-        <button class="btn" onClick={() => setJson(!json)}>
-          {json ? "Back to the form" : "Edit as JSON"}
-        </button>
-      </div>
       {json ? <JsonEditor key={s.updated_at} c={c} onSaved={() => setSaved(true)} /> : <SettingsForm key={s.updated_at} c={c} onSaved={() => setSaved(true)} />}
+      <button type="button" class="inline-flex items-center gap-1.5 text-sm text-muted hover:text-text" onClick={() => setJson(!json)}>
+        <Icon name="code" />
+        {json ? "Back to the form" : "Edit the raw settings as JSON"}
+      </button>
     </div>
   );
 }
@@ -178,13 +178,13 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
           {isDb ? (
             <Input
               label="Image"
-              hint="The image is pinned to an exact version, and major upgrades are manual, so take a backup before changing the major version."
+              info="The image is pinned to an exact version, and major upgrades are manual, so take a backup before changing the major version."
               mono
               {...bind("image")}
             />
           ) : (
             <>
-              <Field label="Type">
+              <Field label="Type" info="Where the service comes from. A Git repository is built on the server; a Docker image is pulled as it is; an inline Dockerfile is built from the text you paste.">
                 <Select
                   value={f.srcType}
                   onChange={(srcType) => set({ srcType })}
@@ -204,7 +204,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
               </Field>
               {f.srcType === "git" && (
                 <>
-                  <Field label="Repository from">
+                  <Field label="Repository from" info="A connected Git host (Settings, Git) gives Tugport access to private repositories and push webhooks. A plain URL works for public repositories, or for private ones with a deploy key.">
                     <Select value={f.provider} onChange={(provider) => set({ provider })} options={providerOptions(providers.data?.providers)} />
                   </Field>
                   <Input
@@ -215,25 +215,25 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                     {...bind("repo")}
                   />
                   <div class="grid gap-4 sm:grid-cols-2">
-                    <Input label="Branch" mono {...bind("branch")} />
+                    <Input label="Branch" info="Pushes to this branch deploy the service when deploying on every push is on." mono {...bind("branch")} />
                     {isCompose ? (
-                      <Input label="Compose file" mono {...bind("composeFile")} />
+                      <Input label="Compose file" info="The Compose file's path inside the repository." mono {...bind("composeFile")} />
                     ) : (
-                      <Input label="Path" hint="This is the build context inside the repository." mono {...bind("path")} />
+                      <Input label="Path" info="This is the build context inside the repository." mono {...bind("path")} />
                     )}
                   </div>
                   {!isCompose && (
                     <TextArea
                       label="Watch paths"
-                      hint="Redeploy only when a push changes these paths, one glob per line. Leave this empty to redeploy on any change."
+                      info="Redeploy only when a push changes these paths, one glob per line. Leave this empty to redeploy on any change."
                       class="h-20"
                       {...bind("watch")}
                     />
                   )}
-                  <Check checked={f.auto} onChange={(auto) => set({ auto })} label="Deploy on every push" />
+                  <Check checked={f.auto} onChange={(auto) => set({ auto })} label="Deploy on every push" info="A push to the branch builds and deploys the service. With this off, it deploys only from the panel, the CLI or its deploy webhook." />
                 </>
               )}
-              {f.srcType === "image" && <Input label="Image" mono required {...bind("image")} />}
+              {f.srcType === "image" && <Input label="Image" info="A Docker image reference like nginx:1.27 or ghcr.io/owner/app:latest. Private registries need their login under Settings, Registries." mono required {...bind("image")} />}
               {f.srcType === "dockerfile" && <TextArea label="Dockerfile" class="h-56" {...bind("content")} />}
               {f.srcType === "compose" && <TextArea label="docker-compose.yml" class="h-72" {...bind("yaml")} />}
             </>
@@ -245,7 +245,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             <BuildFields f={f} set={set} bind={bind} />
             <TextArea
               label="Variables passed as build arguments"
-              hint="List environment variable names, one per line, to pass in addition to the ARGs the Dockerfile declares."
+              info="List environment variable names, one per line, to pass in addition to the ARGs the Dockerfile declares."
               class="h-16"
               {...bind("buildArgs")}
             />
@@ -254,10 +254,10 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Runtime">
           <div class="grid gap-4 sm:grid-cols-2">
-            <Input label="Command" hint="This replaces the image's command; quote arguments that contain spaces." mono placeholder="npm run start" {...bind("command")} />
-            <Input label="Entrypoint" mono {...bind("entrypoint")} />
-            <Input label="Working directory" mono {...bind("workdir")} />
-            <Input label="User" mono placeholder="1000:1000" {...bind("user")} />
+            <Input label="Command" info="This replaces the image's command; quote arguments that contain spaces." mono placeholder="npm run start" {...bind("command")} />
+            <Input label="Entrypoint" info="This replaces the image's entrypoint, the program the command is passed to. Leave it empty to keep the image's own." mono {...bind("entrypoint")} />
+            <Input label="Working directory" info="The directory the command runs in. Leave it empty to keep the image's own." mono {...bind("workdir")} />
+            <Input label="User" info="The user (and optionally group) the container runs as, by name or number. Leave it empty to keep the image's own." mono placeholder="1000:1000" {...bind("user")} />
           </div>
         </Section>
 
@@ -271,9 +271,9 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
 
         <Section title="Resources">
           <div class="grid gap-4 sm:grid-cols-3">
-            <Input label="CPU limit (cores)" type="number" min={0} step="0.1" placeholder="No limit" {...bind("cpus")} />
-            <Input label="Memory limit (MB)" type="number" min={0} placeholder="No limit" {...bind("memory")} />
-            <Input label="Memory reservation (MB)" type="number" min={0} placeholder="None" {...bind("reservation")} />
+            <Input label="CPU limit (cores)" info="The most CPU each replica may use, in cores, like 0.5 for half of one. It slows down above the limit instead of failing." type="number" min={0} step="0.1" placeholder="No limit" {...bind("cpus")} />
+            <Input label="Memory limit (MB)" info="The most memory each replica may use. A replica that goes over is stopped and restarted." type="number" min={0} placeholder="No limit" {...bind("memory")} />
+            <Input label="Memory reservation (MB)" info="Memory the server should keep free for each replica. When memory runs short, containers above their reservation are squeezed first." type="number" min={0} placeholder="None" {...bind("reservation")} />
           </div>
         </Section>
 
@@ -292,18 +292,18 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             />
           </Field>
           <div class="grid gap-4 sm:grid-cols-2">
-            {f.hKind === "http" && <Input label="Path" class="font-mono" {...bind("hPath")} />}
+            {f.hKind === "http" && <Input label="Path" info="The path the check requests, like /health." class="font-mono" {...bind("hPath")} />}
             {(f.hKind === "http" || f.hKind === "tcp") && (
-              <Input label="Port" hint="Leave this empty to use the first domain's port." type="number" min={1} max={65535} {...bind("hPort")} />
+              <Input label="Port" info="Leave this empty to use the first domain's port." type="number" min={1} max={65535} {...bind("hPort")} />
             )}
             {f.hKind === "command" && <Input label="Command" fieldClass="sm:col-span-2" mono placeholder="pg_isready -U app" {...bind("hCommand")} />}
           </div>
           {f.hKind !== "none" && (
             <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <Input label="Interval (s)" type="number" min={1} {...bind("hInterval")} />
-              <Input label="Timeout (s)" type="number" min={1} {...bind("hTimeout")} />
-              <Input label="Retries" type="number" min={0} {...bind("hRetries")} />
-              <Input label="Start period (s)" type="number" min={0} {...bind("hStart")} />
+              <Input label="Interval (s)" info="How often the check runs." type="number" min={1} {...bind("hInterval")} />
+              <Input label="Timeout (s)" info="How long one check may take before it counts as failed." type="number" min={1} {...bind("hTimeout")} />
+              <Input label="Retries" info="How many checks in a row must fail before a replica counts as unhealthy." type="number" min={0} {...bind("hRetries")} />
+              <Input label="Start period (s)" info="Failed checks during this long after a start do not count, for apps that take a while to boot." type="number" min={0} {...bind("hStart")} />
             </div>
           )}
         </Section>
@@ -328,11 +328,11 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             />
           </Field>
           <div class="grid grid-cols-2 gap-4 sm:grid-cols-3">
-            <Input label="Drain time (s)" hint="Old replicas get this long to finish their requests." type="number" min={0} {...bind("drain")} />
-            <Input label="Health timeout (s)" hint="A new version gets this long to become healthy." type="number" min={1} {...bind("healthTimeout")} />
-            <Input label="Images kept" hint="Old images stay for one-click rollbacks." type="number" min={1} {...bind("keepImages")} />
+            <Input label="Drain time (s)" info="Old replicas get this long to finish their requests." type="number" min={0} {...bind("drain")} />
+            <Input label="Health timeout (s)" info="A new version gets this long to become healthy." type="number" min={1} {...bind("healthTimeout")} />
+            <Input label="Images kept" info="Old images stay for one-click rollbacks." type="number" min={1} {...bind("keepImages")} />
           </div>
-          <Field label="When a deploy starts while another one runs">
+          <Field label="When a deploy starts while another one runs" info="Cancelling suits frequent pushes, since only the newest one matters. Waiting makes every deploy finish in order.">
             <Select
               value={f.policy}
               onChange={(policy) => set({ policy })}
@@ -349,14 +349,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
           <p class="text-xs text-muted">Published ports open on the server's own address, which suits TCP and UDP services. HTTP apps should get a domain instead.</p>
           {f.ports.map((p, i) => (
             <div key={i} class="grid grid-cols-[1fr_1fr_6rem_auto] items-end gap-2">
-              <Input label="Container port" type="number" min={1} max={65535} value={p.container} onInput={(e) => port(i, { container: e.currentTarget.value })} />
-              <Input label="Server port" type="number" min={1} max={65535} value={p.host} placeholder={p.container} onInput={(e) => port(i, { host: e.currentTarget.value })} />
+              <Input label="Container port" info="The port the app listens on inside the container." type="number" min={1} max={65535} value={p.container} onInput={(e) => port(i, { container: e.currentTarget.value })} />
+              <Input label="Server port" info="The port it opens on the server's own addresses; the same as the container port when left empty." type="number" min={1} max={65535} value={p.host} placeholder={p.container} onInput={(e) => port(i, { host: e.currentTarget.value })} />
               <Field label="Protocol">
                 <Select value={p.protocol} options={["tcp", "udp"]} onChange={(protocol) => port(i, { protocol })} />
               </Field>
-              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ ports: removeAt(f.ports, i) })}>
-                Remove
-              </button>
+              <IconButton icon="trash" label="Remove this port" class="mb-1 text-bad" onClick={() => set({ ports: removeAt(f.ports, i) })} />
             </div>
           ))}
           <button type="button" class="btn" onClick={() => set({ ports: [...f.ports, { container: "", host: "", protocol: "tcp" }] })}>
@@ -382,18 +380,16 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                 />
               </Field>
               {m.type === "bind" ? (
-                <Input label="Server path" class="font-mono" placeholder="/srv/data" value={m.source} onInput={(e) => mount(i, { source: e.currentTarget.value })} />
+                <Input label="Server path" info="A folder or file on the server, mounted into the container as it is." class="font-mono" placeholder="/srv/data" value={m.source} onInput={(e) => mount(i, { source: e.currentTarget.value })} />
               ) : (
-                <Input label="Volume name" class="font-mono" value={m.name} onInput={(e) => mount(i, { name: e.currentTarget.value })} />
+                <Input label="Volume name" info="A Docker volume, created on first use. Its data stays when the service is redeployed." class="font-mono" value={m.name} onInput={(e) => mount(i, { name: e.currentTarget.value })} />
               )}
-              <Input label="Path in the container" class="font-mono" value={m.target} onInput={(e) => mount(i, { target: e.currentTarget.value })} />
+              <Input label="Path in the container" info="Where the volume or folder appears inside the container." class="font-mono" value={m.target} onInput={(e) => mount(i, { target: e.currentTarget.value })} />
               <label class="flex items-center gap-2 pb-2">
                 <input type="checkbox" checked={m.readonly} onChange={(e) => mount(i, { readonly: e.currentTarget.checked })} />
                 Read-only
               </label>
-              <button type="button" class="btn btn-ghost text-bad" onClick={() => set({ mounts: removeAt(f.mounts, i) })}>
-                Remove
-              </button>
+              <IconButton icon="trash" label="Remove this mount" class="mb-1 text-bad" onClick={() => set({ mounts: removeAt(f.mounts, i) })} />
             </div>
           ))}
           {isDb && f.mounts.length > 0 && <p class="text-xs text-warn">Removing the data volume of a database loses its files on the next deploy.</p>}
@@ -411,12 +407,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
             checked={f.nnp}
             onChange={(nnp) => set({ nnp })}
             label="No new privileges"
-            hint="This stops setuid programs from gaining privileges inside the container, so leave it on unless the app needs sudo or something similar."
+            info="This stops setuid programs from gaining privileges inside the container, so leave it on unless the app needs sudo or something similar."
           />
-          <Check checked={f.gpu} onChange={(gpu) => set({ gpu })} label="GPU access" hint="The containers get access to the server's GPUs." />
+          <Check checked={f.gpu} onChange={(gpu) => set({ gpu })} label="GPU access" info="The containers get access to the server's GPUs." />
           <div class="grid gap-4 sm:grid-cols-2">
-            <TextArea label="Add capabilities" hint="Write one per line, like NET_ADMIN; adding them needs the destroy grant." class="h-16" {...bind("capAdd")} />
-            <TextArea label="Drop capabilities" hint="Write one per line, like ALL." class="h-16" {...bind("capDrop")} />
+            <TextArea label="Add capabilities" info="Write one per line, like NET_ADMIN; adding them needs the destroy grant." class="h-16" {...bind("capAdd")} />
+            <TextArea label="Drop capabilities" info="Write one per line, like ALL." class="h-16" {...bind("capDrop")} />
           </div>
           <div class="space-y-3 rounded-md border border-bad/40 p-3">
             <p class="text-xs text-bad">These switches give the service control over the whole server. Turning them on needs the admin role and the destroy grant.</p>
@@ -430,12 +426,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                   : undefined
               }
             />
-            <Check checked={f.socket} onChange={(socket) => set({ socket })} label="Docker socket" hint="The service can then start and stop any container on the server." />
+            <Check checked={f.socket} onChange={(socket) => set({ socket })} label="Docker socket" info="The service can then start and stop any container on the server." />
             <Check
               checked={f.hostNet}
               onChange={(hostNet) => set({ hostNet })}
               label="Host networking"
-              hint="The service then shares the server's network stack instead of the project network."
+              info="The service then shares the server's network stack instead of the project network."
             />
           </div>
         </Section>
@@ -446,12 +442,12 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
               checked={f.auEnabled}
               onChange={(auEnabled) => set({ auEnabled })}
               label="Update the image automatically"
-              hint="New images roll out with health checks and roll back if they fail."
+              info="New images roll out with health checks and roll back if they fail."
             />
             {f.auEnabled && (
               <div class="grid gap-4 sm:grid-cols-2">
-                <Input label="Check every (minutes)" type="number" min={5} {...bind("auInterval")} />
-                <Field label="Follow">
+                <Input label="Check every (minutes)" info="How often Tugport asks the registry for a newer image." type="number" min={5} {...bind("auInterval")} />
+                <Field label="Follow" info="New images for the same tag follow tags like latest. Newer versions with the same major number move from 1.2 to 1.3 but never to 2.0.">
                   <Select
                     value={f.auPolicy}
                     onChange={(auPolicy) => set({ auPolicy })}
@@ -514,7 +510,7 @@ export function PlacementFields(props: { nodes: Node[] | undefined; rules: Rules
             <input class="input font-mono" spellcheck={false} placeholder="Any server" value={f.node} onInput={(e) => set({ node: e.currentTarget.value })} />
           )}
         </Field>
-        <Field label="Region" hint="Leave this empty to allow every region.">
+        <Field label="Region" info="Leave this empty to allow every region.">
           <input class="input font-mono" spellcheck={false} list="tp-regions" placeholder="Any region" value={f.region} onInput={(e) => set({ region: e.currentTarget.value })} />
           <datalist id="tp-regions">
             {regions.map((r) => (
@@ -524,7 +520,7 @@ export function PlacementFields(props: { nodes: Node[] | undefined; rules: Rules
         </Field>
         <TextArea
           label="Labels"
-          hint="Write key=value pairs, separated by commas or new lines. Only servers with every one of these labels qualify."
+          info="Write key=value pairs, separated by commas or new lines. Only servers with every one of these labels qualify."
           class="h-16"
           placeholder="disk=ssd"
           value={f.labels}

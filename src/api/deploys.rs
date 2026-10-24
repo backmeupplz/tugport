@@ -67,6 +67,24 @@ pub async fn list(State(app): State<AppState>, a: Auth, Path(id): Path<String>) 
     Ok(Json(json!({ "deploys": deploy::recent(&app, &s.id, 50)?, "live": runtime::live_deploy(&app, &s.id) })))
 }
 
+/// The latest deploys across every service the caller can see, for the Actions page.
+pub async fn list_all(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>> {
+    let services: std::collections::HashMap<String, store::Service> = super::visible_services(&app, &a)?.into_iter().map(|s| (s.id.clone(), s)).collect();
+    // ponytail: reads the newest 500 and filters; someone who sees few services gets fewer than 100.
+    let deploys: Vec<Value> = deploy::recent_all(&app, 500)?
+        .into_iter()
+        .filter_map(|d| {
+            let s = services.get(&d.service_id)?;
+            let mut v = serde_json::to_value(&d).ok()?;
+            v["service"] = json!(s.name);
+            v["project"] = json!(s.project);
+            Some(v)
+        })
+        .take(100)
+        .collect();
+    Ok(Json(json!({ "deploys": deploys })))
+}
+
 fn deploy_or_404(app: &AppState, a: &Auth, id: &str, role: Role) -> ApiResult<(deploy::Deploy, store::Service)> {
     let d = deploy::get(app, id)?.ok_or_else(|| ApiError::not_found("deploy not found"))?;
     let s = service_or_404(app, a, &d.service_id, role)?;

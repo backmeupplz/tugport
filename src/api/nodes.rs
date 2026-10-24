@@ -26,6 +26,14 @@ pub async fn list(State(app): State<AppState>, a: Auth) -> ApiResult<Json<Value>
             "created_at": r.get::<_, i64>(10)?, "ingress": local || r.get::<_, bool>(11)?,
         }))
     })?;
+    // The panel's own server has no stored address; show the public one it finds for itself.
+    let own = tokio::task::spawn_blocking(crate::public_address).await.ok().flatten();
+    let rows: Vec<Value> = rows.into_iter().map(|mut n| {
+        if n["local"] == true && n["address"].is_null() {
+            n["address"] = json!(own);
+        }
+        n
+    }).collect();
     Ok(Json(json!({ "nodes": rows, "mesh": mesh })))
 }
 

@@ -1,6 +1,7 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { del, patch, post, put, useApi, useMe } from "../api";
+import { del, patch, post, put, useApi, useMe, useNodes } from "../api";
+import { Icon } from "../icons";
 import {
   Action,
   Card,
@@ -16,6 +17,7 @@ import {
   Page,
   Pill,
   Rows,
+  RowsSkeleton,
   Select,
   Tabs,
   TextArea,
@@ -127,6 +129,11 @@ function General() {
 function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceSettings) => void }) {
   const { f, set, bind, reset } = useForm(toForm(props.settings));
   const usage = useApi<{ total_bytes: number }>("/logs/usage");
+  const channels = useApi<{ channels: { name: string; kind: string; events: string[] }[] }>("/notifications");
+  // Builds default to half of the panel's server; show what that is.
+  const local = useNodes()?.nodes.find((n) => n.local)?.info;
+  const halfCpus = local?.cpus ? local.cpus / 2 : null;
+  const halfMb = local?.memory_total ? Math.floor(local.memory_total / 2 / 1048576) : null;
   const changes = mergePatch(props.settings, toSettings(props.settings, f));
   const dirty = Object.keys(changes).length > 0;
   const s = useSubmit(async () => {
@@ -139,7 +146,7 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
         <div class="space-y-4">
           <Input
             label="Panel domain"
-            hint="Point the domain's DNS at this server first. Tugport then serves the panel there with HTTPS, and Git hosts send webhooks to it."
+            info="Point the domain's DNS at this server first. Tugport then serves the panel there with HTTPS, and Git hosts send webhooks to it."
             mono
             placeholder="deploy.example.com"
             {...bind("panelDomain")}
@@ -149,19 +156,19 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
               checked={f.panelPublic}
               onChange={(panelPublic) => set({ panelPublic })}
               label="Serve the panel on the panel domain"
-              hint="Turn this off to keep the panel private. The panel domain then answers only Git and deploy webhooks, and you open the panel through the address below, such as a tailnet IP."
+              info="Turn this off to keep the panel private. The panel domain then answers only Git and deploy webhooks, and you open the panel through the address below, such as a tailnet IP."
             />
           )}
           <Input
             label="Panel address"
-            hint="The address and port the panel itself listens on, like 100.64.0.5:8484 for a tailnet address. A change takes effect when Tugport restarts, so make sure you can reach the new address first."
+            info="The address and port the panel itself listens on, like 100.64.0.5:8484 for a tailnet address. A change takes effect when Tugport restarts, so make sure you can reach the new address first."
             mono
             {...bind("panelListen")}
           />
-          <Input label="Email for Let's Encrypt" hint="Let's Encrypt writes here about certificate problems." type="email" {...bind("acmeEmail")} />
+          <Input label="Email for Let's Encrypt" info="Let's Encrypt writes here about certificate problems." type="email" {...bind("acmeEmail")} />
           <TextArea
             label="Trusted proxies"
-            hint="Only these addresses may set the client IP through X-Forwarded-For, like Cloudflare or a load balancer; write one range per line."
+            info="Only these addresses may set the client IP through X-Forwarded-For, like Cloudflare or a load balancer; write one range per line."
             class="h-20"
             placeholder="173.245.48.0/20"
             {...bind("trusted")}
@@ -170,7 +177,10 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
       </Card>
       <Card title="Deploys and builds">
         <div class="space-y-4">
-          <Field label="When a deploy starts while another one runs" hint="Services can override this in their own settings.">
+          <Field
+            label="When a deploy starts while another one runs"
+            info="Cancelling suits frequent pushes, since only the newest one matters. Waiting makes every deploy finish in order. Services can override this in their own settings."
+          >
             <Select
               value={f.policy}
               onChange={(policy) => set({ policy })}
@@ -181,9 +191,26 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
             />
           </Field>
           <div class="grid gap-4 sm:grid-cols-3">
-            <Input label="Parallel builds" type="number" min={1} {...bind("maxParallel")} />
-            <Input label="Build CPU cap (cores)" hint="Empty means half of the machine." type="number" min={0} step="0.5" {...bind("bCpus")} />
-            <Input label="Build memory cap (MB)" hint="Empty means half of the memory." type="number" min={0} {...bind("bMem")} />
+            <Input label="Parallel builds" info="How many builds may run at once; more wait in a queue." type="number" min={1} {...bind("maxParallel")} />
+            <Input
+              label="Build CPU cap (cores)"
+              info="The most CPU one build may use, so a build never starves the running services. Leave it empty for half of the server."
+              hint={halfCpus ? `Empty means half of the server: ${halfCpus} cores.` : "Empty means half of the server."}
+              placeholder={halfCpus ? String(halfCpus) : undefined}
+              type="number"
+              min={0}
+              step="0.5"
+              {...bind("bCpus")}
+            />
+            <Input
+              label="Build memory cap (MB)"
+              info="The most memory one build may use. A build that goes over fails instead of pushing running services out of memory. Leave it empty for half of the server."
+              hint={halfMb ? `Empty means half of the server: ${halfMb.toLocaleString("en")} MB.` : "Empty means half of the server."}
+              placeholder={halfMb ? String(halfMb) : undefined}
+              type="number"
+              min={0}
+              {...bind("bMem")}
+            />
           </div>
         </div>
       </Card>
@@ -193,12 +220,12 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
             checked={f.dcEnabled}
             onChange={(dcEnabled) => set({ dcEnabled })}
             label="Clean up Docker automatically"
-            hint="Tugport removes unused images and caps the build cache, but it keeps the images of running services and the last few for rollbacks, and it never touches volumes."
+            info="Tugport removes unused images and caps the build cache, but it keeps the images of running services and the last few for rollbacks, and it never touches volumes."
           />
           {f.dcEnabled && (
             <div class="grid gap-4 sm:grid-cols-2">
-              <Input label="Every (hours)" type="number" min={1} {...bind("dcHours")} />
-              <Input label="Build cache to keep (GB)" type="number" min={0} {...bind("dcCache")} />
+              <Input label="Every (hours)" info="How often the cleanup runs." type="number" min={1} {...bind("dcHours")} />
+              <Input label="Build cache to keep (GB)" info="Cached build layers make rebuilds fast. The cleanup trims the cache down to this size, oldest layers first." type="number" min={0} {...bind("dcCache")} />
             </div>
           )}
           <Check
@@ -213,20 +240,20 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
           />
           {f.lcEnabled && (
             <div class="grid gap-4 sm:grid-cols-2">
-              <Input label="Keep at most (GB)" type="number" min={0} step="0.5" {...bind("lcGb")} />
-              <Input label="Keep at most (days)" hint="Empty means no age limit." type="number" min={1} {...bind("lcDays")} />
+              <Input label="Keep at most (GB)" info="The total size of all stored logs." type="number" min={0} step="0.5" {...bind("lcGb")} />
+              <Input label="Keep at most (days)" info="Empty means no age limit." type="number" min={1} {...bind("lcDays")} />
             </div>
           )}
         </div>
       </Card>
       <Card title="Alert thresholds">
-        <p class="mb-4 text-xs text-muted">Alerts go to the channels set up under Notifications once a condition lasts for the time below.</p>
+        <AlertDestinations channels={channels.data?.channels} />
         <div class="grid grid-cols-2 gap-4 sm:grid-cols-5">
-          <Input label="CPU (%)" type="number" min={1} max={100} {...bind("aCpu")} />
-          <Input label="Memory (%)" type="number" min={1} max={100} {...bind("aMem")} />
-          <Input label="Disk (%)" type="number" min={1} max={100} {...bind("aDisk")} />
-          <Input label="GPU (°C)" type="number" min={1} {...bind("aGpu")} />
-          <Input label="For (minutes)" type="number" min={1} {...bind("aFor")} />
+          <Input label="CPU (%)" info="An alert goes out when a server's CPU use stays above this." type="number" min={1} max={100} {...bind("aCpu")} />
+          <Input label="Memory (%)" info="An alert goes out when a server's memory use stays above this." type="number" min={1} max={100} {...bind("aMem")} />
+          <Input label="Disk (%)" info="An alert goes out when any of a server's disks is fuller than this." type="number" min={1} max={100} {...bind("aDisk")} />
+          <Input label="GPU (°C)" info="An alert goes out when a GPU stays hotter than this." type="number" min={1} {...bind("aGpu")} />
+          <Input label="For (minutes)" info="A condition has to last this long before it alerts, so short spikes stay quiet." type="number" min={1} {...bind("aFor")} />
         </div>
       </Card>
       <Card title="Updates">
@@ -235,15 +262,37 @@ function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceS
             checked={f.upAuto}
             onChange={(upAuto) => set({ upAuto })}
             label="Install new Tugport releases automatically"
-            hint="Tugport checks for a new release every 6 hours and switches to it without dropping traffic."
+            info="Tugport checks for a new release every 6 hours and switches to it without dropping traffic."
           />
-          <Field label="Channel">
+          <Field label="Channel" info="Stable gets tested releases. Beta gets new releases first and may have rough edges.">
             <Select value={f.upChannel} onChange={(upChannel) => set({ upChannel })} options={["stable", "beta"]} />
           </Field>
         </div>
       </Card>
       {dirty && <UnsavedBar s={s} onDiscard={reset} />}
     </form>
+  );
+}
+
+/** Where alerts go: the channels that take them, or a warning that nothing does. */
+function AlertDestinations(props: { channels?: { name: string; kind: string; events: string[] }[] }) {
+  if (!props.channels) return <p class="mb-4 text-xs text-muted">Alerts go to the notification channels that take them once a condition lasts for the time below.</p>;
+  const taking = props.channels.filter((c) => c.events.includes("*") || c.events.some((e) => e.startsWith("alert")));
+  return taking.length ? (
+    <p class="mb-4 text-dim">
+      Alerts go to {taking.map((c) => `${c.name} (${c.kind})`).join(", ")} once a condition lasts for the time below.{" "}
+      <a class="link" href="/settings/notifications">
+        Change channels
+      </a>
+    </p>
+  ) : (
+    <Note tone="warn" class="mb-4">
+      No notification channel takes alerts yet, so nobody hears about them.{" "}
+      <a class="link" href="/settings/notifications">
+        Add a Telegram, email or webhook channel
+      </a>{" "}
+      to get them.
+    </Note>
   );
 }
 
@@ -288,7 +337,7 @@ function Git(props: { owner: boolean }) {
   return (
     <>
       <Card title="Connected Git hosts" pad={false}>
-        <Loaded r={r}>
+        <Loaded r={r} skeleton={<RowsSkeleton />}>
           {(d) => (
             <Rows items={d.providers} empty="Nothing is connected yet. Connected hosts let you pick repositories and deploy on every push.">
               {(p) => (
@@ -457,8 +506,8 @@ function Notifications() {
                   <Action run={() => post(`/notifications/${c.id}/test`)} done="Test message sent.">
                     Send test
                   </Action>
-                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${c.name}?`} run={() => del(`/notifications/${c.id}`).then(r.reload)}>
-                    Remove
+                  <Action class="btn btn-ghost btn-sm px-2 text-bad" label={`Remove ${c.name}`} confirm={`Remove ${c.name}?`} run={() => del(`/notifications/${c.id}`).then(r.reload)}>
+                    <Icon name="trash" />
                   </Action>
                 </div>
               </li>
@@ -486,7 +535,7 @@ function Notifications() {
             <ConfigInput key={key} label={label} type={type} value={f.config[key]} onChange={(v) => set((s) => ({ config: { ...s.config, [key]: v } }))} />
           ))}
           {f.kind === "email" && <Check checked={f.tls} onChange={(tls) => set({ tls })} label="Use TLS" />}
-          <Input label="Events" hint="Use * for everything, or list events such as deploy.failed, deploy.succeeded and certificate.failed." class="font-mono" {...bind("events")} />
+          <Input label="Events" hint="Use * for everything, or list events such as deploy.failed, deploy.succeeded, certificate.failed and alert (server CPU, memory, disk and GPU alerts)." class="font-mono" {...bind("events")} />
           <FormButtons s={s} submit="Add channel" onCancel={() => setOpen(false)} />
         </form>
       </Modal>
@@ -505,7 +554,7 @@ function Registries() {
   return (
     <>
       <Card title="Registries" pad={false}>
-        <Loaded r={r}>
+        <Loaded r={r} skeleton={<RowsSkeleton />}>
           {(d) => (
             <Rows items={d.registries} empty="Add a registry to deploy private images from it. Public images need nothing here.">
               {(g) => (
@@ -513,8 +562,8 @@ function Registries() {
                   <span class="min-w-0 flex-1 truncate">
                     <span class="font-mono">{g.host}</span> <span class="text-muted">as {g.username}</span>
                   </span>
-                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${g.host}?`} run={() => del(`/registries/${g.id}`).then(r.reload)}>
-                    Remove
+                  <Action class="btn btn-ghost btn-sm px-2 text-bad" label={`Remove ${g.host}`} confirm={`Remove ${g.host}?`} run={() => del(`/registries/${g.id}`).then(r.reload)}>
+                    <Icon name="trash" />
                   </Action>
                 </li>
               )}

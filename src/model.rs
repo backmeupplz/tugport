@@ -248,6 +248,16 @@ impl Default for Health {
     }
 }
 
+impl Health {
+    /// A database's own check, run inside it. Once it is up, every 30 seconds with room to spare:
+    /// a check that starts a client (mongosh is a Node program) takes a second or more, and on a
+    /// busy server a 5-second schedule kept one running and flagged healthy databases. While it
+    /// starts, Docker still checks every second.
+    pub fn database(command: &str) -> Self {
+        Health { kind: HealthKind::Command, command: Some(command.into()), interval_s: 30, timeout_s: 15, start_period_s: 30, ..Health::default() }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {

@@ -17,6 +17,7 @@ import {
   Note,
   Page,
   Rows,
+  RowsSkeleton,
   Select,
   Tabs,
   TextArea,
@@ -458,7 +459,7 @@ function Keys(props: { user: User; self: boolean }) {
       }
       pad={false}
     >
-      <Loaded r={keys}>
+      <Loaded r={keys} skeleton={<RowsSkeleton />}>
         {(d) => (
           <Rows
             items={d.keys}

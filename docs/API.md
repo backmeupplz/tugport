@@ -84,7 +84,7 @@ Services can be addressed by id or as `project.service` (for example `shop.api`)
 - an optional `database: {engine: "postgres"|"mysql"|"mariadb"|"mongo"|"redis", user?, database?}`;
 - optional `env: {NAME: value}`.
 
-It returns `{id, name, kind, spec, deploy_hook, database?: {url, project_var}}`. A new database also adds a `<NAME>_URL` project variable. A service name whose container prefix (`tp-<project>-<name>`) another project's service already has is refused.
+It returns `{id, name, kind, spec, deploy_hook, database?: {url, project_var}}`. A new database also adds a `<NAME>_URL` project variable. Databases have no deploy webhook, so their `deploy_hook` is null. A service name whose container prefix (`tp-<project>-<name>`) another project's service already has is refused.
 
 A Compose stack's file is checked at every deploy. Without the stack's `privileged` switch (which needs `destroy`, like for apps), it may only use Compose keys that stay inside the stack: no privileged mode, capabilities, devices, host namespaces (`network_mode`, `pid` and `ipc` may only share another service of the stack), providers or API sockets; bind mounts, `env_file`, secrets, configs and build contexts only inside the stack's folder and without `${VAR}`; no external or named networks and volumes, network drivers other than bridge, IPAM settings, `include` or `extends` from other files. A repository whose symlinks point outside it is refused for any build.
 
@@ -125,7 +125,7 @@ Every field has a default. See `src/model.rs`.
 | GET / POST | `/api/services/{id}/domains` | POST takes `{host, path?, port, container?, https?, via_tunnel?, options?}`. A host belongs to one project, the panel's own domain to the panel, and turning on `via_tunnel` (which writes DNS records in the owner's Cloudflare account) needs the owner. |
 | PATCH / DELETE | `/api/domains/{id}` | PATCH takes the same fields; `container: null` clears a Compose container target. |
 | GET | `/api/services/{id}/hook` | The deploy webhook URL `{url}`. Needs `operator` and `secrets:read`. |
-| POST | `/api/services/{id}/hook` | Issues a new deploy webhook URL `{url}`; the old one stops working. |
+| POST | `/api/services/{id}/hook` | Issues a new deploy webhook URL `{url}`; the old one stops working. Databases have none. |
 | GET | `/api/services/{id}/replicas` | Databases: `{replicas: [{id, name, state, nodes, replication}]}`. `replication` is `copying`, `following` or `failed: <reason>`. |
 | POST | `/api/services/{id}/replicas` | Databases, `operator`: `{placement?}` adds a read replica, see [Database replicas](#database-replicas). Returns `{replica: {id, name}, deploy_id}`. |
 | POST | `/api/services/{id}/promote` | On a replica, `admin`: makes it a primary. Returns `{variable, message}`. |
@@ -158,6 +158,7 @@ Domain `options` contains:
 |---|---|---|
 | POST | `/api/services/{id}/deploy` | See below. |
 | GET | `/api/services/{id}/deploys` | `{deploys: [...], live}` |
+| GET | `/api/deploys` | The latest 100 deploys across the services the caller can see, each with `service` and `project` names: `{deploys: [...]}` |
 | GET | `/api/deploys/{id}` | `{deploy, log: [{ts, line}]}` |
 | GET | `/api/deploys/{id}/log` | SSE stream: `line` events (`{ts, line}`) and `status` events. Ends after the final status. |
 | POST | `/api/deploys/{id}/cancel` | |
@@ -295,6 +296,7 @@ The `config` for each kind:
 | PATCH / DELETE | `/api/backups/jobs/{id}` | |
 | POST | `/api/backups/jobs/{id}/run` | |
 | GET | `/api/backups/jobs/{id}/runs` | `{runs: [{id, kind, status, snapshot, size_bytes, error, started_at, finished_at}]}` |
+| GET | `/api/backups/runs` | The latest 100 backup and restore runs across the jobs the caller can see: `{runs: [{id, job_id, kind, status, size_bytes, error, started_at, finished_at, job_kind, service_id, volume, service, project}]}` |
 | POST | `/api/backups/runs/{id}/restore` | `{test?: true}` restores into a throwaway copy and reports. Returns `{ok, message}`. |
 
 ## Cloudflare Tunnel
@@ -315,7 +317,7 @@ A server is either **ingress** or not. The panel is always ingress. Only ingress
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/nodes` | `{mesh, nodes: [{id, name, local, ingress, address, mesh_ip, region, labels, status, info, last_seen_at, created_at}]}`. Needs the owner or a role on all projects. |
+| GET | `/api/nodes` | `{mesh, nodes: [{id, name, local, ingress, address, mesh_ip, region, labels, status, info, last_seen_at, created_at}]}`. Needs the owner or a role on all projects. `address` is the one a server joined through; for the panel's own server it is its public address. |
 | POST | `/api/nodes/join-token` | Owner. `{panel_url?}` returns `{token, command, expires_at}`: a one-hour command to run as root on the new server. The first call turns on the mesh. |
 | PATCH | `/api/nodes/{id}` | Owner. `{name?, region?, labels?, ingress?}`; `region: null` or `""` clears it. `ingress` has no effect on the panel (always ingress). |
 | DELETE | `/api/nodes/{id}?keep_machine=true&force=true` | Owner. Moves the server's services elsewhere, removes it from the mesh and, if Tugport created it in a cloud account, deletes the machine unless `keep_machine`. Refused (409) while services keep their data there, unless `force`. Returns `{ok, machine_deleted}`. |

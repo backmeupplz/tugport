@@ -357,7 +357,10 @@ fn database(svc: &Value, n: &mut NewService) {
     };
     n.env = env.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     n.env.extend(dotenv(st(svc, "env")));
-    n.spec.source = Source::Image { image: nonempty(st(svc, "image")).unwrap_or(default_image).into() };
+    // Easypanel's images are often a moving tag (mysql:9), and a redeploy would quietly upgrade the
+    // database to whatever it points at now. Swarm records the exact image it runs, so pin that.
+    let image = n.image.clone().filter(|i| i.contains("@sha256:")).unwrap_or_else(|| nonempty(st(svc, "image")).unwrap_or(default_image).into());
+    n.spec.source = Source::Image { image };
     n.spec.mounts.push(Mount::Bind { source: format!("{base}/data"), target: data.into(), readonly: false });
     if matches!(engine, Engine::Mysql | Engine::Mariadb) {
         n.spec.mounts.push(Mount::Bind { source: format!("{base}/easypanel.cnf"), target: "/etc/mysql/conf.d/easypanel.cnf".into(), readonly: false });
@@ -620,6 +623,7 @@ mod tests {
     fn maps_a_store() {
         let mut swarm = HashMap::new();
         swarm.insert("shop_api".to_string(), "easypanel/shop/api:latest".to_string());
+        swarm.insert("shop_db".to_string(), "postgres:16@sha256:abc".to_string());
         swarm.insert("loose_thing".to_string(), "nginx".to_string());
         let ctx = Ctx { acme: None, traefik: None, swarm, exists: &|_| false };
         let plan = map(fixture(), &ctx);
@@ -647,6 +651,7 @@ mod tests {
 
         let db = get("shop/db");
         assert_eq!((db.kind, db.cutover), ("database", Cutover::Swap));
+        assert!(matches!(&db.spec.source, Source::Image { image } if image == "postgres:16@sha256:abc"), "{:?}", db.spec.source);
         assert_eq!(db.env["POSTGRES_DB"], "shop");
         assert!(db.spec.mounts.contains(&Mount::Bind { source: "/etc/easypanel/projects/shop/db/data".into(), target: "/var/lib/postgresql/data".into(), readonly: false }));
         assert_eq!(db.overlays[1], ("easypanel-shop".to_string(), vec!["shop_db".to_string(), "shop-db".to_string(), "db".to_string()]));

@@ -23,7 +23,7 @@ Tugport must be installed and running: its proxy waits for ports 80 and 443 and 
 | Project (Coolify: project and environment; production keeps the project's name) | Project, with project-level env as shared variables |
 | App from GitHub, Git, image or Dockerfile | App with the same source. The first deploy runs the image the old service runs, so nothing is rebuilt during the move. |
 | Nixpacks / Railpack build settings | Same builder; install, build and start commands become `NIXPACKS_*` / `RAILPACK_*` variables |
-| Postgres, MySQL, MariaDB, MongoDB, Redis | Database service on the same data directory or volume, same credentials and image |
+| Postgres, MySQL, MariaDB, MongoDB, Redis | Database service on the same data directory or volume, same credentials and image (Easypanel: pinned to the exact image it runs, so a redeploy never upgrades it) |
 | Compose stack | Compose service; named volumes point at the old stack's volumes |
 | Env vars, file mounts | Encrypted env vars and files. Easypanel's `$(PROJECT_NAME)`, `$(SERVICE_NAME)`, `$(PRIMARY_DOMAIN)`, `$(EASYPANEL_HOST)` and `$(EASYPANEL_DOMAIN)` are filled in |
 | Volume and bind mounts | The same Docker volumes and host paths, so no data is copied |

@@ -39,6 +39,7 @@ There is deliberately no app store, no one-click templates, no teams or organiza
 
 - [API reference](docs/API.md), including the MCP endpoint
 - [Moving from Easypanel or Coolify](docs/MIGRATION.md)
+- [Moving a server to Tugport, for AI agents](website/agents.md), served at https://tugport.com/agents.md
 
 ## Repository
 

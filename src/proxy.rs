@@ -17,7 +17,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -187,6 +187,8 @@ pub struct Proxy {
     fallback: Arc<CertifiedKey>,
     pub challenges: Mutex<HashMap<String, String>>,
     rr: AtomicUsize,
+    /// Whether this proxy holds its ports; another proxy may still have them during a move.
+    pub listening: AtomicBool,
     /// Other servers' proxies that just refused a connection, until when to skip them.
     down: Mutex<HashMap<SocketAddr, std::time::Instant>>,
     /// Containers on their way out (scaling down): no new requests.
@@ -215,6 +217,7 @@ impl Proxy {
             fallback: Arc::new(fallback),
             challenges: Mutex::new(HashMap::new()),
             rr: AtomicUsize::new(0),
+            listening: AtomicBool::new(false),
             down: Mutex::new(HashMap::new()),
             draining: Mutex::new(Default::default()),
             remote_traffic: Mutex::new(HashMap::new()),
@@ -424,6 +427,7 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
     let (http_key, https_key) = (format!("proxy:{http_port}"), format!("proxy:{https_port}"));
     let (http, https) = tokio::try_join!(crate::handoff::listener(&http_key, bind(http_port)), crate::handoff::listener(&https_key, bind(https_port)))?;
     tracing::info!("proxy listening on :{http_port} and :{https_port}");
+    app.proxy.listening.store(true, Ordering::Relaxed);
     let a = app.clone();
     tokio::spawn(accept(http, move |stream, peer| {
         tokio::spawn(serve_conn(a.clone(), TokioIo::new(stream), peer, false));

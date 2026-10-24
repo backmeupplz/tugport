@@ -139,6 +139,17 @@
   .btn:hover { background: var(--surface); }
   .note { margin-top: 16px; font-size: 14.5px; color: var(--muted); }
 
+  /* A prompt to hand an AI agent, next to the install command. */
+  .ask { margin-top: 30px; max-width: 760px; }
+  .ask > p { font-size: 15px; color: var(--dim); margin-bottom: 10px; }
+  .prompt {
+    display: flex; align-items: center; gap: 16px;
+    background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; padding: 12px 12px 12px 18px;
+  }
+  .prompt q { flex: 1; quotes: none; font-size: 16px; line-height: 1.5; }
+  .prompt .copy { background: none; border: 1px solid var(--line-strong); color: var(--text); }
+  .prompt .copy:hover { background: var(--band); filter: none; }
+
   /* Screenshots */
   .frame { border: 1px solid var(--line-strong); border-radius: 14px; overflow: hidden; background: var(--surface); box-shadow: var(--shadow); }
   .bar {
@@ -239,6 +250,7 @@
     .cmd { width: 100%; flex-direction: column; align-items: stretch; gap: 12px; padding: 14px; }
     .cmd code { font-size: 13.5px; line-height: 1.6; white-space: normal; overflow-wrap: anywhere; }
     .actions .btn { flex: 1; justify-content: center; }
+    .prompt { flex-direction: column; align-items: stretch; gap: 12px; padding: 14px; }
     .hero figure { margin-top: 44px; }
     .bar { display: none; }
     .hero .frame { border-radius: 18px; max-width: 420px; margin: 0 auto; }
@@ -299,6 +311,13 @@
         <a class="btn" href="https://github.com/backmeupplz/tugport">View the source</a>
       </div>
       <p class="note">It runs on Linux with systemd, on x86_64 or arm64, and it is free and MIT licensed.</p>
+      <div class="ask">
+        <p>Or let Claude Code, Codex or another coding agent install it and move the apps already running on your server:</p>
+        <div class="prompt">
+          <q id="agent-prompt">Move the apps on my server to Tugport by following https://tugport.com/agents.md</q>
+          <button class="copy" type="button" data-copy="agent-prompt">Copy</button>
+        </div>
+      </div>
       <figure>
         <div class="frame">
           <div class="bar"><i></i><i></i><i></i><span>panel.example.com/projects/storefront/web</span></div>
@@ -460,6 +479,7 @@ Certificates: 1 imported, so nothing is re-issued</pre>
           <button class="copy" type="button" data-copy="install-cmd-2">Copy</button>
         </div>
       </div>
+      <p class="note">An AI agent can do these steps for you, and move the apps already on the server, with the <a href="/agents.md">instructions written for agents</a>.</p>
       <div class="more">
         <a class="btn" href="https://github.com/backmeupplz/tugport/blob/main/docs/API.md">Read the API reference</a>
         <a class="btn" href="https://github.com/backmeupplz/tugport/blob/main/docs/MIGRATION.md">Read the migration guide</a>

@@ -59,6 +59,11 @@ fn wanted(app: &App) -> Result<Vec<String>> {
 }
 
 async fn tick(app: &AppState) -> Result<()> {
+    // While another proxy (nginx, Caddy, Traefik) still holds port 80, Let's Encrypt would reach it
+    // instead and every attempt would fail and back off; issuing starts once the port is ours.
+    if !app.proxy.listening.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     let now = util::now();
     for host in wanted(app)? {
         let row = app.db.row("SELECT not_after, next_attempt_at FROM certificates WHERE host = ?1", [&host], |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)))?;

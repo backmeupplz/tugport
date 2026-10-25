@@ -18,6 +18,7 @@ import {
   Note,
   Page,
   Pill,
+  Skel,
   TextArea,
   toast,
   useForm,
@@ -85,7 +86,7 @@ export function Servers() {
       }
     >
       <ServerTabs current="list" />
-      <Loaded r={r}>
+      <Loaded r={r} skeleton={<ServersSkeleton />}>
         {(d) => (
           <div class="space-y-6">
             {(creating > 0 || failed > 0) && (
@@ -143,6 +144,45 @@ export function Servers() {
   );
 }
 
+/** A server card (name, status and facts) while the list loads. */
+const ServersSkeleton = () => (
+  <ul class="grid gap-4 lg:grid-cols-2" role="status" aria-label="Loading">
+    <li class="card p-4" aria-hidden="true">
+      <div class="flex items-center gap-2">
+        <Skel class="h-5 w-32" />
+        <Skel class="ml-auto h-5 w-16 rounded-full" />
+      </div>
+      <div class="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
+        {Array.from({ length: 8 }, (_, i) => (
+          <div key={i} class="space-y-1.5">
+            <Skel class="h-3 w-14" />
+            <Skel class="h-4 w-20" />
+          </div>
+        ))}
+      </div>
+    </li>
+  </ul>
+);
+
+/** A server's page while it loads: its live tiles and the charts under them. */
+const ServerSkeleton = () => (
+  <div class="space-y-6" role="status" aria-label="Loading">
+    <div class="grid grid-cols-2 gap-3 lg:grid-cols-4" aria-hidden="true">
+      {[0, 1, 2, 3].map((i) => (
+        <div key={i} class="card space-y-2 p-4">
+          <Skel class="h-3 w-12" />
+          <Skel class="h-6 w-20" />
+          <Skel class="h-1.5 w-full" />
+        </div>
+      ))}
+    </div>
+    <div class="grid gap-4 lg:grid-cols-2" aria-hidden="true">
+      <Skel class="h-56 rounded-xl" />
+      <Skel class="h-56 rounded-xl" />
+    </div>
+  </div>
+);
+
 function Heading({ node: n, provider }: { node: Node; provider: string }) {
   return (
     <div class="flex flex-wrap items-center gap-2">
@@ -199,7 +239,7 @@ export function ServerPage(props: { id?: string }) {
   if (!n) {
     return (
       <Page title="Server">
-        <Loaded r={r}>
+        <Loaded r={r} skeleton={<ServerSkeleton />}>
           {() => (
             <Empty
               action={

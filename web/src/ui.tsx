@@ -1,7 +1,7 @@
 // Small shared components. Native elements first: <dialog> for modals, confirm() for
 // quick confirmations, <fieldset disabled> for read-only forms.
-import type { ComponentChildren, JSX } from "preact";
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { createContext, type ComponentChildren, type JSX } from "preact";
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { ApiError } from "./api";
 import { Icon, type IconName } from "./icons";
 import { copyText, sentence } from "./util";
@@ -59,7 +59,7 @@ export function Card(props: { title?: ComponentChildren; actions?: ComponentChil
           {props.actions && <div class="flex flex-wrap gap-2">{props.actions}</div>}
         </header>
       )}
-      <div class={props.pad === false ? "" : "p-4 md:p-5"}>{props.children}</div>
+      <Unpadded.Provider value={props.pad === false}>{props.pad === false ? props.children : <div class="p-4 md:p-5">{props.children}</div>}</Unpadded.Provider>
     </section>
   );
 }
@@ -448,14 +448,20 @@ export function Note(props: { tone?: "info" | "warn" | "bad" | "ok"; children: C
 /** One gray placeholder block; `class` gives it its size. */
 export const Skel = (props: { class?: string }) => <span aria-hidden="true" class={`block animate-pulse rounded-md bg-raised ${props.class ?? "h-4 w-full"}`} />;
 
-/** A few lines of text, for blocks inside a padded card. */
-export const Loading = () => (
-  <div class="space-y-3 py-1" role="status" aria-label="Loading">
-    <Skel class="h-4 w-2/3" />
-    <Skel class="h-4 w-full" />
-    <Skel class="h-4 w-1/2" />
-  </div>
-);
+/** Inside a card without padding (a list), where a skeleton has to bring its own. */
+const Unpadded = createContext(false);
+
+/** A few lines of text, or list rows inside a card without padding. */
+export function Loading() {
+  if (useContext(Unpadded)) return <RowsSkeleton />;
+  return (
+    <div class="space-y-3 py-1" role="status" aria-label="Loading">
+      <Skel class="h-4 w-2/3" />
+      <Skel class="h-4 w-full" />
+      <Skel class="h-4 w-1/2" />
+    </div>
+  );
+}
 
 /** List rows (icon, two lines, a status), for cards without padding. */
 export const RowsSkeleton = (props: { n?: number }) => (
@@ -471,6 +477,13 @@ export const RowsSkeleton = (props: { n?: number }) => (
       </li>
     ))}
   </ul>
+);
+
+/** A list card (rows in a bordered box) while it loads. */
+export const ListSkeleton = (props: { n?: number }) => (
+  <div class="card">
+    <RowsSkeleton n={props.n} />
+  </div>
 );
 
 /** A card's outline with a title bar, filled with `children` (skeleton lines by default). */

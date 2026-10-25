@@ -5,6 +5,7 @@ import { Icon } from "../icons";
 import {
   Action,
   Card,
+  CardSkeleton,
   Check,
   Empty,
   ErrorBox,
@@ -123,7 +124,18 @@ function toSettings(s: InstanceSettings, f: GeneralForm): InstanceSettings {
 
 function General() {
   const r = useApi<InstanceSettings>("/settings", (e) => e.kind === "settings");
-  return <Loaded r={r}>{(s) => <GeneralForm key={JSON.stringify(s)} settings={s} onSaved={r.set} />}</Loaded>;
+  const skeleton = (
+    <div class="space-y-6">
+      <CardSkeleton />
+      <CardSkeleton />
+      <CardSkeleton />
+    </div>
+  );
+  return (
+    <Loaded r={r} skeleton={skeleton}>
+      {(s) => <GeneralForm key={JSON.stringify(s)} settings={s} onSaved={r.set} />}
+    </Loaded>
+  );
 }
 
 function GeneralForm(props: { settings: InstanceSettings; onSaved: (s: InstanceSettings) => void }) {

@@ -10,6 +10,7 @@ import {
   Field,
   FormButtons,
   Input,
+  ListSkeleton,
   Loaded,
   Loading,
   LoadingPage,
@@ -241,7 +242,7 @@ function People() {
       }
     >
       <AccessTabs current="people" />
-      <Loaded r={users}>
+      <Loaded r={users} skeleton={<ListSkeleton />}>
         {(d) => (
           <ul class="card divide-y divide-line">
             {d.users.map((u) => (
@@ -601,7 +602,7 @@ export function Audit() {
       {error ? (
         <ErrorBox error={error} />
       ) : !entries ? (
-        <Loading />
+        <ListSkeleton n={6} />
       ) : entries.length === 0 ? (
         <Empty>Nothing has been recorded for this filter yet.</Empty>
       ) : (

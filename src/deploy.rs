@@ -441,48 +441,41 @@ async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, log:
     crate::sleep::mark_active(app, &s.id);
     crate::proxy::reload(app);
     let serving_old = old.iter().filter(|r| r.state == "running").count();
-    if strategy == Strategy::StartFirst && serving_old > 0 && !store::domains(app, Some(&s.id))?.is_empty() {
-        let drain = s.spec.rollout.drain_s;
-        log.line(&format!("Traffic switched; letting the old version finish requests for {drain}s"));
-        tokio::time::sleep(Duration::from_secs(drain.into())).await;
+    let drain = if strategy == Strategy::StartFirst && serving_old > 0 && !store::domains(app, Some(&s.id))?.is_empty() { s.spec.rollout.drain_s } else { 0 };
+    if drain > 0 {
+        log.line(&format!("Traffic switched; the old version finishes its requests for {drain}s, then goes away"));
     }
-    // The new version is live: a failure to remove the old one is not a failed deploy.
-    if let Err(e) = remove_old(app, &s.id, deploy_id).await {
-        log.line(&format!("Warning: {e:#}; retrying in the background"));
-        tokio::spawn(retry_remove_old(app.clone(), s.id.clone(), deploy_id.to_string()));
-    }
-    Ok(())
-}
-
-/// Remove the replicas of other deploys than `live`. Listed here, after the switch, because
-/// replicas the autoscaler added meanwhile belong to the old version too.
-async fn remove_old(app: &App, service_id: &str, live: &str) -> Result<()> {
-    for r in runtime::replicas(app, service_id).await?.iter().filter(|r| r.deploy != live) {
-        runtime::stop_and_remove(app, r, 30).await.with_context(|| format!("removing the old container {}", r.name))?;
+    // The new version serves now, so the deploy is done: the old one drains and is removed in the
+    // background, and the next deploy can start meanwhile.
+    let mut retired: Vec<String> = old.into_iter().map(|r| r.deploy).collect();
+    retired.sort();
+    retired.dedup();
+    if !retired.is_empty() {
+        tokio::spawn(retire(app.clone(), s.id.clone(), retired, drain));
     }
     Ok(())
 }
 
-/// Keep trying to remove the old version for about half an hour, until another deploy replaces
-/// `live` (which then removes everything else itself).
-async fn retry_remove_old(app: AppState, service_id: String, live: String) {
-    for wait in [30, 60, 120, 240, 480, 900] {
+/// After `drain_s`, remove the containers of the `retired` deploys, retrying for about half an hour.
+/// Only those deploys: by then a newer deploy may be starting containers of its own. Replicas the
+/// autoscaler added to the old version meanwhile belong to a retired deploy too.
+async fn retire(app: AppState, service_id: String, retired: Vec<String>, drain_s: u32) {
+    tokio::time::sleep(Duration::from_secs(drain_s.into())).await;
+    for wait in [0, 30, 60, 120, 240, 480, 900] {
         tokio::time::sleep(Duration::from_secs(wait)).await;
-        if runtime::live_deploy(&app, &service_id).as_deref() != Some(live.as_str()) {
-            return;
-        }
-        if app.deployer.busy(&service_id) {
-            continue;
-        }
-        match remove_old(&app, &service_id, &live).await {
-            Ok(()) => {
-                tracing::info!("removed the old containers of {service_id} after deploy {live}");
-                return;
+        let result: Result<()> = async {
+            for r in runtime::replicas(&app, &service_id).await?.iter().filter(|r| retired.contains(&r.deploy)) {
+                runtime::stop_and_remove(&app, r, 30).await.with_context(|| format!("removing the old container {}", r.name))?;
             }
-            Err(e) => tracing::warn!("{e:#} (service {service_id}, deploy {live})"),
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => return,
+            Err(e) => tracing::warn!("{e:#} (service {service_id}); retrying"),
         }
     }
-    tracing::error!("gave up removing the old containers of {service_id} after deploy {live}; they are removed by the next deploy");
+    tracing::error!("gave up removing the old containers of {service_id}; the next deploy removes them");
 }
 
 /// Run `want` replicas of the live version: start more next to the running ones, or take

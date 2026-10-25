@@ -169,7 +169,7 @@ Domain `options` contains:
 `POST /api/services/{id}/deploy` takes `{ref?, wait?, timeout_s?, no_cache?}`:
 - **With `no_cache: true`:** the build skips the layer cache and pulls its base images again (BuildKit cache mounts are kept). The panel's "Redeploy without cache" button sends it.
 - **Without `wait`:** returns `{deploy_id, status: "queued"}` straight away.
-- **With `wait: true`:** blocks until the deploy finishes and returns `{deploy, log_tail}`.
+- **With `wait: true`:** blocks until the deploy finishes and returns `{deploy, log_tail}`. A deploy finishes once the new version serves; the old one drains (`rollout.drain_s`, start-first services with a domain) and is removed in the background.
 
 A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at, no_cache}`:
 - `status` is `queued`, `building`, `deploying`, `live`, `failed`, `cancelled` or `superseded`.
@@ -229,7 +229,7 @@ The settings fields are:
 - `docker_cleanup: {enabled, interval_hours, build_cache_gb}`
 - `log_cleanup: {enabled, max_gb, max_days}`
 - `trusted_proxies`
-- `builds: {max_parallel, cpus, memory_mb}`
+- `builds: {max_parallel, cpus, memory_mb}` (`max_parallel` applies at once)
 - `alerts: {cpu_percent, memory_percent, disk_percent, gpu_temp_c, for_minutes}`
 - `updates: {auto, channel}`: `auto` (on by default) installs new releases by itself, checking every 6 hours
 

@@ -653,7 +653,19 @@ pub async fn get_settings(State(app): State<AppState>, _: Owner) -> ApiResult<Js
 
 pub async fn update_settings(State(app): State<AppState>, Owner(a): Owner, Json(patch): Json<Value>) -> ApiResult<Json<Settings>> {
     let next: Settings = super::patched(&app.settings(), &patch, "settings")?;
+    let (was, now) = (app.settings().builds.max_parallel.max(1), next.builds.max_parallel.max(1));
     app.db.set_setting("instance", &next)?;
+    // Parallel builds apply at once: more slots now, fewer as running builds finish.
+    if now > was {
+        app.build_slots.add_permits((now - was) as usize);
+    } else if now < was {
+        let slots = app.build_slots.clone();
+        tokio::spawn(async move {
+            if let Ok(p) = slots.acquire_many_owned(was - now).await {
+                p.forget();
+            }
+        });
+    }
     a.audit(&app, "settings.update", None, Some(&patch.as_object().map(|o| names(o.keys())).unwrap_or_default()));
     app.emit("settings", None, None, json!({}));
     Ok(Json(next))

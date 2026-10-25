@@ -30,7 +30,12 @@ jobs:
         run: |
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $v in Cargo.toml"; exit 1; }
+      # The job image's Node 24 (/opt/acttoolcache) is on PATH already; setup-node would fetch the newest 24.x and
+      # copy it into an empty tool cache instead (20 s to 2.5 min on the runner's busy disk), so run it only without one
+      - id: node
+        run: node -v | grep -q '^v24\.' && echo have=1 >> "$GITHUB_OUTPUT" || true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: steps.node.outputs.have != '1'
         with:
           node-version: 24
       - name: Build the web panel
@@ -40,6 +45,10 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.arch }}-unknown-linux-musl
+      # Restore the registry and dependency builds of the last release build
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.arch }}
       - run: pip install --break-system-packages cargo-zigbuild==0.23.4 ziglang==0.16.0
       - name: Build a static binary
         env:

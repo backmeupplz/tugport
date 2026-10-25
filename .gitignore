@@ -2,3 +2,5 @@ target/
 web/node_modules/
 web/dist/
 .claude/
+docs/node_modules/
+website/docs/

@@ -1,0 +1,116 @@
+/* tugport.com/docs: the landing page's tokens, navigation and footer, plus styles for the guides. */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0A0E14;
+  --surface: #10161F;
+  --line: #1C2533;
+  --line-strong: #2A3546;
+  --text: #E8EDF3;
+  --dim: #A0ABBA;
+  --muted: #7A8698;
+  --accent: #FF6A3D;
+  --accent-text: #FF8A63;
+  --code-bg: #121923;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #F7F6F2;
+    --surface: #FFFFFF;
+    --line: #E6E1D8;
+    --line-strong: #D4CDC1;
+    --text: #141B26;
+    --dim: #4A5567;
+    --muted: #667080;
+    --accent-text: #B8401C;
+    --code-bg: #EFECE6;
+    color-scheme: light;
+  }
+}
+
+html { scroll-padding-top: 80px; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 400 16px/1.65 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; }
+code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+h1, h2, h3 { font-family: "Space Grotesk", Inter, system-ui, sans-serif; letter-spacing: -0.02em; font-weight: 600; text-wrap: balance; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* Navigation and footer, as on the landing page */
+.top { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 84%, transparent); backdrop-filter: saturate(1.4) blur(14px); -webkit-backdrop-filter: saturate(1.4) blur(14px); border-bottom: 1px solid var(--line); }
+nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+.brand img { width: 30px; height: 30px; }
+.brand span { font: 700 20px/1 "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
+.links { display: flex; align-items: center; gap: 22px; font-size: 15px; color: var(--dim); }
+.links a { text-decoration: none; }
+.links a:hover { color: var(--text); }
+.links .gh { color: var(--text); padding: 7px 12px; border: 1px solid var(--line-strong); border-radius: 9px; }
+footer { border-top: 1px solid var(--line); padding: 36px 0 48px; color: var(--muted); font-size: 14px; margin-top: 64px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 16px 28px; flex-wrap: wrap; }
+footer nav { height: auto; gap: 22px; flex-wrap: wrap; justify-content: flex-start; }
+footer a { text-decoration: none; color: var(--dim); }
+footer a:hover { color: var(--text); }
+
+/* The index */
+.index { padding-top: 56px; }
+.index h1 { font-size: clamp(34px, 5vw, 48px); line-height: 1.1; }
+.index .lead { margin-top: 14px; color: var(--dim); font-size: 18px; max-width: 40em; }
+.cards { list-style: none; margin-top: 36px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.cards a { display: block; height: 100%; padding: 22px 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); text-decoration: none; }
+.cards a:hover { border-color: var(--line-strong); }
+.cards h2 { font-size: 20px; }
+.cards p { margin-top: 8px; color: var(--dim); font-size: 15px; }
+
+/* A guide: contents on the left, the text on the right */
+.doc { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 48px; padding-top: 40px; }
+.doc aside { position: sticky; top: 88px; align-self: start; max-height: calc(100vh - 110px); overflow-y: auto; font-size: 14px; }
+.doc aside summary { list-style: none; font-weight: 600; color: var(--text); margin-bottom: 10px; cursor: default; }
+.doc aside summary::-webkit-details-marker { display: none; }
+.doc aside ul { list-style: none; }
+.doc aside li a { display: block; padding: 4px 0; color: var(--dim); text-decoration: none; line-height: 1.4; }
+.doc aside li a:hover { color: var(--text); }
+.doc aside li.d3 a { padding-left: 14px; font-size: 13.5px; color: var(--muted); }
+.doc main { min-width: 0; max-width: 820px; }
+.doc h1 { font-size: clamp(32px, 4.5vw, 44px); line-height: 1.1; }
+.doc .meta { margin-top: 10px; color: var(--muted); font-size: 14px; }
+.doc .meta a { color: var(--accent-text); text-decoration: none; }
+.doc main h2 { font-size: 26px; margin: 44px 0 14px; border-top: 1px solid var(--line); padding-top: 28px; }
+.doc main h3 { font-size: 19px; margin: 30px 0 10px; }
+.doc main h2, .doc main h3 { position: relative; }
+.doc .anchor { position: absolute; left: -0.9em; color: var(--muted); text-decoration: none; opacity: 0; }
+.doc h2:hover .anchor, .doc h3:hover .anchor { opacity: 1; }
+.doc main p, .doc main ul, .doc main ol { margin: 12px 0; color: var(--dim); }
+.doc main li { margin: 4px 0 4px 22px; }
+.doc main strong { color: var(--text); font-weight: 600; }
+.doc main a { color: var(--accent-text); text-decoration: none; }
+.doc main a:hover { text-decoration: underline; }
+.doc main :not(pre) > code { -webkit-box-decoration-break: clone; box-decoration-break: clone; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; overflow-wrap: anywhere; color: var(--text); }
+.doc main pre { margin: 16px 0; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; }
+.doc .table { margin: 16px 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+.doc table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.doc th, .doc td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--line); color: var(--dim); }
+.doc th { color: var(--text); font-weight: 600; background: var(--surface); white-space: nowrap; }
+.doc tr:last-child td { border-bottom: 0; }
+/* Methods and paths stay on one line; longer shapes (the spec table) wrap. */
+.doc td:first-child code, .doc tr:has(td:nth-child(3)) td:nth-child(2) code { white-space: nowrap; overflow-wrap: normal; }
+
+@media (max-width: 860px) {
+  .doc { grid-template-columns: 1fr; gap: 0; padding-top: 24px; }
+  .doc aside { position: static; max-height: none; margin-bottom: 24px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; background: var(--surface); }
+  .doc aside summary { cursor: pointer; margin: 0; }
+  .doc aside details[open] summary { margin-bottom: 8px; }
+  .doc .anchor { display: none; }
+}
+@media (max-width: 640px) {
+  .wrap { padding: 0 16px; }
+  .links { gap: 14px; }
+  footer nav a { padding: 8px 0; }
+}

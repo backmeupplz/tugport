@@ -37,8 +37,8 @@ There is deliberately no app store, no one-click templates, no teams or organiza
 
 ## Documentation
 
-- [API reference](docs/API.md), including the MCP endpoint
-- [Moving from Easypanel or Coolify](docs/MIGRATION.md)
+- [API reference](docs/API.md), including the MCP endpoint, at https://tugport.com/docs/api/
+- [Moving from Easypanel or Coolify](docs/MIGRATION.md), at https://tugport.com/docs/migration/
 - [Moving a server to Tugport, for AI agents](website/agents.md), served at https://tugport.com/agents.md
 
 ## Repository
@@ -49,7 +49,7 @@ There is deliberately no app store, no one-click templates, no teams or organiza
 | `web/` | The panel's web UI (Preact and Tailwind), embedded into release builds |
 | `docs/` | API reference and migration guide |
 | `dev/` | Docker-in-Docker boxes for building and testing on Linux (`dev/up.sh`) |
-| `website/` | tugport.com, deployed to GitHub Pages on every push to `main` |
+| `website/` | tugport.com, deployed to GitHub Pages on every push to `main`; its `docs/` pages are rendered from `docs/*.md` by `docs/build.mjs` (`cd docs && npm ci && node build.mjs`) |
 
 The share image `website/og.png` is rendered from `website/og.html` with headless Chrome:
 

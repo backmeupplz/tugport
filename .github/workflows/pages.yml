@@ -3,7 +3,7 @@ name: Deploy website to GitHub Pages
 on:
   push:
     branches: [main]
-    paths: [website/**, .github/workflows/pages.yml]
+    paths: [website/**, docs/**, .github/workflows/pages.yml]
   workflow_dispatch:
 
 permissions:
@@ -26,6 +26,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      # The docs pages are rendered from docs/*.md, so they never drift from the repository.
+      - run: cd docs && npm ci --ignore-scripts && node build.mjs
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: website

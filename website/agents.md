@@ -2,7 +2,7 @@
 
 You are an AI agent, and the person you work for asked you to move the apps on their Linux server into [Tugport](https://tugport.com), a self-hosted deploy platform that runs as one binary next to Docker. Follow these steps in order. The move should cost the apps at most a few seconds of downtime each, and nothing old is deleted until the person says so.
 
-The full API is described at https://github.com/backmeupplz/tugport/blob/main/docs/API.md. Read it before step 4.
+The full API is described at https://tugport.com/docs/api.md. Read it before step 4.
 
 ## Ground rules
 
@@ -22,7 +22,7 @@ If the person has not told you how to reach the server, ask for its SSH address 
 - the reverse proxy (nginx, Caddy, Traefik, Apache) and its config, which gives you the map of domains to apps and ports;
 - databases running natively (Postgres, MySQL, Redis) and which apps use them.
 
-If the server runs Easypanel or Coolify, stop here: Tugport moves those by itself with `tugport migrate`, as described at https://github.com/backmeupplz/tugport/blob/main/docs/MIGRATION.md. Install Tugport (step 2), run `tugport migrate easypanel --dry-run` or `tugport migrate coolify --dry-run`, show the person the plan, and run it without `--dry-run` once they agree.
+If the server runs Easypanel or Coolify, stop here: Tugport moves those by itself with `tugport migrate`, as described at https://tugport.com/docs/migration.md. Install Tugport (step 2), run `tugport migrate easypanel --dry-run` or `tugport migrate coolify --dry-run`, show the person the plan, and run it without `--dry-run` once they agree.
 
 Otherwise write the plan: for every app, what it becomes in Tugport (step 4), where its data lives, which domains point at it, and the order you will move things in. Ask the person to confirm it.
 

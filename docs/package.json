@@ -1,0 +1,12 @@
+{
+  "name": "tugport-docs",
+  "private": true,
+  "type": "module",
+  "description": "Renders docs/*.md into tugport.com/docs (node build.mjs).",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "marked": "16.3.0"
+  }
+}

@@ -49,7 +49,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.arch }}
-      - run: pip install --break-system-packages cargo-zigbuild==0.23.4 ziglang==0.16.0
+      # cargo-zigbuild and zig in a venv the runner's cache keeps, instead of a fresh pip install (~40 s) each release
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/zig-venv
+          key: zig-venv-${{ runner.os }}-cargo-zigbuild-0.23.4-ziglang-0.16.0
+      - name: cargo-zigbuild and zig
+        run: |
+          [ -x ~/zig-venv/bin/cargo-zigbuild ] || { python3 -m venv ~/zig-venv && ~/zig-venv/bin/pip install -q cargo-zigbuild==0.23.4 ziglang==0.16.0; }
+          echo ~/zig-venv/bin >> "$GITHUB_PATH"
       - name: Build a static binary
         env:
           TUGPORT_COMMIT: ${{ github.sha }}

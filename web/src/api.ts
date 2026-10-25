@@ -146,6 +146,7 @@ export interface Deploy {
   created_at: number;
   started_at: number | null;
   finished_at: number | null;
+  no_cache: boolean;
 }
 export interface Domain {
   id: string;

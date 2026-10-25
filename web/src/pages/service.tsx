@@ -67,8 +67,8 @@ export interface Ctx {
 const multiServer = (c: Ctx) => (c.nodes?.nodes.length ?? 0) > 1 || c.d.status.replicas.some((r) => r.node !== "local");
 
 /** Starts a deploy and opens its live log. */
-export async function deploy(c: Ctx) {
-  const r = await post<{ deploy_id: string }>(`/services/${c.d.service.id}/deploy`, {});
+export async function deploy(c: Ctx, noCache = false) {
+  const r = await post<{ deploy_id: string }>(`/services/${c.d.service.id}/deploy`, noCache ? { no_cache: true } : {});
   c.openLog(r.deploy_id);
 }
 
@@ -366,6 +366,7 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
         <div class="flex flex-wrap items-center gap-2">
           <Pill state={d.status} />
           {d.id === props.live && <span class="chip">serving traffic</span>}
+          {d.no_cache && <span class="chip">no cache</span>}
           <span class="text-dim">
             {started(d)}
             {took && ` · took ${took}`}
@@ -442,14 +443,22 @@ function Deploys({ c }: { c: Ctx }) {
   const id = c.d.service.id;
   const r = useApi<{ deploys: Deploy[]; live: string | null }>(`/services/${id}/deploys`, (e) => e.service_id === id && e.kind === "deploy");
   const canDeploy = atLeast(c.d.role, "deployer");
+  const builds = c.d.service.spec.source.type !== "image";
   return (
     <Card
       title="Deploys"
       actions={
         canDeploy && (
-          <Action confirm="Roll back to the previous image?" run={() => rollback(c)}>
-            Roll back
-          </Action>
+          <div class="flex flex-wrap gap-2">
+            {builds && (
+              <Action title="Rebuild every layer and pull the base images again" run={() => deploy(c, true)}>
+                Redeploy without cache
+              </Action>
+            )}
+            <Action confirm="Roll back to the previous image?" run={() => rollback(c)}>
+              Roll back
+            </Action>
+          </div>
         )
       }
       pad={false}

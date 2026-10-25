@@ -42,21 +42,24 @@ pub async fn build(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> 
         Build::Auto => Build::Railpack,
         other => other.clone(),
     };
+    if d.no_cache {
+        log.line("Building without the cache and with freshly pulled base images");
+    }
     let started = std::time::Instant::now();
     match &method {
         Build::Dockerfile { path, target } => {
             log.line(&format!("Building with {path}"));
             let file = crate::util::inside(&context, path).filter(|f| f.is_file()).ok_or_else(|| anyhow!("{path} not found in the build context"))?;
-            let mut cmd = buildx(s, &image, &env, &file);
+            let mut cmd = buildx(s, &image, &env, &file, d.no_cache);
             if let Some(t) = target {
                 cmd.args(["--target", t]);
             }
             build_args(&mut cmd, &env, &file, &s.spec.build_args, log);
             run(cmd, &context, sha, log).await?
         }
-        Build::Railpack => railpack(app, s, &context, &image, sha, &env, log).await?,
-        Build::Nixpacks => nixpacks(app, s, &context, &image, sha, &env, log).await?,
-        Build::Buildpacks { builder } => buildpacks(app, s, &context, &image, builder, &env, log).await?,
+        Build::Railpack => railpack(app, s, &context, &image, sha, &env, d.no_cache, log).await?,
+        Build::Nixpacks => nixpacks(app, s, &context, &image, sha, &env, d.no_cache, log).await?,
+        Build::Buildpacks { builder } => buildpacks(app, s, &context, &image, builder, &env, d.no_cache, log).await?,
         Build::Auto => bail!("no build method could be chosen"),
     }
     log.line(&format!("Built {image} in {:.1}s", started.elapsed().as_secs_f32()));
@@ -66,13 +69,16 @@ pub async fn build(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) -> 
 /// `docker buildx build -f file`. Build-time env for docker: secrets are read from
 /// the process environment, never argv, under neutral names, so a variable called PATH or
 /// DOCKER_CONFIG cannot steer docker itself.
-fn buildx(s: &Service, image: &str, env: &Env, file: &Path) -> Command {
+fn buildx(s: &Service, image: &str, env: &Env, file: &Path, no_cache: bool) -> Command {
     let mut cmd = Command::new("docker");
     cmd.args(["buildx", "build", "--progress=plain", "--load", "-t", image])
         .args(["--label", &format!("tugport.service={}", s.id)])
         .arg("-f")
         .arg(file)
         .env("DOCKER_BUILDKIT", "1");
+    if no_cache {
+        cmd.args(["--no-cache", "--pull"]);
+    }
     for (i, (k, v)) in env.iter().enumerate() {
         let alias = format!("TUGPORT_BUILD_SECRET_{i}");
         cmd.arg("--secret").arg(format!("id={k},env={alias}"));
@@ -149,7 +155,8 @@ async fn plan(mut cmd: Command, env: &Env, tool: &str, log: &DeployLog) -> Resul
     crate::proc::run_streamed(cmd, &|l| log.line(l)).await.with_context(|| format!("{} could not plan this repository", tool.to_lowercase()))
 }
 
-async fn railpack(app: &AppState, s: &Service, context: &Path, image: &str, sha: Option<&str>, env: &Env, log: &DeployLog) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn railpack(app: &AppState, s: &Service, context: &Path, image: &str, sha: Option<&str>, env: &Env, no_cache: bool, log: &DeployLog) -> Result<()> {
     let bin = tools::ensure(app, Tool::Railpack, &|l| log.line(l)).await?;
     let out = app.paths.sources().join(&s.id).join("plan");
     std::fs::create_dir_all(&out)?;
@@ -161,7 +168,7 @@ async fn railpack(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     if let Some(sha) = sha {
         std::fs::write(&plan_file, railpack_git_sha(&std::fs::read_to_string(&plan_file)?, sha)?)?;
     }
-    let mut cmd = buildx(s, image, env, &plan_file);
+    let mut cmd = buildx(s, image, env, &plan_file, no_cache);
     cmd.args(["--build-arg", &format!("BUILDKIT_SYNTAX={}", tools::RAILPACK_FRONTEND)]);
     cmd.args(["--build-arg", &format!("secrets-hash={}", secrets_hash(env))]);
     run(cmd, context, sha, log).await
@@ -185,7 +192,8 @@ fn secrets_hash(env: &Env) -> String {
     crate::util::sha256_hex(joined.as_bytes())
 }
 
-async fn nixpacks(app: &AppState, s: &Service, context: &Path, image: &str, sha: Option<&str>, env: &Env, log: &DeployLog) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn nixpacks(app: &AppState, s: &Service, context: &Path, image: &str, sha: Option<&str>, env: &Env, no_cache: bool, log: &DeployLog) -> Result<()> {
     let bin = tools::ensure(app, Tool::Nixpacks, &|l| log.line(l)).await?;
     // `--out` writes .nixpacks/Dockerfile without building. Variables are passed by name
     // so values stay out of the generated files; buildx supplies them as build args.
@@ -197,7 +205,7 @@ async fn nixpacks(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     let dockerfile = context.join(".nixpacks").join("Dockerfile");
     let Ok(text) = std::fs::read_to_string(&dockerfile) else { bail!("nixpacks did not produce a Dockerfile") };
     std::fs::write(&dockerfile, nixpacks_git_sha(&text))?;
-    let mut cmd = buildx(s, image, env, &dockerfile);
+    let mut cmd = buildx(s, image, env, &dockerfile, no_cache);
     build_args(&mut cmd, env, &dockerfile, &[], log);
     // Nixpacks' own defaults (NODE_ENV=production next to NPM_CONFIG_PRODUCTION=false, say), which
     // `nixpacks build` would pass itself; the service's variables win.
@@ -222,7 +230,8 @@ fn nixpacks_git_sha(dockerfile: &str) -> String {
     lines.join("\n") + "\n"
 }
 
-async fn buildpacks(app: &AppState, s: &Service, context: &Path, image: &str, builder: &str, env: &Env, log: &DeployLog) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn buildpacks(app: &AppState, s: &Service, context: &Path, image: &str, builder: &str, env: &Env, no_cache: bool, log: &DeployLog) -> Result<()> {
     let bin = tools::ensure(app, Tool::Pack, &|l| log.line(l)).await?;
     log.line(&format!("Building with buildpacks ({builder})"));
     // Values go through a memory-only env file instead of the command line.
@@ -230,7 +239,10 @@ async fn buildpacks(app: &AppState, s: &Service, context: &Path, image: &str, bu
     let lines = Zeroizing::new(env.iter().map(|(k, v)| format!("{k}={}\n", v.replace('\n', "\\n"))).collect::<String>());
     crate::util::write_private(&env_file, lines.as_bytes())?;
     let mut cmd = Command::new(&bin);
-    cmd.args(["build", image, "--builder", builder, "--docker-host", "inherit", "--pull-policy", "if-not-present"]);
+    cmd.args(["build", image, "--builder", builder, "--docker-host", "inherit", "--pull-policy", if no_cache { "always" } else { "if-not-present" }]);
+    if no_cache {
+        cmd.arg("--clear-cache");
+    }
     // A trusted builder runs with access to the Docker daemon, so only well-known builders get it;
     // others run their buildpacks in separate containers without it (slower, same result).
     if trusted_builder(builder) {

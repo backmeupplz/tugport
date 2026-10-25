@@ -166,11 +166,12 @@ Domain `options` contains:
 | POST | `/api/services/{id}/restart` / `stop` / `start` | |
 | GET | `/api/events?project&service` | SSE stream, see below. |
 
-`POST /api/services/{id}/deploy` takes `{ref?, wait?, timeout_s?}`:
+`POST /api/services/{id}/deploy` takes `{ref?, wait?, timeout_s?, no_cache?}`:
+- **With `no_cache: true`:** the build skips the layer cache and pulls its base images again (BuildKit cache mounts are kept). The panel's "Redeploy without cache" button sends it.
 - **Without `wait`:** returns `{deploy_id, status: "queued"}` straight away.
 - **With `wait: true`:** blocks until the deploy finishes and returns `{deploy, log_tail}`.
 
-A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at}`:
+A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at, no_cache}`:
 - `status` is `queued`, `building`, `deploying`, `live`, `failed`, `cancelled` or `superseded`.
 - `trigger` is `manual`, `api`, `agent`, `push`, `webhook`, `rollback`, `autoupdate`, `migration`, `reschedule` (its server went away), `drain` (its server is being removed), `replica` or `replication`.
 

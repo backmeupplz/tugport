@@ -46,6 +46,10 @@ pub async fn deploy(app: &AppState, s: &Service, d: &Deploy, log: &DeployLog) ->
     };
     log.line("Pulling images");
     crate::proc::run_streamed(compose(&["pull", "--ignore-buildable", "--quiet"]), &|l| log.line(l)).await?;
+    if d.no_cache {
+        log.line("Building without the cache and with freshly pulled base images");
+        crate::proc::run_streamed(compose(&["build", "--no-cache", "--pull"]), &|l| log.line(l)).await.context("the build failed")?;
+    }
     log.line("Starting the stack");
     crate::proc::run_streamed(compose(&["up", "-d", "--build", "--remove-orphans", "--wait", "--wait-timeout", "300"]), &|l| log.line(l))
         .await

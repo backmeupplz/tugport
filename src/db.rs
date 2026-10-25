@@ -8,6 +8,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/002_cloud.sql"),
     include_str!("migrations/003_ingress.sql"),
     include_str!("migrations/004_databases.sql"),
+    include_str!("migrations/005_no_cache.sql"),
 ];
 
 /// SQLite in WAL mode behind a mutex. Calls are short; never hold the guard across `.await`.

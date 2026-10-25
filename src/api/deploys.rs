@@ -24,6 +24,8 @@ pub struct DeployBody {
     /// Block until the deploy finishes and return its outcome and log tail.
     wait: bool,
     timeout_s: Option<u64>,
+    /// Build without the layer cache and pull base images again.
+    no_cache: bool,
 }
 
 fn trigger_for(a: &Auth) -> &'static str {
@@ -39,7 +41,7 @@ pub async fn deploy(State(app): State<AppState>, a: Auth, Path(id): Path<String>
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
     check_ref(b.git_ref.as_deref())?;
     let mut events = app.events.subscribe();
-    let req = Request { trigger: trigger_for(&a).into(), actor: Some(a.0.name.clone()), git_ref: b.git_ref, ..Default::default() };
+    let req = Request { trigger: trigger_for(&a).into(), actor: Some(a.0.name.clone()), git_ref: b.git_ref, no_cache: b.no_cache, ..Default::default() };
     let did = deploy::enqueue(&app, &s, req)?;
     a.audit_service(&app, "deploy.start", &s, Some(&did));
     if !b.wait {

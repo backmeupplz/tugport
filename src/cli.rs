@@ -28,6 +28,9 @@ pub enum Client {
         service: String,
         #[arg(long = "ref")]
         git_ref: Option<String>,
+        /// Build without the layer cache and pull base images again.
+        #[arg(long)]
+        no_cache: bool,
         /// Return right away instead of following the deploy.
         #[arg(long)]
         detach: bool,
@@ -255,8 +258,8 @@ pub async fn run(cmd: Client, json: bool) -> Result<i32> {
                 println!("  last deploy {} ({})", d.get("status").map_or("", s), d.get("trigger").map_or("", s));
             }
         }),
-        Client::Deploy { service, git_ref, detach } => {
-            let v = api.post(&format!("/api/services/{service}/deploy"), json!({ "ref": git_ref })).await?;
+        Client::Deploy { service, git_ref, no_cache, detach } => {
+            let v = api.post(&format!("/api/services/{service}/deploy"), json!({ "ref": git_ref, "no_cache": no_cache })).await?;
             let id = v["deploy_id"].as_str().ok_or_else(|| anyhow!("no deploy id returned"))?.to_string();
             if detach {
                 return print(json, &v, |_| println!("Deploy {id} queued."));

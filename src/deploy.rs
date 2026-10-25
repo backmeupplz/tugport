@@ -55,9 +55,11 @@ pub struct Deploy {
     pub created_at: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// Built with no layer cache and freshly pulled base images.
+    pub no_cache: bool,
 }
 
-const SELECT: &str = "SELECT id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at FROM deploys";
+const SELECT: &str = "SELECT id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at, no_cache FROM deploys";
 
 fn row(r: &rusqlite::Row) -> rusqlite::Result<Deploy> {
     Ok(Deploy {
@@ -74,6 +76,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<Deploy> {
         created_at: r.get(10)?,
         started_at: r.get(11)?,
         finished_at: r.get(12)?,
+        no_cache: r.get(13)?,
     })
 }
 
@@ -101,6 +104,8 @@ pub struct Request {
     pub commit_message: Option<String>,
     /// Deploy this exact image (rollbacks) instead of building or pulling.
     pub image: Option<String>,
+    /// Build without the layer cache and pull base images again.
+    pub no_cache: bool,
 }
 
 fn set_status(app: &App, d: &str, status: &str, error: Option<&str>) {
@@ -132,8 +137,8 @@ fn transition(app: &App, s: &Service, d: &str, status: &str, error: Option<&str>
 pub fn enqueue(app: &AppState, s: &Service, req: Request) -> Result<String> {
     let id = util::id();
     app.db.exec(
-        "INSERT INTO deploys (id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, created_at) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![id, s.id, req.trigger, req.actor, req.git_ref, req.commit_sha, req.commit_message, req.image, util::now()],
+        "INSERT INTO deploys (id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, created_at, no_cache) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![id, s.id, req.trigger, req.actor, req.git_ref, req.commit_sha, req.commit_message, req.image, util::now(), req.no_cache],
     )?;
     announce(app, s, &id, "queued");
     let policy = s.spec.deploy_policy.unwrap_or(app.settings().deploy_policy);
@@ -550,7 +555,7 @@ mod tests {
         let mut d = Deploy {
             id: "d".into(), service_id: "s".into(), status: "live".into(), trigger: "push".into(), actor: None, git_ref: None,
             commit_sha: Some("0123456789abcdef".into()), commit_message: Some("fix it\nbody".into()), image: None, error: None,
-            created_at: 0, started_at: None, finished_at: None,
+            created_at: 0, started_at: None, finished_at: None, no_cache: false,
         };
         assert_eq!(summary(&d), "0123456 fix it");
         d.commit_sha = Some("ééééé".into());

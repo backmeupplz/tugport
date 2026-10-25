@@ -21,6 +21,7 @@ function toForm(spec: Spec) {
     path: src.type === "git" ? src.path : "",
     watch: src.type === "git" ? src.watch_paths.join("\n") : "",
     auto: src.type === "git" ? src.auto_deploy : true,
+    submodules: src.type === "git" ? (src.submodules ?? true) : true,
     image: src.type === "image" ? src.image : "",
     content: src.type === "dockerfile" ? src.content : "",
     yaml: src.type === "compose" ? src.yaml : "",
@@ -231,6 +232,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                     />
                   )}
                   <Check checked={f.auto} onChange={(auto) => set({ auto })} label="Deploy on every push" info="A push to the branch builds and deploys the service. With this off, it deploys only from the panel, the CLI or its deploy webhook." />
+                  <Check checked={f.submodules} onChange={(submodules) => set({ submodules })} label="Check out submodules" info="Deploys fetch the repository's Git submodules. Turn this off for services that don't use them, so their deploys skip that download." />
                 </>
               )}
               {f.srcType === "image" && <Input label="Image" info="A Docker image reference like nginx:1.27 or ghcr.io/owner/app:latest. Private registries need their login under Settings, Registries." mono required {...bind("image")} />}

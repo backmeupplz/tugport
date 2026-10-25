@@ -103,6 +103,9 @@ pub enum Source {
         watch_paths: Vec<String>,
         #[serde(default = "yes")]
         auto_deploy: bool,
+        /// Check out the repository's submodules (recursively, shallow).
+        #[serde(default = "yes")]
+        submodules: bool,
     },
     Image {
         image: String,
@@ -472,6 +475,6 @@ mod tests {
         assert_eq!(spec.rollout.strategy, Strategy::StartFirst);
         assert_eq!(spec.build, Build::Auto);
         let git: Source = serde_json::from_str(r#"{"type":"git","repo":"o/r"}"#).unwrap();
-        assert!(matches!(git, Source::Git { ref branch, auto_deploy: true, .. } if branch == "main"));
+        assert!(matches!(git, Source::Git { ref branch, auto_deploy: true, submodules: true, .. } if branch == "main"));
     }
 }

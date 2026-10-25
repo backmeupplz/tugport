@@ -560,7 +560,7 @@ pub async fn create_replica(app: &App, node: &NodeHandle, s: &Service, deploy_id
         ..Default::default()
     };
     // A leftover container with the same name (from a crashed deploy) would block creation.
-    force_remove(&node.docker, &name).await;
+    let _ = force_remove(&node.docker, &name).await;
     let created = node
         .docker
         .create_container(Some(CreateContainerOptions { name: Some(name.clone()), ..Default::default() }), config)
@@ -585,32 +585,63 @@ pub async fn start_healthy(app: &App, node: &NodeHandle, s: &Service, deploy_id:
     Ok(id)
 }
 
+/// Calls that wait on the daemon's own work (starting, stopping, removing, loading images) can
+/// take minutes on a host with saturated disks; bollard's 2-minute default would report a failure
+/// while Docker is still doing the work.
+pub const SLOW: Duration = Duration::from_secs(600);
+
+pub fn slow(docker: bollard::Docker) -> bollard::Docker {
+    docker.with_timeout(SLOW)
+}
+
+fn gone(e: &bollard::errors::Error) -> bool {
+    matches!(e, bollard::errors::Error::DockerResponseServerError { status_code: 404, .. })
+}
+
 pub async fn start(app: &App, node: &str, id: &str) -> Result<()> {
-    app.docker_on(node)?.start_container(id, None::<bollard::query_parameters::StartContainerOptions>).await.with_context(|| format!("starting {id}"))?;
+    slow(app.docker_on(node)?).start_container(id, None::<bollard::query_parameters::StartContainerOptions>).await.with_context(|| format!("starting {id}"))?;
     Ok(())
 }
 
 pub async fn stop(app: &App, node: &str, id: &str, timeout_s: i32) -> Result<()> {
-    match app.docker_on(node)?.stop_container(id, Some(StopContainerOptions { t: Some(timeout_s), ..Default::default() })).await {
-        Ok(()) => Ok(()),
-        Err(bollard::errors::Error::DockerResponseServerError { status_code: 304 | 404, .. }) => Ok(()),
-        Err(e) => Err(e.into()),
+    stop_on(&app.docker_on(node)?, id, timeout_s).await
+}
+
+/// Stop a container. When the stop call fails (a client timeout while the daemon is busy, say),
+/// kill it and succeed if it is down after all: callers must not act on a container that may still run.
+async fn stop_on(docker: &bollard::Docker, id: &str, timeout_s: i32) -> Result<()> {
+    let grace = Duration::from_secs(timeout_s.max(0) as u64);
+    let docker = docker.clone().with_timeout(SLOW + grace);
+    let err = match docker.stop_container(id, Some(StopContainerOptions { t: Some(timeout_s), ..Default::default() })).await {
+        Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 304 | 404, .. }) => return Ok(()),
+        Err(e) => e,
+    };
+    tracing::warn!("stopping {id}: {err}; killing it");
+    let _ = docker.kill_container(id, None::<bollard::query_parameters::KillContainerOptions>).await;
+    match docker.inspect_container(id, None::<bollard::query_parameters::InspectContainerOptions>).await {
+        Ok(i) if i.state.as_ref().and_then(|s| s.running) != Some(true) => Ok(()),
+        Err(e) if gone(&e) => Ok(()),
+        _ => Err(anyhow::Error::from(err).context(format!("{id} is still running"))),
     }
 }
 
 pub async fn restart(app: &App, node: &str, id: &str) -> Result<()> {
-    app.docker_on(node)?.restart_container(id, None::<bollard::query_parameters::RestartContainerOptions>).await?;
+    slow(app.docker_on(node)?).restart_container(id, None::<bollard::query_parameters::RestartContainerOptions>).await?;
     Ok(())
 }
 
-async fn force_remove(docker: &bollard::Docker, id: &str) {
-    let _ = docker.remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await;
+async fn force_remove(docker: &bollard::Docker, id: &str) -> Result<()> {
+    match slow(docker.clone()).remove_container(id, Some(RemoveContainerOptions { force: true, ..Default::default() })).await {
+        // 409: Docker is already removing it.
+        Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 404 | 409, .. }) => Ok(()),
+        Err(e) => Err(anyhow::Error::from(e).context(format!("removing {id}"))),
+    }
 }
 
 pub async fn remove(app: &App, node: &str, id: &str, name: &str) -> Result<()> {
-    force_remove(&app.docker_on(node)?, id).await;
+    let removed = force_remove(&app.docker_on(node)?, id).await;
     crate::nodes::forget_secrets(app, node, name).await;
-    Ok(())
+    removed
 }
 
 pub async fn stop_and_remove(app: &App, r: &Replica, timeout_s: i32) -> Result<()> {
@@ -769,6 +800,68 @@ pub async fn detect_gpu(app: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Docker API that fails every stop with `stop_status`; a kill stops the container if `killable`.
+    async fn fake_docker(stop_status: u16, killable: bool) -> (bollard::Docker, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::{Method, StatusCode, Uri};
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(vec![]));
+        let running = Arc::new(Mutex::new(true));
+        let (seen, up) = (calls.clone(), running.clone());
+        let app = axum::Router::new().fallback(move |method: Method, uri: Uri| {
+            let (seen, up) = (seen.clone(), up.clone());
+            async move {
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(format!("{method} {}", path.rsplit('/').next().unwrap_or("")));
+                if path.ends_with("/stop") {
+                    (StatusCode::from_u16(stop_status).unwrap(), r#"{"message":"Timeout error"}"#.to_string())
+                } else if path.ends_with("/kill") {
+                    *up.lock().unwrap() = !killable;
+                    (StatusCode::NO_CONTENT, String::new())
+                } else {
+                    (StatusCode::OK, format!(r#"{{"Id":"c1","State":{{"Running":{}}}}}"#, up.lock().unwrap()))
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = Arc::new(hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build_http());
+        let docker = bollard::Docker::connect_with_custom_transport(
+            move |req: bollard::BollardRequest| {
+                let client = client.clone();
+                async move { client.request(req).await.map_err(bollard::errors::Error::from) }
+            },
+            Some(format!("http://{addr}")),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        (docker, calls)
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_kills_and_succeeds_once_the_container_is_down() {
+        let (docker, calls) = fake_docker(500, true).await;
+        stop_on(&docker, "c1", 30).await.unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["POST stop", "POST kill", "GET json"]);
+    }
+
+    #[tokio::test]
+    async fn a_container_that_keeps_running_is_an_error() {
+        let (docker, _) = fake_docker(500, false).await;
+        let e = stop_on(&docker, "c1", 30).await.unwrap_err();
+        assert!(format!("{e:#}").contains("still running"), "{e:#}");
+    }
+
+    #[tokio::test]
+    async fn stopped_or_missing_containers_need_no_kill() {
+        for status in [304, 404] {
+            let (docker, calls) = fake_docker(status, false).await;
+            stop_on(&docker, "c1", 30).await.unwrap();
+            assert_eq!(*calls.lock().unwrap(), ["POST stop"]);
+        }
+    }
 
     #[test]
     fn health_commands_run_through_init() {

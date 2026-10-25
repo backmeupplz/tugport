@@ -229,6 +229,7 @@ fn app(svc: &Value, n: &mut NewService, ctx: &Ctx, has_token: bool, registries: 
             path: path.clone(),
             watch_paths: vec![],
             auto_deploy: src["autoDeploy"].as_bool().unwrap_or(false),
+            submodules: true,
         },
         "github" => {
             n.notes.push("Easypanel has no GitHub token, so the repository is cloned without one".into());

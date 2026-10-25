@@ -108,14 +108,19 @@ fn build_slice() -> Option<&'static str> {
     Path::new("/sys/fs/cgroup/tugport.slice/tugport-builds.slice").exists().then_some("tugport-builds.slice")
 }
 
+/// Names declared with ARG, several per line too (`ARG CI NODE_ENV`, as Nixpacks writes them).
 fn declared_args(dockerfile: &str) -> Vec<String> {
     dockerfile
         .lines()
         .filter_map(|l| {
             let l = l.trim_start();
-            let rest = l.get(..4).filter(|kw| kw.eq_ignore_ascii_case("ARG ")).and(l.get(4..))?.trim_start();
-            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-            (!name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit())).then_some(name)
+            l.get(..4).filter(|kw| kw.eq_ignore_ascii_case("ARG ")).and(l.get(4..))
+        })
+        .flat_map(str::split_whitespace)
+        .filter_map(|word| {
+            let name = word.split_once('=').map_or(word, |(n, _)| n);
+            let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            valid.then(|| name.to_string())
         })
         .collect()
 }
@@ -153,10 +158,25 @@ async fn railpack(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     prepare.arg("prepare").arg(context).arg("--plan-out").arg(&plan_file).arg("--info-out").arg(out.join("railpack-info.json"));
     // Railpack turns the variables into build secrets.
     plan(prepare, env, "Railpack", log).await?;
+    if let Some(sha) = sha {
+        std::fs::write(&plan_file, railpack_git_sha(&std::fs::read_to_string(&plan_file)?, sha)?)?;
+    }
     let mut cmd = buildx(s, image, env, &plan_file);
     cmd.args(["--build-arg", &format!("BUILDKIT_SYNTAX={}", tools::RAILPACK_FRONTEND)]);
     cmd.args(["--build-arg", &format!("secrets-hash={}", secrets_hash(env))]);
     run(cmd, context, sha, log).await
+}
+
+/// The Railpack frontend ignores build args, so GIT_SHA goes into the plan as a variable of the
+/// build step: a new commit reruns the build, not the install before it.
+fn railpack_git_sha(plan: &str, sha: &str) -> Result<String> {
+    let mut plan: serde_json::Value = serde_json::from_str(plan).context("reading the Railpack plan")?;
+    if let Some(steps) = plan["steps"].as_array_mut() {
+        for step in steps.iter_mut().filter(|s| s["name"] == "build") {
+            step["variables"]["GIT_SHA"] = sha.into();
+        }
+    }
+    Ok(serde_json::to_string(&plan)?)
 }
 
 /// Changes when any variable changes, so cached layers that used it are rebuilt.
@@ -172,13 +192,34 @@ async fn nixpacks(app: &AppState, s: &Service, context: &Path, image: &str, sha:
     let mut prepare = Command::new(&bin);
     prepare.arg("build").arg(context).arg("--out").arg(context).arg("--name").arg(image);
     plan(prepare, env, "Nixpacks", log).await?;
+    // build.sh spells out every value and would be copied into the image with the source.
+    let _ = std::fs::remove_file(context.join(".nixpacks").join("build.sh"));
     let dockerfile = context.join(".nixpacks").join("Dockerfile");
-    if !dockerfile.exists() {
-        bail!("nixpacks did not produce a Dockerfile");
-    }
+    let Ok(text) = std::fs::read_to_string(&dockerfile) else { bail!("nixpacks did not produce a Dockerfile") };
+    std::fs::write(&dockerfile, nixpacks_git_sha(&text))?;
     let mut cmd = buildx(s, image, env, &dockerfile);
     build_args(&mut cmd, env, &dockerfile, &[], log);
+    // Nixpacks' own defaults (NODE_ENV=production next to NPM_CONFIG_PRODUCTION=false, say), which
+    // `nixpacks build` would pass itself; the service's variables win.
+    let mut defaults = Command::new(&bin);
+    defaults.arg("plan").arg(context);
+    let plan: serde_json::Value = serde_json::from_str(&crate::proc::output(defaults).await?).context("reading the Nixpacks plan")?;
+    for (k, v) in plan["variables"].as_object().into_iter().flatten() {
+        if let (false, Some(v)) = (env.contains_key(k), v.as_str()) {
+            cmd.args(["--build-arg", &format!("{k}={v}")]);
+        }
+    }
     run(cmd, context, sha, log).await
+}
+
+/// Declare GIT_SHA right before the build phase of a Nixpacks Dockerfile: a new commit then reruns
+/// the build, not the dependency install above it.
+fn nixpacks_git_sha(dockerfile: &str) -> String {
+    let mut lines: Vec<&str> = dockerfile.lines().collect();
+    if let Some(i) = ["# build phase", "# start"].iter().find_map(|m| lines.iter().position(|l| l.trim() == *m)) {
+        lines.insert(i, "ARG GIT_SHA");
+    }
+    lines.join("\n") + "\n"
 }
 
 async fn buildpacks(app: &AppState, s: &Service, context: &Path, image: &str, builder: &str, env: &Env, log: &DeployLog) -> Result<()> {
@@ -211,7 +252,7 @@ fn trusted_builder(builder: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{declared_args, trusted_builder};
+    use super::{declared_args, nixpacks_git_sha, railpack_git_sha, trusted_builder};
 
     #[test]
     fn only_known_builders_are_trusted() {
@@ -225,5 +266,28 @@ mod tests {
     fn finds_declared_args() {
         let df = "FROM node:24\nARG NPM_TOKEN\n arg VITE_API_URL=default\nRUN echo $NPM_TOKEN\n# ARG COMMENTED\n";
         assert_eq!(declared_args(df), vec!["NPM_TOKEN", "VITE_API_URL"]);
+    }
+
+    #[test]
+    fn finds_every_arg_of_a_line() {
+        let df = "ARG CI FOO NIXPACKS_METADATA\nARG A=1 B=two 9X\n";
+        assert_eq!(declared_args(df), vec!["CI", "FOO", "NIXPACKS_METADATA", "A", "B"]);
+    }
+
+    #[test]
+    fn git_sha_comes_after_the_install() {
+        let df = "FROM x\nARG CI\n# install phase\nRUN npm ci\n\n# build phase\nCOPY . /app/.\nRUN npm run build\n# start\nCMD [\"npm start\"]\n";
+        let out = nixpacks_git_sha(df);
+        assert!(out.contains("RUN npm ci\n\nARG GIT_SHA\n# build phase\n"), "{out}");
+        assert_eq!(nixpacks_git_sha("FROM x\nRUN a\n# start\nCMD b\n"), "FROM x\nRUN a\nARG GIT_SHA\n# start\nCMD b\n");
+        assert_eq!(nixpacks_git_sha("FROM x\n"), "FROM x\n");
+    }
+
+    #[test]
+    fn railpack_gets_git_sha_in_the_build_step_only() {
+        let plan = r#"{"steps":[{"name":"install","variables":{"CI":"true"}},{"name":"build","secrets":["*"]}],"deploy":{}}"#;
+        let out: serde_json::Value = serde_json::from_str(&railpack_git_sha(plan, "abc").unwrap()).unwrap();
+        assert_eq!(out["steps"][1]["variables"]["GIT_SHA"], "abc");
+        assert_eq!(out["steps"][0]["variables"], serde_json::json!({ "CI": "true" }));
     }
 }

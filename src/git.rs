@@ -275,17 +275,20 @@ fn check_links(root: &Path) -> Result<()> {
 /// Check out a service's Git source for a deploy (its commit, else its ref, else the branch) and
 /// record the commit on the deploy. Returns the folder at the source's path and the commit.
 pub async fn checkout(app: &App, s: &Service, d: &Deploy, log: &(dyn Fn(&str) + Sync)) -> Result<(PathBuf, String)> {
-    let Source::Git { provider, repo, branch, path, .. } = &s.spec.source else { bail!("this service does not deploy from Git") };
+    let Source::Git { provider, repo, branch, path, submodules, .. } = &s.spec.source else { bail!("this service does not deploy from Git") };
     let git_ref = d.commit_sha.as_deref().or(d.git_ref.as_deref()).unwrap_or(branch);
     let dest = app.paths.sources().join(&s.id).join("repo");
-    let (sha, msg) = fetch(app, s, provider.as_deref(), repo, git_ref, &dest, log).await?;
+    let (sha, msg) = fetch(app, s, provider.as_deref(), repo, git_ref, *submodules, &dest, log).await?;
     app.db.exec("UPDATE deploys SET commit_sha = ?1, commit_message = ?2 WHERE id = ?3", params![sha, msg, d.id])?;
     let dir = util::inside(&dest, path).filter(|d| d.is_dir()).ok_or_else(|| anyhow!("the path {path} does not exist in the repository"))?;
     Ok((dir, sha))
 }
 
 /// Fetch `git_ref` (branch, tag or commit) into `dest` and check it out. Returns (sha, message).
-async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, git_ref: &str, dest: &Path, log: &(dyn Fn(&str) + Sync)) -> Result<(String, String)> {
+/// `dest` persists between deploys: the first fetch is shallow, later ones bring only new commits,
+/// and a commit that is already there is not fetched at all.
+#[allow(clippy::too_many_arguments)]
+async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, git_ref: &str, submodules: bool, dest: &Path, log: &(dyn Fn(&str) + Sync)) -> Result<(String, String)> {
     // Every source of a ref (the spec, webhooks, the API, migration) passes through here.
     if !valid_ref(git_ref) {
         bail!("{git_ref:?} is not a branch, tag or commit name");
@@ -312,7 +315,9 @@ async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, gi
             c.env("GIT_CONFIG_PARAMETERS", h);
         }
         // Network transports only, for submodules too: no local paths, file:// or ext::.
-        c.arg("-C").arg(dest).args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git");
+        c.arg("-C").arg(dest).env("GIT_TERMINAL_PROMPT", "0").env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git");
+        // A detached auto-gc rewrites .git/shallow under the next command ("shallow file has changed").
+        c.args(["-c", "gc.autoDetach=false", "-c", "maintenance.autoDetach=false"]).args(args);
         if let Some(ssh) = &ssh_cmd {
             c.env("GIT_SSH_COMMAND", ssh);
         }
@@ -320,25 +325,34 @@ async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, gi
     };
     let run = |args: &[&str]| crate::proc::output(git(args));
     let fetched: Result<(String, String)> = async {
-        if !dest.join(".git").exists() {
+        let fresh = !dest.join(".git").exists();
+        if fresh {
             std::fs::create_dir_all(dest)?;
             run(&["init", "-q"]).await?;
             run(&["remote", "add", "origin", &url]).await?;
         } else {
             run(&["remote", "set-url", "origin", &url]).await?;
         }
-        log(&format!("Fetching {git_ref} from {}", redact(&url)));
-        if let Err(e) = crate::proc::run_streamed(git(&["fetch", "-q", "--depth", "50", "--no-tags", "origin", git_ref]), log).await {
-            // Full SHAs not at a branch tip need an unshallow fetch on some hosts.
-            log(&format!("Shallow fetch failed ({e}); fetching all branches"));
-            crate::proc::run_streamed(git(&["fetch", "-q", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]), log).await?;
+        let commit = format!("{git_ref}^{{commit}}");
+        if is_sha(git_ref) && !fresh && run(&["cat-file", "-e", &commit]).await.is_ok() {
+            log(&format!("{} is already here", &git_ref[..7]));
             run(&["checkout", "-q", "--force", git_ref]).await?;
         } else {
-            run(&["checkout", "-q", "--force", "FETCH_HEAD"]).await?;
+            log(&format!("Fetching {git_ref} from {}", redact(&url)));
+            // --depth on an existing shallow clone downloads the whole tree again, so only the first fetch has it.
+            let args: &[&str] = if fresh { &["fetch", "-q", "--depth", "1", "--no-tags", "origin", git_ref] } else { &["fetch", "-q", "--no-tags", "origin", git_ref] };
+            if let Err(e) = crate::proc::run_streamed(git(args), log).await {
+                // Full SHAs not at a branch tip need an unshallow fetch on some hosts.
+                log(&format!("Fetch failed ({e}); fetching all branches"));
+                crate::proc::run_streamed(git(&["fetch", "-q", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*"]), log).await?;
+                run(&["checkout", "-q", "--force", git_ref]).await?;
+            } else {
+                run(&["checkout", "-q", "--force", "FETCH_HEAD"]).await?;
+            }
         }
         run(&["clean", "-ffdxq"]).await?;
-        if dest.join(".gitmodules").exists() {
-            crate::proc::run_streamed(git(&["submodule", "update", "--init", "--recursive", "--depth", "1"]), log).await?;
+        if submodules && dest.join(".gitmodules").exists() {
+            crate::proc::run_streamed(git(&["submodule", "update", "--init", "--recursive", "--depth", "1", "--jobs", "8"]), log).await?;
         }
         check_links(dest)?;
         Ok((run(&["rev-parse", "HEAD"]).await?.trim().to_string(), run(&["log", "-1", "--format=%B"]).await?.trim().to_string()))
@@ -351,6 +365,11 @@ async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, gi
     let (sha, msg) = fetched?;
     log(&format!("Checked out {} {}", sha.get(..7).unwrap_or(&sha), msg.lines().next().unwrap_or("")));
     Ok((sha, msg))
+}
+
+/// A full commit id: one that may already be in the clone.
+fn is_sha(r: &str) -> bool {
+    r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Post the deploy state on the commit (shows up as a check next to the commit).
@@ -554,6 +573,14 @@ pub async fn finish_github_manifest(app: &App, provider_id: &str, code: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_full_commit_ids_are_looked_up_locally() {
+        assert!(is_sha("fba652009ad96134cb51580f5c8d1daa185d05d5"));
+        assert!(!is_sha("fba6520"));
+        assert!(!is_sha("main"));
+        assert!(!is_sha("zba652009ad96134cb51580f5c8d1daa185d05d5"));
+    }
 
     #[test]
     fn signs_github_app_jwt() {

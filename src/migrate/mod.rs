@@ -416,7 +416,7 @@ fn image_tag(image: &str) -> String {
 
 /// A Git source without a provider; pushes reach it through the deploy webhook.
 fn git_source(repo: &str, branch: &str, path: &str) -> Source {
-    Source::Git { provider: None, repo: repo.into(), branch: branch.into(), path: path.trim_matches('/').into(), watch_paths: vec![], auto_deploy: false }
+    Source::Git { provider: None, repo: repo.into(), branch: branch.into(), path: path.trim_matches('/').into(), watch_paths: vec![], auto_deploy: false, submodules: true }
 }
 
 /// The strings in a JSON array; anything else reads as empty.

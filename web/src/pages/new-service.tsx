@@ -78,7 +78,7 @@ interface Created {
 
 const needsKey = (f: Form) => !f.provider && /^(git@|ssh:\/\/)/.test(f.repo.trim());
 
-export function gitSource(f: Pick<Form, "provider" | "repo" | "branch" | "path" | "watch" | "auto">, compose = false) {
+export function gitSource(f: Pick<Form, "provider" | "repo" | "branch" | "path" | "watch" | "auto"> & { submodules?: boolean }, compose = false) {
   return {
     type: "git" as const,
     provider: f.provider || null,
@@ -87,6 +87,7 @@ export function gitSource(f: Pick<Form, "provider" | "repo" | "branch" | "path" 
     path: compose ? "" : f.path.trim(),
     watch_paths: compose ? [] : lines(f.watch),
     auto_deploy: f.auto,
+    submodules: f.submodules ?? true,
   };
 }
 

@@ -89,8 +89,10 @@ async fn clean_on(app: &App, node: &str, docker: &bollard::Docker, images: &Imag
         let stale = matches!(c.state.map(|s| s.to_string()).as_deref(), Some("exited" | "created" | "dead"));
         let old = util::now() - c.created.unwrap_or(0) > 3600;
         if stale && old && runtime::live_deploy(app, service).as_deref() != Some(deploy.as_str()) {
-            runtime::remove(app, node, c.id.as_deref().unwrap_or_default(), &runtime::listed_name(c.names.clone())).await?;
-            removed_containers += 1;
+            match runtime::remove(app, node, c.id.as_deref().unwrap_or_default(), &runtime::listed_name(c.names.clone())).await {
+                Ok(()) => removed_containers += 1,
+                Err(e) => tracing::warn!("cleanup: {e:#}"),
+            }
         }
     }
 

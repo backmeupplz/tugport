@@ -96,7 +96,7 @@ Every field has a default. See `src/model.rs`.
 
 | Field | Shape |
 |---|---|
-| `source` | `{type: "git", provider?, repo, branch, path, watch_paths, auto_deploy}`, `{type: "image", image}`, `{type: "dockerfile", content}` or `{type: "compose", yaml}` |
+| `source` | `{type: "git", provider?, repo, branch, path, watch_paths, auto_deploy, submodules}` (`submodules` defaults to true; false skips Git submodules), `{type: "image", image}`, `{type: "dockerfile", content}` or `{type: "compose", yaml}` |
 | `build` | `{type: "auto"}`, `{type: "dockerfile", path, target?}`, `{type: "railpack"}`, `{type: "nixpacks"}` or `{type: "buildpacks", builder}` |
 | Runtime basics | `command`, `entrypoint`, `working_dir`, `user`, `replicas` (ignored while `autoscale` is set) |
 | `ports` | `[{container, host, protocol: tcp\|udp}]` |

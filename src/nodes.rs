@@ -876,7 +876,9 @@ async fn restore(app: &AppState, node: &NodeHandle) -> Result<()> {
         let (Some(id), Some(sid)) = (c.id, labels.get(runtime::L_SERVICE)) else { continue };
         let name = runtime::listed_name(c.names);
         let Some(s) = services.get(sid) else {
-            runtime::remove(app, &node.id, &id, &name).await?;
+            if let Err(e) = runtime::remove(app, &node.id, &id, &name).await {
+                tracing::warn!("restoring {}: {e:#}", node.name);
+            }
             continue;
         };
         if s.kind == "compose" {
@@ -884,7 +886,9 @@ async fn restore(app: &AppState, node: &NodeHandle) -> Result<()> {
         }
         let current = app.deployer.busy(&s.id) || runtime::live_deploy(app, &s.id).as_deref() == labels.get(runtime::L_DEPLOY).map(String::as_str);
         if !current {
-            runtime::remove(app, &node.id, &id, &name).await?;
+            if let Err(e) = runtime::remove(app, &node.id, &id, &name).await {
+                tracing::warn!("restoring {}: {e:#}", node.name);
+            }
             continue;
         }
         // The node lists its own containers: secrets go only to servers the service was placed on
@@ -1053,7 +1057,7 @@ pub async fn ship_image(app: &App, node: &NodeHandle, s: &Service, image: &str, 
         anyhow::Ok(())
     });
     let body = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) });
-    let mut load = node.docker.import_image_stream(bollard::query_parameters::ImportImageOptions::default(), body, None);
+    let mut load = crate::runtime::slow(node.docker.clone()).import_image_stream(bollard::query_parameters::ImportImageOptions::default(), body, None);
     let mut load_err = None;
     while let Some(item) = load.next().await {
         if let Err(e) = item {

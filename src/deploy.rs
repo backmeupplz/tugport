@@ -305,10 +305,14 @@ fn summary(d: &Deploy) -> String {
 /// After a cancel: drop this deploy's containers unless it already took traffic.
 async fn cleanup_after_cancel(app: &App, s: &Service, deploy_id: &str) {
     let live = runtime::live_deploy(app, &s.id);
+    let went_live = live.as_deref() == Some(deploy_id);
     for r in runtime::replicas(app, &s.id).await.unwrap_or_default() {
         // A deploy that went live keeps its containers; one that never took traffic loses them.
-        if (live.as_deref() == Some(deploy_id)) != (r.deploy == deploy_id) {
+        if went_live != (r.deploy == deploy_id) {
             let _ = runtime::stop_and_remove(app, &r, 10).await;
+        } else if !went_live && live.as_deref() == Some(r.deploy.as_str()) && r.state != "running" && !crate::nodes::stopped(app, &s.id) {
+            // A stop-first rollout cancelled after stopping the live version: start it again.
+            let _ = runtime::start(app, &r.node, &r.id).await;
         }
     }
 }
@@ -377,8 +381,13 @@ async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, log:
         if !old.is_empty() {
             log.line(&format!("Stopping the old version ({})", containers(old.len())));
         }
+        // A failed stop must not end the rollout between stopping the old version and starting the
+        // new one: `stop` kills what it could not stop, and if the old version still runs, the new
+        // one fails to start or to become healthy and the old one keeps serving.
         for r in &old {
-            runtime::stop(app, &r.node, &r.id, 30).await?;
+            if let Err(e) = runtime::stop(app, &r.node, &r.id, 30).await {
+                log.line(&format!("Warning: could not stop {}: {e:#}", r.name));
+            }
         }
     }
 
@@ -410,7 +419,9 @@ async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, log:
         if strategy == Strategy::StopFirst && !old.is_empty() {
             log.line("Starting the previous version again");
             for r in &old {
-                let _ = runtime::start(app, &r.node, &r.id).await;
+                if let Err(e) = runtime::start(app, &r.node, &r.id).await {
+                    log.line(&format!("Warning: could not start {} again: {e:#}", r.name));
+                }
             }
         } else if !old.is_empty() {
             log.line("The previous version keeps serving traffic.");
@@ -430,11 +441,43 @@ async fn rollout(app: &AppState, s: &Service, deploy_id: &str, image: &str, log:
         log.line(&format!("Traffic switched; letting the old version finish requests for {drain}s"));
         tokio::time::sleep(Duration::from_secs(drain.into())).await;
     }
-    // Listed again: replicas the autoscaler added meanwhile belong to the old version too.
-    for r in runtime::replicas(app, &s.id).await?.iter().filter(|r| r.deploy != deploy_id) {
-        runtime::stop_and_remove(app, r, 30).await.with_context(|| format!("removing {}", r.name))?;
+    // The new version is live: a failure to remove the old one is not a failed deploy.
+    if let Err(e) = remove_old(app, &s.id, deploy_id).await {
+        log.line(&format!("Warning: {e:#}; retrying in the background"));
+        tokio::spawn(retry_remove_old(app.clone(), s.id.clone(), deploy_id.to_string()));
     }
     Ok(())
+}
+
+/// Remove the replicas of other deploys than `live`. Listed here, after the switch, because
+/// replicas the autoscaler added meanwhile belong to the old version too.
+async fn remove_old(app: &App, service_id: &str, live: &str) -> Result<()> {
+    for r in runtime::replicas(app, service_id).await?.iter().filter(|r| r.deploy != live) {
+        runtime::stop_and_remove(app, r, 30).await.with_context(|| format!("removing the old container {}", r.name))?;
+    }
+    Ok(())
+}
+
+/// Keep trying to remove the old version for about half an hour, until another deploy replaces
+/// `live` (which then removes everything else itself).
+async fn retry_remove_old(app: AppState, service_id: String, live: String) {
+    for wait in [30, 60, 120, 240, 480, 900] {
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+        if runtime::live_deploy(&app, &service_id).as_deref() != Some(live.as_str()) {
+            return;
+        }
+        if app.deployer.busy(&service_id) {
+            continue;
+        }
+        match remove_old(&app, &service_id, &live).await {
+            Ok(()) => {
+                tracing::info!("removed the old containers of {service_id} after deploy {live}");
+                return;
+            }
+            Err(e) => tracing::warn!("{e:#} (service {service_id}, deploy {live})"),
+        }
+    }
+    tracing::error!("gave up removing the old containers of {service_id} after deploy {live}; they are removed by the next deploy");
 }
 
 /// Run `want` replicas of the live version: start more next to the running ones, or take

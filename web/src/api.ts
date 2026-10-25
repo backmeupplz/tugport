@@ -117,7 +117,7 @@ export interface Status {
   replicas: Replica[];
 }
 export type Source =
-  | { type: "git"; provider?: string | null; repo: string; branch: string; path: string; watch_paths: string[]; auto_deploy: boolean }
+  | { type: "git"; provider?: string | null; repo: string; branch: string; path: string; watch_paths: string[]; auto_deploy: boolean; submodules?: boolean }
   | { type: "image"; image: string }
   | { type: "dockerfile"; content: string }
   | { type: "compose"; yaml: string };

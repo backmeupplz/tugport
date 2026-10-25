@@ -1,6 +1,9 @@
 // Formatting and small pure helpers shared by every page.
 
 /** "wrong name or password" -> "Wrong name or password." */
+/** Drops terminal color and cursor codes (ESC [ ... letter), which apps write into their logs. */
+export const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+
 export function sentence(msg: string): string {
   const s = msg.trim();
   if (!s) return s;

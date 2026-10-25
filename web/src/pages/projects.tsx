@@ -64,7 +64,7 @@ export function Projects() {
       title="Projects"
       actions={
         <>
-          <div role="group" aria-label="Layout" class="flex rounded-lg border border-line p-0.5">
+          <div role="group" aria-label="Layout" class="flex h-11 items-center rounded-lg border border-line p-0.5 md:h-9">
             {(
               [
                 ["grid", "Grid"],
@@ -77,7 +77,7 @@ export function Projects() {
                 aria-pressed={layout === id}
                 aria-label={`Show as a ${label.toLowerCase()}`}
                 title={label}
-                class={`grid size-8 place-items-center rounded-md ${layout === id ? "bg-raised text-text" : "text-muted hover:text-text"}`}
+                class={`grid h-full w-10 place-items-center rounded-md md:w-8 ${layout === id ? "bg-raised text-text" : "text-muted hover:text-text"}`}
                 onClick={() => setLayout(id)}
               >
                 <Icon name={id} />

@@ -354,7 +354,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
               <Field label="Protocol">
                 <Select value={p.protocol} options={["tcp", "udp"]} onChange={(protocol) => port(i, { protocol })} />
               </Field>
-              <IconButton icon="trash" label="Remove this port" class="mb-1 text-bad" onClick={() => set({ ports: removeAt(f.ports, i) })} />
+              <IconButton icon="trash" label="Remove this port" class="h-11 text-bad md:h-9" onClick={() => set({ ports: removeAt(f.ports, i) })} />
             </div>
           ))}
           <button type="button" class="btn" onClick={() => set({ ports: [...f.ports, { container: "", host: "", protocol: "tcp" }] })}>
@@ -389,7 +389,7 @@ function SettingsForm({ c, onSaved }: { c: Ctx; onSaved: () => void }) {
                 <input type="checkbox" checked={m.readonly} onChange={(e) => mount(i, { readonly: e.currentTarget.checked })} />
                 Read-only
               </label>
-              <IconButton icon="trash" label="Remove this mount" class="mb-1 text-bad" onClick={() => set({ mounts: removeAt(f.mounts, i) })} />
+              <IconButton icon="trash" label="Remove this mount" class="h-11 text-bad md:h-9" onClick={() => set({ mounts: removeAt(f.mounts, i) })} />
             </div>
           ))}
           {isDb && f.mounts.length > 0 && <p class="text-xs text-warn">Removing the data volume of a database loses its files on the next deploy.</p>}

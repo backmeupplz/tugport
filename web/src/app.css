@@ -91,7 +91,7 @@
 
 @layer components {
   .btn {
-    @apply inline-flex h-10 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-line bg-surface px-3.5 text-sm md:h-8 md:px-3 md:text-[13px] font-medium text-text shadow-(--shadow) transition-colors hover:border-line-strong hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex h-11 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-line bg-surface px-3.5 text-sm md:h-9 md:px-3 md:text-[13px] font-medium text-text shadow-(--shadow) transition-colors hover:border-line-strong hover:bg-raised disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-primary {
     @apply border-transparent bg-accent text-accent-ink hover:border-transparent hover:bg-accent hover:brightness-110;

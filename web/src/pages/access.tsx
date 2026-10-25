@@ -615,7 +615,7 @@ export function Audit() {
                   <code class="text-[13px] text-accent-text">{e.action}</code>
                   {e.target && <span class="min-w-0 break-all text-dim">{e.target}</span>}
                 </div>
-                <p class="mt-0.5 text-xs text-muted">
+                <p class="mt-0.5 text-xs text-muted [overflow-wrap:anywhere]">
                   {[when(e.at), e.project_id ? (names[e.project_id] ?? e.project_id) : "", e.ip ?? "", e.key_id ? `key ${e.key_id}` : "", e.detail ?? ""]
                     .filter(Boolean)
                     .join(" · ")}

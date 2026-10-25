@@ -32,7 +32,7 @@ import {
   useSubmit,
 } from "../ui";
 import { fmt } from "../charts";
-import { ago, bytes, clock, duration, qs, sumUsage, varName } from "../util";
+import { ago, bytes, clock, duration, qs, stripAnsi, sumUsage, varName } from "../util";
 import { ReadReplicas, ReplicaOf } from "./database";
 import { Domains } from "./domains";
 import { DeployKey } from "./new-service";
@@ -361,7 +361,7 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
   const took = d.started_at && d.finished_at ? duration(d.finished_at - d.started_at) : "";
   const canDeploy = atLeast(c.d.role, "deployer");
   return (
-    <div class="flex flex-wrap items-start gap-3">
+    <div class="flex flex-wrap items-center gap-3">
       <div class="min-w-0 flex-1 space-y-1">
         <div class="flex flex-wrap items-center gap-2">
           <Pill state={d.status} />
@@ -379,7 +379,7 @@ function DeployRow(props: { d: Deploy; live: string | null; c: Ctx; actions?: bo
         {d.image && <p class="truncate font-mono text-xs text-muted">{d.image}</p>}
         {d.error && <p class="text-bad">{d.error}</p>}
       </div>
-      <div class="flex flex-wrap gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <button class="btn" onClick={() => c.openLog(d.id)}>
           Log
         </button>
@@ -528,7 +528,7 @@ export function DeployLog(props: { id: string | null; onClose: () => void }) {
         onScroll={box.onScroll}
         class="h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-bg p-3 font-mono text-xs leading-relaxed"
       >
-        {lines.length ? lines.map((l) => `${clock(l.ts)}  ${l.line}`).join("\n") : done ? "This deploy wrote no log lines." : "Waiting for the first lines…"}
+        {lines.length ? lines.map((l) => `${clock(l.ts)}  ${stripAnsi(l.line)}`).join("\n") : done ? "This deploy wrote no log lines." : "Waiting for the first lines…"}
       </pre>
       {info?.error && done && (
         <div class="mt-3">

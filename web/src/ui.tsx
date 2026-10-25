@@ -36,13 +36,14 @@ export function Page(props: {
       )}
       <header class="mb-7 flex flex-wrap items-start justify-between gap-4">
         <div class="min-w-0">
-          <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          {/* As tall as the action buttons, so the title lines up with them. */}
+          <div class="flex min-h-11 flex-wrap items-center gap-x-3 gap-y-1.5 md:min-h-9">
             <h1 class="break-words text-2xl font-semibold tracking-tight">{props.title}</h1>
             {props.meta}
           </div>
           {props.sub && <div class="mt-1.5 max-w-3xl text-dim">{props.sub}</div>}
         </div>
-        {props.actions && <div class="flex flex-wrap gap-2">{props.actions}</div>}
+        {props.actions && <div class="flex flex-wrap items-center gap-2">{props.actions}</div>}
       </header>
       {props.children}
     </div>
@@ -642,7 +643,7 @@ export function Toasts() {
       ref={ref}
       popover="manual"
       aria-live="polite"
-      class="pointer-events-none fixed top-auto right-4 bottom-4 left-4 z-50 m-0 flex h-auto w-auto flex-col items-end gap-2 overflow-visible border-0 bg-transparent p-0"
+      class="pointer-events-none fixed top-auto right-4 bottom-4 left-4 z-50 m-0 h-auto w-auto flex-col items-end gap-2 overflow-visible border-0 bg-transparent p-0 [&:popover-open]:flex"
     >
       {list.map((t) => (
         <div

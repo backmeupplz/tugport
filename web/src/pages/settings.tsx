@@ -349,8 +349,8 @@ function Git(props: { owner: boolean }) {
                     </p>
                   </div>
                   {props.owner && (
-                    <Action class="btn btn-ghost text-bad" confirm={`Disconnect ${p.name}?`} run={() => del(`/git/providers/${p.id}`).then(r.reload)} done="Disconnected.">
-                      Disconnect
+                    <Action class="btn btn-ghost btn-sm px-2 text-bad" label={`Disconnect ${p.name}`} confirm={`Disconnect ${p.name}?`} run={() => del(`/git/providers/${p.id}`).then(r.reload)} done="Disconnected.">
+                      <Icon name="trash" />
                     </Action>
                   )}
                 </li>
@@ -502,7 +502,7 @@ function Notifications() {
                   <span class="font-medium">{c.name}</span> <span class="chip">{c.kind}</span>
                   <p class="text-xs text-muted">{c.events.includes("*") ? "All events" : c.events.join(", ")}</p>
                 </div>
-                <div class="flex flex-wrap gap-2">
+                <div class="flex flex-wrap items-center gap-2">
                   <Action run={() => post(`/notifications/${c.id}/test`)} done="Test message sent.">
                     Send test
                   </Action>
@@ -671,8 +671,8 @@ function Backups() {
                     <span class="font-medium">{t.name}</span> <span class="chip">{t.kind}</span>{" "}
                     {t.storage_class && <span class="chip">{storageClasses.find(([c]) => c === t.storage_class)?.[1] ?? t.storage_class}</span>}
                   </span>
-                  <Action class="btn btn-ghost text-bad" confirm={`Remove ${t.name}?`} run={() => del(`/backups/targets/${t.id}`).then(targets.reload)}>
-                    Remove
+                  <Action class="btn btn-ghost btn-sm px-2 text-bad" label={`Remove ${t.name}`} confirm={`Remove ${t.name}?`} run={() => del(`/backups/targets/${t.id}`).then(targets.reload)}>
+                    <Icon name="trash" />
                   </Action>
                 </li>
               )}
@@ -706,7 +706,7 @@ function Backups() {
                     </p>
                     {j.last_run?.error && <p class="text-xs text-bad">{j.last_run.error}</p>}
                   </div>
-                  <div class="flex flex-wrap gap-2">
+                  <div class="flex flex-wrap items-center gap-2">
                     <button class="btn" onClick={() => setRunsOf(j)}>
                       Runs
                     </button>
@@ -714,8 +714,13 @@ function Backups() {
                     <Action run={() => post(`/backups/jobs/${j.id}/run`).then(jobs.reload)} done="Backup started.">
                       Run now
                     </Action>
-                    <Action class="btn btn-ghost text-bad" confirm="Remove this job? Existing backups stay in the target." run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}>
-                      Remove
+                    <Action
+                      class="btn btn-ghost btn-sm px-2 text-bad"
+                      label="Remove this job"
+                      confirm="Remove this job? Existing backups stay in the target."
+                      run={() => del(`/backups/jobs/${j.id}`).then(jobs.reload)}
+                    >
+                      <Icon name="trash" />
                     </Action>
                   </div>
                 </li>
@@ -996,7 +1001,7 @@ function AboutCard() {
           <dl class="grid grid-cols-[8rem_1fr] gap-y-2">
             <Row label="Version">{a.version}</Row>
             <Row label="Commit">
-              <code>{a.commit}</code>
+              <code class="break-all">{a.commit}</code>
             </Row>
             <Row label="Docker">{a.docker ?? "not reachable"}</Row>
             <Row label="Source code">

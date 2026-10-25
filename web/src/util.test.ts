@@ -17,6 +17,7 @@ import {
   sizeLabel,
   sizesIn,
   splitArgs,
+  stripAnsi,
   str,
   sumUsage,
   varName,
@@ -145,4 +146,9 @@ test("row edits and form text", () => {
   assert.equal(str(null), "");
   assert.equal(str(undefined), "");
   assert.equal(str(0), "0");
+});
+
+test("stripAnsi drops color codes and keeps the text", () => {
+  assert.equal(stripAnsi("\x1b[35mWARN\x1b[39m Ghost \x1b[1m\x1b[37mstarted\x1b[39m\x1b[22m"), "WARN Ghost started");
+  assert.equal(stripAnsi("plain [35m text"), "plain [35m text");
 });

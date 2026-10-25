@@ -4,7 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { get, useApi, type Node, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
 import { Card, Empty, ErrorBox, Field, Input, Loaded, Loading, Note, Pill, Select, Skel, errText } from "../ui";
-import { ago, bytes, clock, qs, sentence, toMs } from "../util";
+import { ago, bytes, clock, qs, sentence, stripAnsi, toMs } from "../util";
 
 /** A log box that stays scrolled to the newest line, unless the reader scrolled up. `lines` changes as lines arrive. */
 export function useStickToBottom<T extends HTMLElement>(lines: unknown) {
@@ -147,7 +147,7 @@ export function Logs(props: { service: Service; replicas: Replica[]; label: (r: 
               <div key={i} class={`whitespace-pre-wrap break-words ${l.stream === "stderr" ? "text-warn" : ""}`}>
                 <span class="select-none text-muted">{clock(toMs(l.ts))} </span>
                 {many && l.replica && <span class="select-none text-muted">[{l.replica}] </span>}
-                {l.line}
+                {stripAnsi(l.line)}
               </div>
             ))
           )}

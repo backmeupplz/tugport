@@ -231,7 +231,7 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
                 <input type="checkbox" checked={r.permanent} onChange={(e) => redirect(i, { permanent: e.currentTarget.checked })} />
                 Permanent
               </label>
-              <IconButton icon="trash" label="Remove this redirect" class="mb-1 text-bad" onClick={() => set({ redirects: removeAt(f.redirects, i) })} />
+              <IconButton icon="trash" label="Remove this redirect" class="h-11 text-bad md:h-9" onClick={() => set({ redirects: removeAt(f.redirects, i) })} />
             </div>
           ))}
           <button type="button" class="btn" onClick={() => set({ redirects: [...f.redirects, { from: "", to: "", permanent: false }] })}>
@@ -253,7 +253,7 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
                 value={b.password}
                 onInput={(e) => basic(i, { password: e.currentTarget.value })}
               />
-              <IconButton icon="trash" label="Remove this login" class="mb-1 text-bad" onClick={() => set({ basic: removeAt(f.basic, i) })} />
+              <IconButton icon="trash" label="Remove this login" class="h-11 text-bad md:h-9" onClick={() => set({ basic: removeAt(f.basic, i) })} />
             </div>
           ))}
           <button type="button" class="btn" onClick={() => set({ basic: [...f.basic, { user: "", password: "" }] })}>

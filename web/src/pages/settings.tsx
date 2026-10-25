@@ -11,6 +11,7 @@ import {
   ErrorBox,
   Field,
   FormButtons,
+  IconButton,
   Input,
   Loaded,
   Modal,
@@ -334,10 +335,48 @@ async function startGithubApp(organization: string) {
   form.submit();
 }
 
+/** What a token must allow on each host: listing repositories, managing their webhooks, posting commit statuses. */
+const FORGEJO_SCOPES = "Give it access to all repositories with repository: Read and write, user: Read and organization: Read.";
+const TOKEN_SCOPES: Record<string, string> = {
+  forgejo: FORGEJO_SCOPES,
+  gitea: FORGEJO_SCOPES,
+  gitlab: "Give it the api scope.",
+  github_token: "Give it the repo and admin:repo_hook scopes.",
+};
+
+/** Rotate a connection's token in place: services, webhooks and the webhook secret stay as they are. */
+function ReplaceToken(props: { p: Provider; onClose: () => void; onSaved: () => void }) {
+  const [token, setToken] = useState("");
+  const s = useSubmit(async () => {
+    await put(`/git/providers/${props.p.id}/token`, { token: token.trim() });
+    toast("Token replaced.");
+    props.onSaved();
+    props.onClose();
+  });
+  return (
+    <Modal open onClose={props.onClose} title={`Replace the token of ${props.p.name}`}>
+      <form class="space-y-4" onSubmit={s.submit}>
+        <p class="text-dim">Services deploying from this connection and its push webhooks keep working. Tugport checks the new token before saving it.</p>
+        <Input
+          label="New token"
+          type="password"
+          autocomplete="off"
+          required
+          hint={TOKEN_SCOPES[props.p.kind] ?? TOKEN_SCOPES.github_token}
+          value={token}
+          onInput={(e) => setToken(e.currentTarget.value)}
+        />
+        <FormButtons s={s} submit="Replace token" onCancel={props.onClose} disabled={!token.trim()} />
+      </form>
+    </Modal>
+  );
+}
+
 function Git(props: { owner: boolean }) {
   const r = useApi<{ providers: Provider[] }>("/git/providers");
   const settings = useApi<InstanceSettings>(props.owner ? "/settings" : null);
   const [org, setOrg] = useState("");
+  const [rotating, setRotating] = useState<Provider | null>(null);
   const { f, set, bind } = useForm({ kind: "forgejo", name: "", base_url: "", token: "" });
   const needsBase = f.kind === "forgejo" || f.kind === "gitea";
   const s = useSubmit(async () => {
@@ -360,6 +399,7 @@ function Git(props: { owner: boolean }) {
                       {p.base_url} · connected {ago(p.created_at)}
                     </p>
                   </div>
+                  {props.owner && p.kind !== "github_app" && <IconButton icon="key" label={`Replace the token of ${p.name}`} onClick={() => setRotating(p)} />}
                   {props.owner && (
                     <Action class="btn btn-ghost btn-sm px-2 text-bad" label={`Disconnect ${p.name}`} confirm={`Disconnect ${p.name}?`} run={() => del(`/git/providers/${p.id}`).then(r.reload)} done="Disconnected.">
                       <Icon name="trash" />
@@ -371,6 +411,7 @@ function Git(props: { owner: boolean }) {
           )}
         </Loaded>
       </Card>
+      {rotating && <ReplaceToken p={rotating} onClose={() => setRotating(null)} onSaved={r.reload} />}
       {props.owner && (
         <>
           <Card title="Connect GitHub">
@@ -422,7 +463,7 @@ function Git(props: { owner: boolean }) {
               />
               <Input
                 label="Access token"
-                hint="It needs read access to repositories and permission to manage their webhooks."
+                hint={TOKEN_SCOPES[f.kind] ?? TOKEN_SCOPES.github_token}
                 class="font-mono"
                 type="password"
                 required

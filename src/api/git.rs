@@ -25,6 +25,16 @@ pub struct TokenProvider {
     token: String,
 }
 
+/// What a token for `kind` must allow: listing repositories, managing their webhooks and
+/// posting commit statuses.
+fn needs(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Forgejo => "Give it access to all repositories with repository: Read and write, user: Read and organization: Read.",
+        Kind::Gitlab => "Give it the api scope.",
+        _ => "Give it the repo and admin:repo_hook scopes.",
+    }
+}
+
 /// Connect a host with an access token (Forgejo/Gitea, GitLab, or a GitHub token).
 pub async fn create(State(app): State<AppState>, Owner(a): Owner, Json(b): Json<TokenProvider>) -> ApiResult<Json<Value>> {
     let kind = Kind::parse(&b.kind).filter(|k| *k != Kind::GithubApp).ok_or_else(|| ApiError::bad_request("kind is forgejo, gitea, gitlab or github_token"))?;
@@ -42,16 +52,41 @@ pub async fn create(State(app): State<AppState>, Owner(a): Owner, Json(b): Json<
     let p = git::provider(&app, &id)?.ok_or_else(|| ApiError::not_found("the provider was not saved"))?;
     if let Err(e) = git::repos(&p).await {
         app.db.exec("DELETE FROM git_providers WHERE id = ?1", [&id])?;
-        return Err(ApiError::bad_request(format!("the token does not work: {e:#}")));
+        return Err(ApiError::bad_request(format!("the token does not work ({e:#}). {}", needs(kind))));
     }
     a.audit(&app, "git.connect", Some(&name), Some(kind.as_str()));
     Ok(Json(json!({ "id": id, "name": name })))
 }
 
+#[derive(Deserialize)]
+pub struct TokenBody {
+    token: String,
+}
+
+/// Swap a connection's token (a rotation) after checking the new one works. The connection
+/// keeps its id and webhook secret, so services and webhooks stay as they are.
+pub async fn replace_token(State(app): State<AppState>, Owner(a): Owner, Path(id): Path<String>, Json(b): Json<TokenBody>) -> ApiResult<Json<Value>> {
+    let old = provider_or_404(&app, &id)?;
+    if old.kind == Kind::GithubApp {
+        return Err(ApiError::bad_request("a GitHub App connection gets fresh tokens by itself"));
+    }
+    let mut p = old.clone();
+    p.config["token"] = json!(b.token.trim());
+    if let Err(e) = git::repos(&p).await {
+        return Err(ApiError::bad_request(format!("the token does not work ({e:#}). {}", needs(p.kind))));
+    }
+    git::save_provider(&app, Some(&id), p.kind, &p.name, &p.base_url, &p.config)?;
+    a.audit(&app, "git.token_replaced", Some(&p.name), Some(p.kind.as_str()));
+    Ok(ok())
+}
+
 pub async fn delete(State(app): State<AppState>, Owner(a): Owner, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let used = crate::store::services(&app, None)?.into_iter().any(|s| matches!(&s.spec.source, Source::Git { provider: Some(p), .. } if *p == id));
-    if used {
-        return Err(ApiError::conflict("services still deploy from this provider"));
+    let used = crate::store::services(&app, None)?.into_iter().filter(|s| matches!(&s.spec.source, Source::Git { provider: Some(p), .. } if *p == id)).count();
+    if used > 0 {
+        return Err(ApiError::conflict(format!(
+            "{used} {} still deploy from this connection; to rotate its token, use Replace token instead",
+            if used == 1 { "service" } else { "services" }
+        )));
     }
     app.db.exec("DELETE FROM git_providers WHERE id = ?1", [&id])?;
     a.audit(&app, "git.disconnect", Some(&id), None);

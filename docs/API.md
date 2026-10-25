@@ -203,7 +203,8 @@ A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit
 |---|---|---|
 | GET | `/api/git/providers` | `{providers: [{id, kind, name, base_url, created_at}]}` |
 | POST | `/api/git/providers` | `{kind: "forgejo"\|"gitea"\|"gitlab"\|"github_token", name?, base_url?, token}` |
-| DELETE | `/api/git/providers/{id}` | |
+| PUT | `/api/git/providers/{id}/token` | `{token}`: rotates the token after checking it works; services, webhooks and the webhook secret stay (not for GitHub App connections) |
+| DELETE | `/api/git/providers/{id}` | 409 while services still deploy from it |
 | GET | `/api/git/providers/{id}/repos` | `{repos: ["owner/name"]}` |
 | POST | `/api/git/github/manifest` | See below. |
 | GET | `/api/git/github/callback` | GitHub redirects here; it stores the app and redirects to the install page. |

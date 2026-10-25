@@ -107,6 +107,7 @@ pub fn router(app: AppState) -> Router {
         .route("/api/tunnel", get(observe::tunnel_status).put(observe::tunnel_connect).delete(observe::tunnel_disconnect))
         .route("/api/git/providers", get(git::list).post(git::create))
         .route("/api/git/providers/{id}", delete(git::delete))
+        .route("/api/git/providers/{id}/token", put(git::replace_token))
         .route("/api/git/providers/{id}/repos", get(git::repos))
         .route("/api/git/github/manifest", post(git::github_manifest))
         .route("/api/git/github/callback", get(git::github_callback))

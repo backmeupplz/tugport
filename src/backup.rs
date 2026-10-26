@@ -150,6 +150,9 @@ fn restic_args(class: Option<&str>, args: &[&str]) -> Vec<String> {
             out.extend(["-o".to_string(), o.into()]);
         }
     }
+    // Jobs on one target share a repository; a backup and another job's retention (which locks it
+    // exclusively) would otherwise fail each other.
+    out.extend(["--retry-lock".to_string(), "2h".into()]);
     out.extend(args.iter().map(|a| a.to_string()));
     if deep && args.first() == Some(&"forget") {
         out.push("--repack-cacheable-only".into());
@@ -874,7 +877,7 @@ mod tests {
         assert_eq!(restic_args(Some("GLACIER_IR"), &forget)[..3], [RESTIC, "-o", "s3.storage-class=GLACIER_IR"]);
         for plain in [s3("STANDARD"), local] {
             let args = restic_args(plain.storage_class(), &forget);
-            assert_eq!(args[0], RESTIC);
+            assert_eq!(args[..3], [RESTIC, "--retry-lock", "2h"]);
             assert!(!args.iter().any(|a| a.contains("storage-class") || a == "--repack-cacheable-only"), "{args:?}");
         }
     }

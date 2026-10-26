@@ -1,13 +1,16 @@
 //! Backup targets (S3 or local), jobs, runs and restores.
 
 use super::service_or_404;
+use super::{ApiError, ApiResult, Auth, Events, Owner, ok, sse_events, sse_json};
 use super::{bad, detached, row_json};
-use super::{ApiError, ApiResult, Auth, Owner, ok};
 use crate::app::AppState;
 use crate::auth::Role;
 use crate::{backup, util};
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::response::sse;
+use futures_util::future::ready;
+use futures_util::stream::{self, BoxStream, StreamExt};
 use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -97,11 +100,15 @@ pub async fn list_jobs(State(app): State<AppState>, a: Auth) -> ApiResult<Json<V
             continue;
         }
         job["enabled"] = json!(job["enabled"] != 0);
-        job["last_run"] = json!(app.db.row(
-            "SELECT status, finished_at, error FROM backup_runs WHERE job_id = ?1 AND kind = 'backup' ORDER BY started_at DESC LIMIT 1",
+        let mut last = app.db.row(
+            "SELECT id, status, finished_at, error FROM backup_runs WHERE job_id = ?1 AND kind = 'backup' ORDER BY started_at DESC LIMIT 1",
             [job["id"].as_str()],
             row_json,
-        )?);
+        )?;
+        if let Some(run) = &mut last {
+            with_progress(run);
+        }
+        job["last_run"] = json!(last);
         out.push(job);
     }
     Ok(Json(json!({ "jobs": out })))
@@ -202,11 +209,12 @@ pub async fn run_job(State(app): State<AppState>, a: Auth, Path(id): Path<String
 pub async fn list_runs(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let (j, project) = job_project(&app, &id)?;
     require_job(&a, &project, Role::Viewer)?;
-    let runs = app.db.rows(
+    let mut runs = app.db.rows(
         "SELECT id, kind, status, snapshot, size_bytes, error, started_at, finished_at FROM backup_runs WHERE job_id = ?1 ORDER BY started_at DESC LIMIT 100",
         [&j.id],
         row_json,
     )?;
+    runs.iter_mut().for_each(with_progress);
     Ok(Json(json!({ "runs": runs })))
 }
 
@@ -262,10 +270,82 @@ pub async fn recent_runs(State(app): State<AppState>, a: Auth) -> ApiResult<Json
         }
         run["service"] = json!(service.as_ref().map(|s| &s.name));
         run["project"] = json!(service.as_ref().map(|s| &s.project));
+        with_progress(&mut run);
         out.push(run);
         if out.len() == 100 {
             break;
         }
     }
     Ok(Json(json!({ "runs": out })))
+}
+
+/// A running run's latest progress, as `progress` (null when it has none yet or is not running).
+fn with_progress(run: &mut Value) {
+    run["progress"] = json!(run["id"].as_str().and_then(backup::progress));
+}
+
+/// A run with its job, after checking the caller may see it.
+fn run_or_404(app: &AppState, a: &Auth, id: &str) -> ApiResult<Value> {
+    let mut run = app
+        .db
+        .row(
+            "SELECT r.id, r.job_id, r.kind, r.status, r.snapshot, r.size_bytes, r.error, r.started_at, r.finished_at, j.kind AS job_kind, j.service_id, j.volume
+             FROM backup_runs r JOIN backup_jobs j ON j.id = r.job_id WHERE r.id = ?1",
+            [id],
+            row_json,
+        )?
+        .ok_or_else(|| ApiError::not_found("backup run not found"))?;
+    let service = run["service_id"].as_str().and_then(|sid| crate::store::service(app, sid).ok().flatten());
+    require_job(a, &service.as_ref().map(|s| s.project_id.clone()), Role::Viewer)?;
+    run["service"] = json!(service.as_ref().map(|s| &s.name));
+    run["project"] = json!(service.as_ref().map(|s| &s.project));
+    with_progress(&mut run);
+    Ok(run)
+}
+
+fn read_log(app: &AppState, id: &str) -> Vec<(i64, String)> {
+    crate::deploy::read_log_file(&backup::log_path(app, id))
+}
+
+pub async fn get_run(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let run = run_or_404(&app, &a, &id)?;
+    let log: Vec<Value> = read_log(&app, &id).into_iter().map(|(ts, l)| json!({ "ts": ts, "line": l })).collect();
+    Ok(Json(json!({ "run": run, "log": log })))
+}
+
+/// The run's log so far, then new lines and progress as they come, until the run finishes.
+pub async fn log_stream(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Events> {
+    // Subscribe before reading the run and its file so nothing falls in between.
+    let rx = app.events.subscribe();
+    let run = run_or_404(&app, &a, &id)?;
+    let line = |ts: &Value, l: &Value| sse_json("line", &json!({ "ts": ts, "line": l }));
+    let mut backlog: Vec<sse::Event> = read_log(&app, &id).into_iter().map(|(ts, l)| line(&json!(ts), &json!(l))).collect();
+    if !run["progress"].is_null() {
+        backlog.push(sse_json("progress", &run["progress"]));
+    }
+    let status = run["status"].as_str().unwrap_or("").to_string();
+    let tail: BoxStream<'static, sse::Event> = if status != "running" {
+        stream::iter([sse::Event::default().event("status").data(status)]).boxed()
+    } else {
+        crate::util::subscribe(rx)
+            .filter_map(move |e| {
+                ready(match e.kind.as_str() {
+                    _ if e.data["run_id"] != id.as_str() => None,
+                    "backup.log" => Some((line(&e.data["ts"], &e.data["line"]), false)),
+                    "backup.progress" => Some((sse_json("progress", &e.data["progress"]), false)),
+                    "backup" => {
+                        let status = e.data["status"].as_str().unwrap_or("");
+                        Some((sse::Event::default().event("status").data(status), status != "running"))
+                    }
+                    _ => None,
+                })
+            })
+            .scan(false, |finished, (ev, fin)| {
+                let out = if *finished { None } else { Some(ev) };
+                *finished |= fin;
+                ready(out)
+            })
+            .boxed()
+    };
+    Ok(sse_events(stream::iter(backlog).chain(tail)))
 }

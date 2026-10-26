@@ -29,6 +29,7 @@ import {
   useSubmit,
 } from "../ui";
 import { ago, bytes, cidr, mergePatch, num, sentence, str, when, words } from "../util";
+import { Progress, RunLog, type RunProgress } from "./actions";
 import { PROVIDER_KINDS } from "./new-service";
 
 const TABS: [string, string][] = [
@@ -672,7 +673,7 @@ interface Job {
   schedule: string;
   keep_last: number;
   enabled?: boolean;
-  last_run?: { status: string; finished_at: number | null; error: string | null } | null;
+  last_run?: { id: string; status: string; finished_at: number | null; error: string | null; progress?: RunProgress | null } | null;
 }
 interface Run {
   id: string;
@@ -683,12 +684,14 @@ interface Run {
   error: string | null;
   started_at: number;
   finished_at: number | null;
+  progress?: RunProgress | null;
 }
 
 function Backups() {
   const targets = useApi<{ targets: Target[] }>("/backups/targets");
-  const jobs = useApi<{ jobs: Job[] }>("/backups/jobs");
+  const jobs = useApi<{ jobs: Job[] }>("/backups/jobs", (e) => e.kind === "backup");
   const [addTarget, setAddTarget] = useState(false);
+  const [logId, setLogId] = useState<string | null>(null);
   const [addJob, setAddJob] = useState(false);
   const [runsOf, setRunsOf] = useState<Job | null>(null);
   const services = useServices();
@@ -757,9 +760,15 @@ function Backups() {
                       <code>{j.schedule}</code> to {targetName(j.target_id)}, keeping the last {j.keep_last}
                       {j.last_run?.finished_at ? `, last finished ${ago(j.last_run.finished_at)}` : ""}
                     </p>
+                    {j.last_run?.status === "running" && <Progress id={j.last_run.id} initial={j.last_run.progress} class="mt-1" />}
                     {j.last_run?.error && <p class="text-xs text-bad">{j.last_run.error}</p>}
                   </div>
                   <div class="flex flex-wrap items-center gap-2">
+                    {j.last_run?.status === "running" && (
+                      <button class="btn" onClick={() => setLogId(j.last_run!.id)}>
+                        Log
+                      </button>
+                    )}
                     <button class="btn" onClick={() => setRunsOf(j)}>
                       Runs
                     </button>
@@ -784,7 +793,8 @@ function Backups() {
       </Card>
       {addTarget && <TargetForm onClose={() => setAddTarget(false)} onSaved={targets.reload} />}
       {addJob && targets.data && <JobForm targets={targets.data.targets} services={services} onClose={() => setAddJob(false)} onSaved={jobs.reload} />}
-      {runsOf && <Runs job={runsOf} archived={target(runsOf.target_id)?.storage_class === "DEEP_ARCHIVE"} onClose={() => setRunsOf(null)} />}
+      {runsOf && <Runs job={runsOf} archived={target(runsOf.target_id)?.storage_class === "DEEP_ARCHIVE"} onLog={setLogId} onClose={() => setRunsOf(null)} />}
+      <RunLog id={logId} onClose={() => setLogId(null)} />
     </>
   );
 }
@@ -908,8 +918,8 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
   );
 }
 
-function Runs(props: { job: Job; archived: boolean; onClose: () => void }) {
-  const r = useApi<{ runs: Run[] }>(`/backups/jobs/${props.job.id}/runs`);
+function Runs(props: { job: Job; archived: boolean; onLog: (id: string) => void; onClose: () => void }) {
+  const r = useApi<{ runs: Run[] }>(`/backups/jobs/${props.job.id}/runs`, (e) => e.kind === "backup");
   const restore = async (id: string, test: boolean) => {
     const res = await post<{ message?: string }>(`/backups/runs/${id}/restore`, { test });
     toast(res.message ? sentence(res.message) : test ? "The test restore finished." : "The backup was restored.");
@@ -931,20 +941,30 @@ function Runs(props: { job: Job; archived: boolean; onClose: () => void }) {
                       <span class="text-dim">{when(run.started_at)}</span>
                       {run.size_bytes != null && <span class="text-muted">{bytes(run.size_bytes)}</span>}
                     </div>
+                    {run.status === "running" && <Progress id={run.id} initial={run.progress} class="mt-1" />}
                     {run.error && <p class="text-bad">{run.error}</p>}
                   </div>
-                  {run.snapshot && (
-                    <>
-                      <Action run={() => restore(run.id, true)}>Test restore</Action>
-                      <Action class="btn btn-danger" confirm={
-                          props.archived
-                            ? "Restore this backup? It replaces the current data. It is in Glacier Deep Archive, so S3 first thaws it, which can take up to 48 hours."
-                            : "Restore this backup? It replaces the current data."
-                        } run={() => restore(run.id, false)}>
-                        Restore
-                      </Action>
-                    </>
-                  )}
+                  <div class="flex flex-wrap gap-2">
+                    <button class="btn" onClick={() => props.onLog(run.id)}>
+                      Log
+                    </button>
+                    {run.snapshot && (
+                      <>
+                        <Action run={() => restore(run.id, true)}>Test restore</Action>
+                        <Action
+                          class="btn btn-danger"
+                          confirm={
+                            props.archived
+                              ? "Restore this backup? It replaces the current data. It is in Glacier Deep Archive, so S3 first thaws it, which can take up to 48 hours."
+                              : "Restore this backup? It replaces the current data."
+                          }
+                          run={() => restore(run.id, false)}
+                        >
+                          Restore
+                        </Action>
+                      </>
+                    )}
+                  </div>
                 </li>
               ))}
             </ul>

@@ -245,7 +245,7 @@ export interface Event {
   data: any;
   at: number;
 }
-const KINDS = ["deploy", "deploy.log", "service.status", "service.updated", "audit", "certificate", "settings", "metrics", "warning", "nodes"];
+const KINDS = ["deploy", "deploy.log", "backup", "backup.progress", "service.status", "service.updated", "audit", "certificate", "settings", "metrics", "warning", "nodes"];
 const listeners = new Set<(e: Event) => void>();
 let source: EventSource | null = null;
 let wanted = false;

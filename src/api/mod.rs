@@ -103,6 +103,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/backups/jobs/{id}/run", post(backups::run_job))
         .route("/api/backups/jobs/{id}/runs", get(backups::list_runs))
         .route("/api/backups/runs", get(backups::recent_runs))
+        .route("/api/backups/runs/{id}", get(backups::get_run))
+        .route("/api/backups/runs/{id}/log", get(backups::log_stream))
         .route("/api/backups/runs/{id}/restore", post(backups::restore))
         .route("/api/tunnel", get(observe::tunnel_status).put(observe::tunnel_connect).delete(observe::tunnel_disconnect))
         .route("/api/git/providers", get(git::list).post(git::create))

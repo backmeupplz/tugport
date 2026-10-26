@@ -253,7 +253,12 @@ fn log_path(app: &App, deploy_id: &str) -> std::path::PathBuf {
 }
 
 pub fn read_log(app: &App, deploy_id: &str) -> Vec<(i64, String)> {
-    std::fs::read_to_string(log_path(app, deploy_id))
+    read_log_file(&log_path(app, deploy_id))
+}
+
+/// The `ts<TAB>line` lines of a log file (deploy and backup run logs).
+pub fn read_log_file(path: &std::path::Path) -> Vec<(i64, String)> {
+    std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.split_once('\t').map(|(t, s)| (t.parse().unwrap_or(0), s.to_string())))

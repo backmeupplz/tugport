@@ -33,6 +33,9 @@ impl Paths {
     pub fn deploy_logs(&self) -> PathBuf {
         self.data.join("deploys")
     }
+    pub fn backup_logs(&self) -> PathBuf {
+        self.data.join("backup-runs")
+    }
     pub fn tools(&self) -> PathBuf {
         self.data.join("bin")
     }
@@ -49,11 +52,11 @@ impl Paths {
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {
-        for dir in [&self.etc, &self.data, &self.logs(), &self.sources(), &self.deploy_logs(), &self.tools(), &self.secrets(), &self.files()] {
+        for dir in [&self.etc, &self.data, &self.logs(), &self.sources(), &self.deploy_logs(), &self.backup_logs(), &self.tools(), &self.secrets(), &self.files()] {
             std::fs::create_dir_all(dir)?;
         }
         restrict(&self.etc, 0o700)?;
-        // The database, container and deploy logs and Git checkouts (private code): root only.
+        // The database, container, deploy and backup logs and Git checkouts (private code): root only.
         // Containers reach the files mounted into them (the init, Compose folders) regardless.
         restrict(&self.data, 0o700)?;
         restrict(&self.run, 0o711)?;

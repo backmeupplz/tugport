@@ -211,8 +211,9 @@ pub async fn events(State(app): State<AppState>, a: Auth, Query(q): Query<Events
             let visible = match &e.project_id {
                 Some(pid) => p.can(pid, Role::Viewer),
                 // Server-wide events (servers, metrics, alerts) go to whoever may see servers; the
-                // audit trail outside projects (sign-ins, users, keys) only to the owner.
-                None => p.is_owner || (p.all_projects_role.is_some() && e.kind != "audit"),
+                // audit trail outside projects (sign-ins, users, keys) and the log and progress of
+                // Tugport's own backups only to the owner.
+                None => p.is_owner || (p.all_projects_role.is_some() && e.kind != "audit" && !e.kind.starts_with("backup.")),
             };
             let wanted = q.project.as_ref().is_none_or(|x| e.project_id.as_ref() == Some(x)) && q.service.as_ref().is_none_or(|x| e.service_id.as_ref() == Some(x));
             ready(visible && wanted)

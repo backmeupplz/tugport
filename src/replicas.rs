@@ -327,7 +327,7 @@ async fn attach(app: &AppState, primary: &Service, replica: &Service) -> Result<
             let dump = b.root(b.dump, &format!("--all-databases --single-transaction --routines --triggers --events {}", b.position));
             let producer = crate::backup::exec_cli(app, &src.node, &src.id, false, &dump)?;
             let consumer = crate::backup::exec_cli(app, &dst.node, &dst.id, true, &b.sql(""))?;
-            crate::backup::pipe(producer, consumer).await.context("copying the primary's data")?;
+            crate::backup::pipe(producer, consumer, &|_, _| {}).await.context("copying the primary's data")?;
             run(app, &dst, &format!("{SQL_PW}\n{}", b.sql(&format!("-e \"{}\"", b.start)))).await.context("starting replication")?;
             until(app, &dst, &b.sql(&format!("-E -e '{}'", b.status)), b.following, wait).await
         }

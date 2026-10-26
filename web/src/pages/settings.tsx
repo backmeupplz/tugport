@@ -1280,13 +1280,13 @@ function Requests() {
             <Rows items={entries} empty="No request matches these filters.">
               {(e) => (
                 <li key={e.id} class="px-4 py-2.5 md:px-5">
-                  <div class="flex items-baseline gap-2">
-                    <code class="min-w-0 flex-1 text-[13px] [overflow-wrap:anywhere]">
+                  <div class="flex flex-wrap items-baseline gap-x-2">
+                    <code class="min-w-0 basis-full text-[13px] [overflow-wrap:anywhere] sm:basis-0 sm:flex-1">
                       {e.method} {e.path}
                       {e.query && <span class="text-muted">?{e.query}</span>}
                     </code>
                     <span class={`tabular-nums ${e.status >= 500 ? "text-bad" : e.status >= 400 ? "text-warn" : "text-dim"}`}>{e.status}</span>
-                    <span class={`w-20 shrink-0 text-right tabular-nums ${speed(e.us / 1000)}`}>{ms(e.us / 1000)}</span>
+                    <span class={`shrink-0 tabular-nums sm:w-20 sm:text-right ${speed(e.us / 1000)}`}>{ms(e.us / 1000)}</span>
                   </div>
                   <p class="mt-0.5 text-xs text-muted [overflow-wrap:anywhere]" title={e.agent ?? undefined}>
                     {[when(Math.floor(e.at / 1000)), e.who ?? "not signed in", e.key_id ? `key ${e.key_id}` : "", e.ip ?? "", e.bytes != null ? bytes(e.bytes) : ""].filter(Boolean).join(" · ")}

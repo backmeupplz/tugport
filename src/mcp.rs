@@ -92,7 +92,7 @@ fn tools() -> Vec<Tool> {
         tool("list_replicas", M::GET, "/api/services/{service}/replicas", "A database's read replicas and whether they follow it.", on_service()),
         tool("add_replica", M::POST, "/api/services/{service}/replicas", "Add a read replica to a database, on a given server or region (placement {node, region, labels}). MongoDB and MariaDB primaries restart once the first time.", obj(json!({ "service": service, "placement": { "type": "object" } }), &["service"])),
         tool("promote_replica", M::POST, "/api/services/{service}/promote", "Make a replica a primary when its primary is lost (admin). The old primary's URL variable then points at it.", on_service()),
-        tool("list_backups", M::GET, "/api/backups/jobs", "Backup jobs with their last run.", none()),
+        tool("list_backups", M::GET, "/api/backups/jobs", "Backup jobs with their last run. A volume job's volume is a named volume, or a folder of the server (a path) the service mounts.", none()),
         tool("run_backup", M::POST, "/api/backups/jobs/{job_id}/run", "Run a backup job now.", obj(json!({ "job_id": s("Backup job id") }), &["job_id"])),
         tool("backup_run", M::GET, "/api/backups/runs/{run_id}", "A backup or restore run: its status, progress while it runs, and its log.", obj(json!({ "run_id": s("Backup run id, from list_backups (last_run.id)") }), &["run_id"])),
         Tool { query: &["project", "service", "actor", "limit"], ..tool("audit_log", M::GET, "/api/audit", "Who did what, newest first.", obj(json!({ "project": s("Project id"), "service": s("Service id"), "actor": s("User or agent name"), "limit": { "type": "integer" } }), &[])) },

@@ -661,7 +661,7 @@ const storageHints: Record<string, string> = {
   GLACIER_IR:
     "Glacier Instant Retrieval costs less still and is instant to read, but its retrieval fee is higher and every file is billed for at least 90 days. Not every S3-compatible provider offers it.",
   DEEP_ARCHIVE:
-    "Deep Archive is by far the cheapest. Restores wait up to 48 hours while S3 thaws the data, every file is billed for at least 180 days, test restores check only the index and not the data itself, and the access key needs the s3:RestoreObject permission. Choose it here instead of adding a bucket lifecycle rule, because a rule would also archive the files that backups read and break them.",
+    "Deep Archive is by far the cheapest. Restores wait up to 48 hours while S3 thaws the data, every file is billed for at least 180 days, quick test restores check only the index and not the data itself (a full test thaws it, for a retrieval fee), and the access key needs the s3:RestoreObject permission. Choose it here instead of adding a bucket lifecycle rule, because a rule would also archive the files that backups read and break them.",
 };
 
 interface Job {
@@ -706,7 +706,7 @@ function Backups() {
       ? "Tugport's own state"
       : j.kind === "database"
         ? `Database dump of ${serviceName(j.service_id)}`
-        : `Volume ${j.volume ?? ""} of ${serviceName(j.service_id)}`;
+        : `${j.volume?.startsWith("/") ? "Folder" : "Volume"} ${j.volume ?? ""} of ${serviceName(j.service_id)}`;
   return (
     <>
       <Card
@@ -747,7 +747,7 @@ function Backups() {
       >
         <Loaded r={jobs}>
           {(d) => (
-            <Rows items={d.jobs} empty="No scheduled backups yet. Jobs back up databases, volumes or Tugport's own state on a schedule.">
+            <Rows items={d.jobs} empty="No scheduled backups yet. Jobs back up databases, volumes, host folders or Tugport's own state on a schedule.">
               {(j) => (
                 <li key={j.id} class="row">
                   <div class="min-w-0 flex-1">
@@ -855,8 +855,11 @@ function useServices() {
 
 function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onClose: () => void; onSaved: () => void }) {
   const { f, set, bind } = useForm({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
-  const detail = useApi<{ service: { spec: { mounts?: { type: string; name?: string }[] } } }>(f.kind === "volume" && f.service ? `/services/${f.service}` : null);
-  const volumes = (detail.data?.service.spec.mounts ?? []).flatMap((m) => (m.type === "volume" && m.name ? [m.name] : []));
+  const detail = useApi<{ service: { spec: { mounts?: { type: string; name?: string; source?: string }[] } } }>(f.kind === "volume" && f.service ? `/services/${f.service}` : null);
+  // The service's named volumes and the folders of its server it mounts (bind mounts).
+  const volumes = (detail.data?.service.spec.mounts ?? []).flatMap((m): [string, string][] =>
+    m.type === "volume" && m.name ? [[m.name, m.name]] : m.type === "bind" && m.source ? [[m.source, `Host folder ${m.source}`]] : [],
+  );
   const s = useSubmit(async () => {
     await post("/backups/jobs", {
       kind: f.kind,
@@ -878,7 +881,7 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
             onChange={(kind) => set({ kind, service: "" })}
             options={[
               ["database", "A database (consistent dump)"],
-              ["volume", "A volume"],
+              ["volume", "A volume or host folder"],
               ["state", "Tugport's own state"],
             ]}
           />
@@ -896,13 +899,17 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
           </Field>
         )}
         {f.kind === "volume" && f.service && (
-          <Field label="Volume" hint={detail.data && !volumes.length ? "This service has no named volumes to back up." : undefined}>
-            <Select
-              class="font-mono"
-              value={f.volume}
-              onChange={(volume) => set({ volume })}
-              options={[["", detail.data ? "Choose…" : "Loading…"], ...volumes.map((v): [string, string] => [v, v])]}
-            />
+          <Field
+            label="Volume or folder"
+            hint={
+              detail.data && !volumes.length
+                ? "This service has no named volumes or host folders to back up."
+                : f.volume.startsWith("/")
+                  ? "A folder of the server the service runs on, which the service mounts."
+                  : undefined
+            }
+          >
+            <Select class="font-mono" value={f.volume} onChange={(volume) => set({ volume })} options={[["", detail.data ? "Choose…" : "Loading…"], ...volumes]} />
           </Field>
         )}
         <div class="grid gap-4 sm:grid-cols-3">
@@ -920,13 +927,20 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
 
 function Runs(props: { job: Job; archived: boolean; onLog: (id: string) => void; onClose: () => void }) {
   const r = useApi<{ runs: Run[] }>(`/backups/jobs/${props.job.id}/runs`, (e) => e.kind === "backup");
-  const restore = async (id: string, test: boolean) => {
-    const res = await post<{ message?: string }>(`/backups/runs/${id}/restore`, { test });
+  const restore = async (id: string, test: boolean, full = false) => {
+    const res = await post<{ message?: string }>(`/backups/runs/${id}/restore`, { test, full });
     toast(res.message ? sentence(res.message) : test ? "The test restore finished." : "The backup was restored.");
     await r.reload();
   };
   return (
     <Modal open onClose={props.onClose} title="Backup runs" wide>
+      {props.archived && (
+        <p class="mb-3 text-sm text-muted">
+          These backups are in Glacier Deep Archive. Test restore is quick and free: it lists the snapshot and checks the repository's index and folder trees, which stay readable, but
+          not the file data, which stays frozen. Full test has S3 thaw the data first (up to 48 hours, and a bulk retrieval fee of about $0.0025 per GB), then restores it into a
+          throwaway copy and checks it, without touching the service.
+        </p>
+      )}
       <Loaded r={r}>
         {(d) =>
           d.runs.length === 0 ? (
@@ -951,6 +965,14 @@ function Runs(props: { job: Job; archived: boolean; onLog: (id: string) => void;
                     {run.snapshot && (
                       <>
                         <Action run={() => restore(run.id, true)}>Test restore</Action>
+                        {props.archived && (
+                          <Action
+                            confirm="Run a full test restore? S3 first thaws this backup's data from Glacier Deep Archive, which takes up to 48 hours and costs a bulk retrieval fee of about $0.0025 per GB. It is then restored into a throwaway copy and checked; the service is not touched. The run reports the result."
+                            run={() => restore(run.id, true, true)}
+                          >
+                            Full test
+                          </Action>
+                        )}
                         <Action
                           class="btn btn-danger"
                           confirm={

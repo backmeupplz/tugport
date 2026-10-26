@@ -46,7 +46,7 @@ const runState = (s: string): [string, string] => (s === "ok" ? ["live", "done"]
 const took = (start: number | null, end: number | null) => (start && end ? ` · took ${duration(end - start)}` : "");
 
 const runKind = (kind: string) => (kind === "backup" ? "Backup" : kind === "test-restore" ? "Test restore" : "Restore");
-const runWhat = (r: RunItem) => (r.job_kind === "state" ? "Tugport's own data" : r.job_kind === "volume" ? `volume ${r.volume ?? ""}` : "database");
+const runWhat = (r: RunItem) => (r.job_kind === "state" ? "Tugport's own data" : r.job_kind === "volume" ? `${r.volume?.startsWith("/") ? "folder" : "volume"} ${r.volume ?? ""}` : "database");
 
 /** Deploys and backups across everything the viewer can see, newest first. */
 export function Actions() {

@@ -140,22 +140,7 @@ pub async fn create_job(State(app): State<AppState>, a: Auth, Json(b): Json<JobB
             None
         }
     };
-    match (b.kind.as_str(), &service) {
-        ("database", Some(s)) if s.spec.database.is_some() => {}
-        ("database", _) => return Err(ApiError::bad_request("database backups need a database service")),
-        ("volume", _) if b.volume.as_deref().is_none_or(|v| v.is_empty()) => return Err(ApiError::bad_request("volume backups need a volume name")),
-        // The name reaches `docker run -v`, where a path would mean a folder of the server, and
-        // another service's volume another project's data.
-        ("volume", Some(s))
-            if !s.spec.mounts.iter().any(|m| matches!(m, crate::model::Mount::Volume { name, .. } if Some(name.as_str()) == b.volume.as_deref())) =>
-        {
-            return Err(ApiError::bad_request("pick one of the service's volumes"));
-        }
-        ("volume", None) if b.volume.as_deref().is_some_and(|v| v.contains(['/', ':'])) => return Err(ApiError::bad_request("that is not a volume name")),
-        ("volume", _) | ("state", None) => {}
-        ("state", Some(_)) => return Err(ApiError::bad_request("state backups are not tied to a service")),
-        _ => return Err(ApiError::bad_request("kind is database, volume or state")),
-    }
+    check_job(&b.kind, b.volume.as_deref(), service.as_ref().map(|s| &s.spec)).map_err(ApiError::bad_request)?;
     backup::target(&app, &b.target_id).map_err(|_| ApiError::bad_request("unknown backup target"))?;
     let id = util::id();
     app.db.exec(
@@ -164,6 +149,28 @@ pub async fn create_job(State(app): State<AppState>, a: Auth, Json(b): Json<JobB
     )?;
     app.audit(Some(&a.0), "backup.job_create", service.as_ref().map(|s| s.project_id.as_str()), service.as_ref().map(|s| s.id.as_str()), Some(&b.kind), Some(&b.schedule));
     Ok(Json(json!({ "id": id })))
+}
+
+/// What a job of `kind` may back up, for the service (spec) it is tied to.
+fn check_job(kind: &str, volume: Option<&str>, spec: Option<&crate::model::ServiceSpec>) -> Result<(), &'static str> {
+    let volume = volume.unwrap_or("");
+    match (kind, spec) {
+        ("database", Some(s)) if s.database.is_some() => Ok(()),
+        ("database", _) => Err("database backups need a database service"),
+        ("volume", _) if volume.is_empty() => Err("volume backups need a volume name"),
+        // The name reaches `docker run -v`, where a path is a folder of the server: only one the
+        // service already mounts. Another service's volume or folder would be another project's data.
+        ("volume", Some(s)) if volume.starts_with('/') && !backup::bind_source(s, volume) => Err("pick one of the folders the service mounts"),
+        ("volume", Some(s))
+            if !volume.starts_with('/') && !s.mounts.iter().any(|m| matches!(m, crate::model::Mount::Volume { name, .. } if name == volume)) =>
+        {
+            Err("pick one of the service's volumes")
+        }
+        ("volume", None) if volume.contains(['/', ':']) => Err("that is not a volume name"),
+        ("volume", _) | ("state", None) => Ok(()),
+        ("state", Some(_)) => Err("state backups are not tied to a service"),
+        _ => Err("kind is database, volume or state"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -222,10 +229,12 @@ pub async fn list_runs(State(app): State<AppState>, a: Auth, Path(id): Path<Stri
 #[serde(default)]
 pub struct RestoreBody {
     test: bool,
+    /// With `test` on a Deep Archive backup: thaw the data and restore it too, not only check the index.
+    full: bool,
 }
 
 pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<String>, body: Option<Json<RestoreBody>>) -> ApiResult<Json<Value>> {
-    let test = body.map(|b| b.0.test).unwrap_or(false);
+    let RestoreBody { test, full } = body.map(|b| b.0).unwrap_or_default();
     let job_id: String = app.db.row("SELECT job_id FROM backup_runs WHERE id = ?1", [&run_id], |r| r.get(0))?.ok_or_else(|| ApiError::not_found("backup run not found"))?;
     let (j, project) = job_project(&app, &job_id)?;
     if test {
@@ -240,17 +249,18 @@ pub async fn restore(State(app): State<AppState>, a: Auth, Path(run_id): Path<St
     }
     app.audit(Some(&a.0), if test { "backup.test_restore" } else { "backup.restore" }, project.as_deref(), j.service_id.as_deref(), Some(&run_id), None);
     let (app2, rid) = (app.clone(), run_id.clone());
-    if !test && backup::archived(&app, &j) {
+    if (!test || full) && backup::archived(&app, &j) {
         // S3 takes up to 48 hours to thaw the data, longer than a request should wait; the run records how it went.
         tokio::spawn(async move {
-            if let Err(e) = backup::restore(&app2, &rid, false).await {
+            if let Err(e) = backup::restore(&app2, &rid, test, full).await {
                 tracing::warn!("restoring backup run {rid} failed: {e:#}");
             }
         });
-        let msg = "The restore started. This backup is in S3 Glacier Deep Archive, so S3 first thaws it, which can take up to 48 hours. It shows up in the job's runs and gets its result there when it finishes.";
+        let what = if test { "full test restore" } else { "restore" };
+        let msg = format!("The {what} started. This backup is in S3 Glacier Deep Archive, so S3 first thaws it, which can take up to 48 hours. It shows up in the job's runs and gets its result there when it finishes.");
         return Ok(Json(json!({ "ok": true, "message": msg })));
     }
-    let msg = detached(async move { backup::restore(&app2, &rid, test).await }).await?.map_err(bad)?;
+    let msg = detached(async move { backup::restore(&app2, &rid, test, full).await }).await?.map_err(bad)?;
     Ok(Json(json!({ "ok": true, "message": msg })))
 }
 
@@ -348,4 +358,35 @@ pub async fn log_stream(State(app): State<AppState>, a: Auth, Path(id): Path<Str
             .boxed()
     };
     Ok(sse_events(stream::iter(backlog).chain(tail)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Mount, ServiceSpec};
+
+    #[test]
+    fn jobs_back_up_only_what_the_service_mounts() {
+        let spec = ServiceSpec {
+            mounts: vec![
+                Mount::Volume { name: "data".into(), target: "/data".into(), readonly: false },
+                Mount::Bind { source: "/var/opt/memos".into(), target: "/var/opt/memos".into(), readonly: false },
+                Mount::Bind { source: "/srv/a:b".into(), target: "/x".into(), readonly: false },
+            ],
+            ..Default::default()
+        };
+        let s = Some(&spec);
+        assert_eq!(check_job("volume", Some("data"), s), Ok(()));
+        assert_eq!(check_job("volume", Some("/var/opt/memos"), s), Ok(()));
+        assert!(check_job("volume", Some("other"), s).is_err());
+        for path in ["/var/opt", "/var/opt/memos/", "/etc", "/srv/a:b", "/data"] {
+            assert!(check_job("volume", Some(path), s).is_err(), "{path}");
+        }
+        assert!(check_job("volume", Some(""), s).is_err());
+        assert_eq!(check_job("volume", Some("data"), None), Ok(()));
+        assert!(check_job("volume", Some("/var/opt/memos"), None).is_err());
+        assert!(check_job("database", None, s).is_err());
+        assert_eq!(check_job("state", None, None), Ok(()));
+        assert!(check_job("state", None, s).is_err());
+    }
 }

@@ -1,9 +1,10 @@
 //! Backups with restic (run from its official image). Databases are dumped through the
-//! container's init and streamed in, volumes are read directly, and Tugport's own state
-//! is snapshotted. Repositories are encrypted with a password derived from the master key.
+//! container's init and streamed in, volumes and the folders services mount are read directly,
+//! and Tugport's own state is snapshotted. Repositories are encrypted with a password derived
+//! from the master key.
 
 use crate::app::{App, AppState};
-use crate::model::Engine;
+use crate::model::{Engine, Mount, ServiceSpec};
 use crate::{databases, runtime, store, util};
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::params;
@@ -158,14 +159,22 @@ fn restic_args(class: Option<&str>, args: &[&str]) -> Vec<String> {
 
 /// Deep Archive: have S3 thaw what a restore of `include` needs and wait for it (up to 48 hours) by
 /// restoring it into the throwaway restic container. It then stays readable for 7 days, so the real
-/// restore after it (and any downtime around that) does not wait.
-async fn thaw(cli: Command, repo: &Repo, snapshot: &str, include: &str, log: &RunLog) -> Result<()> {
+/// restore after it (and any downtime around that) does not wait. A test thaws in S3's Bulk tier,
+/// the cheapest; a real restore in its Standard one, which takes up to 12 hours.
+async fn thaw(cli: Command, repo: &Repo, snapshot: &str, include: &str, test: bool, log: &RunLog) -> Result<()> {
     if repo.archived() {
         log.line("Waiting for S3 to thaw the backup from Glacier Deep Archive (up to 48 hours)…");
-        log.run(restic_on(cli, repo, &[], &["restore", "--json", snapshot, "--target", "/thaw", "--include", include])).await.context("thawing the backup from Deep Archive")?;
+        let mut args = vec!["restore", "--json", snapshot, "--target", "/thaw", "--include", include];
+        if test {
+            args.extend(BULK);
+        }
+        log.run(restic_on(cli, repo, &[], &args)).await.context("thawing the backup from Deep Archive")?;
     }
     Ok(())
 }
+
+/// Restic's option for thawing Deep Archive data in S3's cheapest tier (about $0.0025 per GB).
+const BULK: [&str; 2] = ["-o", "s3.restore-tier=Bulk"];
 
 /// Whether a job's backups are in Deep Archive, where a restore first waits up to 48 hours for S3.
 pub fn archived(app: &App, j: &Job) -> bool {
@@ -516,11 +525,11 @@ async fn backup(app: &App, j: &Job, log: &RunLog) -> Result<(Option<String>, Opt
             summary.into_inner().unwrap_or_else(|e| e.into_inner())
         }
         "volume" => {
-            let vol = volume_name(j)?;
-            let mount = format!("{vol}:/data/{vol}:ro");
+            let (host, path, what) = job_data(app, j)?;
+            let mount = format!("{host}:{path}:ro");
             let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
-            log.line(&format!("Backing up volume {vol}…"));
-            log.run(restic_on(cli, &repo, &[mount], &["backup", "--json", &format!("/data/{vol}"), "--tag", "tugport", "--tag", &job_tag])).await?
+            log.line(&format!("Backing up {what}…"));
+            log.run(restic_on(cli, &repo, &[mount], &["backup", "--json", &path, "--tag", "tugport", "--tag", &job_tag])).await?
         }
         "state" => {
             let dir = app.paths.data.join("backup-staging");
@@ -542,8 +551,9 @@ async fn backup(app: &App, j: &Job, log: &RunLog) -> Result<(Option<String>, Opt
     Ok((snapshot, size))
 }
 
-/// Restore a run in place, or (test) into a throwaway copy that is checked and removed.
-pub async fn restore(app: &AppState, run_id: &str, test: bool) -> Result<String> {
+/// Restore a run in place, or (test) into a throwaway copy that is checked and removed. A test of
+/// a Deep Archive backup only checks what is in Standard, unless `full` has S3 thaw the data first.
+pub async fn restore(app: &AppState, run_id: &str, test: bool, full: bool) -> Result<String> {
     let (job_id, snapshot): (String, Option<String>) =
         app.db.row("SELECT job_id, snapshot FROM backup_runs WHERE id = ?1", [run_id], |r| Ok((r.get(0)?, r.get(1)?)))?.ok_or_else(|| anyhow!("backup run {run_id} not found"))?;
     let snapshot = snapshot.ok_or_else(|| anyhow!("this run has no snapshot"))?;
@@ -553,10 +563,12 @@ pub async fn restore(app: &AppState, run_id: &str, test: bool) -> Result<String>
     let log = start_run(app, &j, if test { "test-restore" } else { "restore" }, Some(&snapshot))?;
     log.line(&format!("{} snapshot {}…", if test { "Test-restoring" } else { "Restoring" }, snapshot.get(..8).unwrap_or(&snapshot)));
     let result = match j.kind.as_str() {
-        // Reading archived data takes S3 up to 48 hours, so a test checks only what is in Standard.
-        _ if test && repo.archived() => verify_snapshot(&repo, &snapshot, &log).await,
+        // Reading archived data takes S3 up to 48 hours, so a quick test checks only what is in Standard.
+        _ if test && repo.archived() && !full => verify_snapshot(&repo, &snapshot, &log).await,
         "database" => restore_database(app, &j, &repo, &snapshot, test, &log).await,
         "volume" if !test => restore_volume(app, &j, &repo, &snapshot, &log).await,
+        // Only the full test of an archived one restores all of it; a quick test reads 5% (volumes can be large).
+        "volume" if full && repo.archived() => test_volume(app, &j, &repo, &snapshot, &log).await,
         "volume" => verify_snapshot(&repo, &snapshot, &log).await,
         "state" => restore_state(app, &repo, &snapshot, &log).await,
         other => Err(anyhow!("unknown backup kind {other}")),
@@ -576,7 +588,7 @@ async fn verify_snapshot(repo: &Repo, snapshot: &str, log: &RunLog) -> Result<St
     log.line("Listing the snapshot…");
     crate::proc::output(restic_cmd(repo, &[], &["ls", snapshot])).await?;
     if repo.archived() {
-        return Ok("The snapshot is listed and the repository's index and folder trees passed their integrity check. The data itself is in S3 Glacier Deep Archive, so it was not read; a real restore thaws it first, which takes up to 48 hours.".into());
+        return Ok("The snapshot is listed and the repository's index and folder trees passed their integrity check. The data itself is in S3 Glacier Deep Archive, so it was not read. A full test restore has S3 thaw it first (up to 48 hours, with a retrieval fee) and then restores it into a throwaway copy.".into());
     }
     Ok("The snapshot is readable and the repository passed its integrity check.".into())
 }
@@ -589,7 +601,7 @@ async fn restore_database(app: &AppState, j: &Job, repo: &Repo, snapshot: &str, 
     let db = databases::preset(engine);
     let path = format!("/{}/{}", s.name, db.dump_file);
     // `restic dump` cannot thaw archived data itself.
-    thaw(Command::new("docker"), repo, snapshot, &path, log).await?;
+    thaw(Command::new("docker"), repo, snapshot, &path, test, log).await?;
     let (node, container, scratch_name) = if test {
         log.line(&format!("Starting a temporary copy of {}…", s.name));
         let (node, id, name) = scratch_database(app, &s).await?;
@@ -655,18 +667,56 @@ async fn scratch_database(app: &AppState, s: &store::Service) -> Result<(String,
 
 /// A job's volume, refused when it is not a plain volume name: in `docker run -v` a path would
 /// be a folder of the server.
-fn volume_name(j: &Job) -> Result<&str> {
-    let vol = j.volume.as_deref().ok_or_else(|| anyhow!("volume backups need a volume"))?;
+fn volume_name(vol: &str) -> Result<&str> {
     if vol.is_empty() || vol.starts_with(['.', '-']) || vol.contains(['/', ':', ',']) {
         bail!("{vol} is not a volume name");
     }
     Ok(vol)
 }
 
+/// Whether `path` is a folder the service mounts from its server (and safe in `docker run -v`).
+pub fn bind_source(spec: &ServiceSpec, path: &str) -> bool {
+    !path.contains([':', ',']) && spec.mounts.iter().any(|m| matches!(m, Mount::Bind { source, .. } if source == path))
+}
+
+/// What a volume job backs up: the host side of `docker run -v` (a volume, or a folder its service
+/// mounts, checked again on every run), where it sits in the snapshot, and what to call it.
+fn job_data(app: &App, j: &Job) -> Result<(String, String, String)> {
+    let v = j.volume.as_deref().ok_or_else(|| anyhow!("volume backups need a volume"))?;
+    if !v.starts_with('/') {
+        volume_name(v)?;
+    } else if !j.service_id.as_deref().and_then(|sid| store::service(app, sid).ok().flatten()).is_some_and(|s| bind_source(&s.spec, v)) {
+        bail!("{v} is no longer a folder the service mounts");
+    }
+    let (path, what) = snapshot_path(v);
+    Ok((v.into(), path, what))
+}
+
+/// Where a volume job's data sits in its snapshots, and what to call it.
+fn snapshot_path(v: &str) -> (String, String) {
+    if v.starts_with('/') { (format!("/host{v}"), format!("folder {v}")) } else { (format!("/data/{v}"), format!("volume {v}")) }
+}
+
+/// A full test restore of an archived volume or folder: into the throwaway restic container (so the
+/// service is not touched, and the copy goes with the container), every file read back and checked.
+/// Nothing of the server is mounted, so a folder needs no check that the service still mounts it.
+async fn test_volume(app: &App, j: &Job, repo: &Repo, snapshot: &str, log: &RunLog) -> Result<String> {
+    let (path, what) = snapshot_path(j.volume.as_deref().ok_or_else(|| anyhow!("volume backups need a volume"))?);
+    let mut args = vec!["restore", "--json", "--verify", snapshot, "--target", "/restoretest", "--include", path.as_str()];
+    if repo.archived() {
+        log.line("Waiting for S3 to thaw the backup from Glacier Deep Archive (up to 48 hours)…");
+        args.extend(BULK);
+    }
+    log.line(&format!("Restoring {what} into a throwaway copy…"));
+    let s = log.run(restic_on(crate::nodes::docker_cli(app, &volume_node(app, j))?, repo, &[], &args)).await?.unwrap_or_default();
+    let (files, bytes) = (s["files_restored"].as_u64().unwrap_or(0), s["bytes_restored"].as_u64().unwrap_or(0));
+    Ok(format!("Test restore succeeded: {files} files ({}) of {what} were restored into a throwaway copy, read back and checked, then removed.", human(bytes)))
+}
+
 async fn restore_volume(app: &AppState, j: &Job, repo: &Repo, snapshot: &str, log: &RunLog) -> Result<String> {
-    let vol = volume_name(j)?;
+    let (host, path, what) = job_data(app, j)?;
     // Before anything stops, so the service keeps running while S3 thaws the data.
-    thaw(crate::nodes::docker_cli(app, &volume_node(app, j))?, repo, snapshot, &format!("/data/{vol}"), log).await?;
+    thaw(crate::nodes::docker_cli(app, &volume_node(app, j))?, repo, snapshot, &path, false, log).await?;
     let users: Vec<runtime::Replica> = match &j.service_id {
         Some(sid) => runtime::replicas(app, sid).await?.into_iter().filter(|r| r.state == "running").collect(),
         None => vec![],
@@ -679,22 +729,22 @@ async fn restore_volume(app: &AppState, j: &Job, repo: &Repo, snapshot: &str, lo
             runtime::stop(app, &r.node, &r.id, 30).await?;
             stopped.push(r);
         }
-        let mount = format!("{vol}:/data/{vol}");
+        let mount = format!("{host}:{path}");
         let cli = crate::nodes::docker_cli(app, &volume_node(app, j))?;
-        log.line(&format!("Restoring volume {vol}…"));
-        log.run(restic_on(cli, repo, &[mount], &["restore", "--json", snapshot, "--target", "/", "--include", &format!("/data/{vol}")])).await
+        log.line(&format!("Restoring {what}…"));
+        log.run(restic_on(cli, repo, &[mount], &["restore", "--json", snapshot, "--target", "/", "--include", &path])).await
     }
     .await;
     for r in stopped {
         log.line(&format!("Starting {} again…", r.name));
         if let Err(e) = runtime::start(app, &r.node, &r.id).await {
-            tracing::warn!("starting {} again after restoring {vol}: {e:#}", r.name);
+            tracing::warn!("starting {} again after restoring {what}: {e:#}", r.name);
         }
     }
     // Restarted containers may have new addresses, also when the restore failed.
     crate::proxy::reload(app);
     res?;
-    Ok(format!("Restored volume {vol}."))
+    Ok(format!("Restored {what}."))
 }
 
 async fn restore_state(app: &App, repo: &Repo, snapshot: &str, log: &RunLog) -> Result<String> {

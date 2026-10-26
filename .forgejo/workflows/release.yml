@@ -90,9 +90,11 @@ jobs:
           FJ_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
           sha256sum tugport-linux-* > SHA256SUMS && cat SHA256SUMS
-          # The tag reaches the GitHub mirror within seconds; wait for it rather than letting GitHub create one
+          # A tag made on Forgejo alone (a release) only reaches the mirror with the next pushed commit, so put it there
+          gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1 || gh api "repos/$REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" >/dev/null || true
           for i in $(seq 30); do gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1 && break; sleep 10; done
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" --repo "$REPO" --clobber *

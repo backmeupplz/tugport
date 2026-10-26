@@ -168,6 +168,11 @@
   h2 { font-size: clamp(30px, 3.6vw, 44px); line-height: 1.08; max-width: 18em; }
   .intro { margin-top: 18px; color: var(--dim); font-size: 18px; max-width: 40em; }
 
+  /* Launch film: served by Tugport itself (media.tugport.com), AV1 where the browser decodes it, HEVC otherwise. */
+  .film { margin-top: 48px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: #000; box-shadow: var(--shadow); }
+  .film video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; }
+  .film-note { margin-top: 14px; color: var(--muted); font-size: 14.5px; }
+
   /* Feature grid: each card is a short claim and the panel showing it. */
   .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 20px; margin-top: 56px; }
   .card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; }
@@ -254,6 +259,7 @@
     .hero figure { margin-top: 44px; }
     .bar { display: none; }
     .hero .frame { border-radius: 18px; max-width: 420px; margin: 0 auto; }
+    .film { margin-top: 36px; border-radius: 12px; }
     section { padding: 72px 0; }
     .grid { margin-top: 40px; gap: 16px; }
     .card .txt { padding: 22px 20px 18px; }
@@ -285,6 +291,7 @@
         <span>Tugport</span>
       </a>
       <div class="links">
+        <a class="hide-sm" href="#film">Film</a>
         <a class="hide-sm" href="#features">Features</a>
         <a class="hide-sm" href="#agents">Agents</a>
         <a class="hide-sm" href="#install">Install</a>
@@ -331,6 +338,21 @@
       </figure>
     </div>
   </div>
+
+  <section id="film" class="band">
+    <div class="wrap">
+      <p class="label">Launch film</p>
+      <h2>See what Tugport does in four minutes.</h2>
+      <p class="intro">The film shows the real panel moving apps off Easypanel and Coolify, issuing certificates, running databases, handing scoped keys to AI agents, joining servers over WireGuard and putting idle apps to sleep.</p>
+      <div class="film">
+        <video controls playsinline preload="none" poster="/shots/film-poster.webp" width="1920" height="1080" aria-label="Tugport launch film, 4 minutes 5 seconds, narrated, with a metal soundtrack">
+          <source src="https://media.tugport.com/tugport-launch-av1.mp4" type='video/mp4; codecs="av01.0.09M.10, mp4a.40.2"'>
+          <source src="https://media.tugport.com/tugport-launch-hevc.mp4" type='video/mp4; codecs="hvc1.1.6.L123.B0, mp4a.40.2"'>
+        </video>
+      </div>
+      <p class="film-note">It runs for 4 minutes 5 seconds with narration and a metal soundtrack, and it is served by Tugport itself.</p>
+    </div>
+  </section>
 
   <section id="features">
     <div class="wrap">

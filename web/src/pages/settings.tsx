@@ -916,7 +916,7 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
           <Field label="Target">
             <Select value={f.target} onChange={(target) => set({ target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
           </Field>
-          <Input label="Schedule" hint="Use cron format in the server's time zone." class="font-mono" required {...bind("schedule")} />
+          <Input label="Schedule" hint="Use cron format, in UTC." class="font-mono" required {...bind("schedule")} />
           <Input label="Keep the last" type="number" min={1} {...bind("keep")} />
         </div>
         <FormButtons s={s} submit="Add job" onCancel={props.onClose} disabled={(f.kind !== "state" && !f.service) || (f.kind === "volume" && !f.volume)} />

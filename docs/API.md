@@ -296,7 +296,7 @@ The `config` for each kind:
 |---|---|---|
 | GET / POST | `/api/backups/targets` | POST takes `{name, kind: s3\|local, config}`. S3 config: `{endpoint, bucket, prefix?, access_key, secret_key, region?, storage_class?}`. Local config: `{path}`. GET adds each target's `storage_class` (null for Standard). |
 | DELETE | `/api/backups/targets/{id}` | |
-| GET / POST | `/api/backups/jobs` | GET returns jobs with `enabled` and `last_run` (`{id, status, finished_at, error, progress}`). POST takes `{service_id?, target_id, kind: database\|volume\|state, volume?, schedule (cron), keep_last}`. A volume job's `volume` is one of the service's named volumes or, for a folder of the server, the exact `source` of one of its bind mounts (such as `/var/opt/memos`); without a service, only a volume name. A folder is checked again on every run, so a job stops working once the service no longer mounts it. |
+| GET / POST | `/api/backups/jobs` | GET returns jobs with `enabled` and `last_run` (`{id, status, finished_at, error, progress}`). POST takes `{service_id?, target_id, kind: database\|volume\|state, volume?, schedule (cron, in UTC), keep_last}`. A volume job's `volume` is one of the service's named volumes or, for a folder of the server, the exact `source` of one of its bind mounts (such as `/var/opt/memos`); without a service, only a volume name. A folder is checked again on every run, so a job stops working once the service no longer mounts it. |
 | PATCH / DELETE | `/api/backups/jobs/{id}` | |
 | POST | `/api/backups/jobs/{id}/run` | |
 | GET | `/api/backups/jobs/{id}/runs` | `{runs: [{id, kind, status, snapshot, size_bytes, error, started_at, finished_at, progress}]}` |

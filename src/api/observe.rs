@@ -13,6 +13,7 @@ use rusqlite::params;
 use super::{bad, detached, row_json};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -126,13 +127,26 @@ pub async fn metrics_query(State(app): State<AppState>, a: Auth, Query(q): Query
 
 pub async fn docker_usage(State(app): State<AppState>, a: Auth, Query(q): Query<NodeQuery>) -> ApiResult<Json<Value>> {
     a.require_servers("needs the owner or a role on all projects")?;
-    let docker = app.docker_on(q.node.as_deref().unwrap_or("local")).map_err(|e| ApiError::not_found(format!("{e:#}")))?;
-    let df = docker.df(None::<bollard::query_parameters::DataUsageOptions>).await.map_err(anyhow::Error::from)?;
+    let node = q.node.as_deref().unwrap_or("local");
+    let docker = app.docker_on(node).map_err(|e| ApiError::not_found(format!("{e:#}")))?;
+    Ok(Json(util::cached(&DOCKER_USAGE, node, Duration::from_secs(300), docker_df(docker)).await?))
+}
+
+/// Docker's disk usage takes seconds (it sizes every volume), so it is kept for a few minutes.
+static DOCKER_USAGE: util::Cache<Value> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+async fn docker_df(docker: bollard::Docker) -> anyhow::Result<Value> {
+    let df = docker.df(None::<bollard::query_parameters::DataUsageOptions>).await?;
     let images: i64 = df.images.iter().flatten().map(|i| i.size).sum();
     let build: i64 = df.build_cache.iter().flatten().filter_map(|b| b.size).sum();
     let volumes: i64 = df.volumes.iter().flatten().filter_map(|v| v.usage_data.as_ref().map(|u| u.size)).sum();
     let containers: i64 = df.containers.iter().flatten().filter_map(|c| c.size_rw).sum();
-    Ok(Json(json!({ "images": images, "build_cache": build, "volumes": volumes, "containers": containers })))
+    Ok(json!({ "images": images, "build_cache": build, "volumes": volumes, "containers": containers }))
+}
+
+/// Measure this server's Docker disk usage in the background, so the first look is instant too.
+pub async fn warm_docker_usage(app: AppState) {
+    let _ = util::cached(&DOCKER_USAGE, "local", Duration::ZERO, docker_df(app.docker.clone())).await;
 }
 
 pub async fn list_channels(State(app): State<AppState>, _: Owner) -> ApiResult<Json<Value>> {

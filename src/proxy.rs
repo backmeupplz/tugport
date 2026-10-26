@@ -200,6 +200,9 @@ pub struct Proxy {
     http1: Client<HttpConnector, Body>,
     h2c: Client<HttpConnector, Body>,
     auth_cache: Mutex<HashMap<String, i64>>,
+    /// Every service's containers from the last table build, which the API reads instead of
+    /// asking Docker again (a listing takes ~100 ms on a busy server).
+    pub replicas: RwLock<Option<runtime::Listing>>,
 }
 
 impl Proxy {
@@ -226,6 +229,7 @@ impl Proxy {
             http1: Client::builder(TokioExecutor::new()).pool_idle_timeout(Duration::from_secs(30)).build(conn.clone()),
             h2c: Client::builder(TokioExecutor::new()).http2_only(true).build(conn),
             auth_cache: Mutex::new(HashMap::new()),
+            replicas: RwLock::new(None),
         })
     }
 
@@ -305,7 +309,14 @@ pub fn reload(app: &App) {
 async fn build_table(app: &App) -> Result<Table> {
     let mut routes = vec![];
     let services: HashMap<String, store::Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
-    let replicas = runtime::all_replicas(app).await.unwrap_or_default();
+    let replicas = match runtime::all_replicas(app).await {
+        Ok(r) => {
+            let r = Arc::new(r);
+            *crate::util::write(&app.proxy.replicas) = Some(r.clone());
+            r
+        }
+        Err(_) => Default::default(),
+    };
     let draining = crate::util::lock(&app.proxy.draining).clone();
     let settings = app.settings();
     for d in store::domains(app, None)? {
@@ -397,14 +408,15 @@ pub async fn initial_routes(app: &App) {
     rebuild(app, false).await;
 }
 
-/// Keep the routing table fresh: on demand, on container events on any server, and every 30 seconds.
+/// Keep the routing table (and the API's container listing) fresh: on demand, on container
+/// events on any server, and every 30 seconds.
 pub async fn watch(app: AppState) {
     tokio::spawn(crate::nodes::for_each_node(app.clone(), |app, node| async move {
         use futures_util::StreamExt;
         let filters = HashMap::from([("type".to_string(), vec!["container".to_string()])]);
         let mut events = node.docker.events(Some(bollard::query_parameters::EventsOptions { filters: Some(filters), ..Default::default() }));
         while let Some(Ok(e)) = events.next().await {
-            if matches!(e.action.as_deref(), Some("start" | "die" | "stop" | "pause" | "unpause")) || e.action.as_deref().is_some_and(|a| a.starts_with("health_status")) {
+            if matches!(e.action.as_deref(), Some("create" | "start" | "die" | "stop" | "pause" | "unpause" | "destroy")) || e.action.as_deref().is_some_and(|a| a.starts_with("health_status")) {
                 reload(&app);
             }
         }

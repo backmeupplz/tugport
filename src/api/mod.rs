@@ -10,6 +10,8 @@ mod nodes;
 mod observe;
 mod projects;
 
+pub use observe::warm_docker_usage;
+
 use crate::app::AppState;
 use crate::auth::{self, KeyCheck, Principal};
 use axum::Router;

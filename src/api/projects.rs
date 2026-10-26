@@ -16,10 +16,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-/// Each service's state, from one container listing per server.
+/// Each service's state, from the proxy's latest container listing.
 async fn states(app: &AppState, services: &[Service]) -> ApiResult<BTreeMap<String, Value>> {
-    let mut reps = crate::runtime::all_replicas(app).await?;
-    Ok(services.iter().map(|s| (s.id.clone(), crate::runtime::status_of(app, s, reps.remove(&s.id).unwrap_or_default()))).collect())
+    let reps = crate::runtime::known_replicas(app).await?;
+    Ok(services.iter().map(|s| (s.id.clone(), crate::runtime::status_of(app, s, reps.get(&s.id).cloned().unwrap_or_default()))).collect())
 }
 
 fn role(a: &Auth, project_id: &str) -> Option<&'static str> {

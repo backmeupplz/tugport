@@ -697,8 +697,11 @@ pub async fn audit(State(app): State<AppState>, a: Auth, Query(q): Query<AuditQu
     Ok(Json(json!({ "entries": rows })))
 }
 
+/// The newest release, checked at most every 10 minutes (GitHub allows 60 calls an hour).
+static LATEST: util::Cache<crate::updates::Release> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 pub async fn update_status(_: Owner) -> ApiResult<Json<Value>> {
-    let latest = crate::updates::latest().await.ok();
+    let latest = util::cached(&LATEST, "", std::time::Duration::from_secs(600), crate::updates::latest()).await.ok();
     let available = latest.as_ref().is_some_and(|r| crate::updates::newer(&r.version));
     Ok(Json(json!({ "current": crate::VERSION, "latest": latest, "available": available })))
 }

@@ -99,6 +99,18 @@ pub async fn all_replicas(app: &App) -> Result<HashMap<String, Vec<Replica>>> {
     Ok(out)
 }
 
+/// Every service's containers, by service id.
+pub type Listing = std::sync::Arc<HashMap<String, Vec<Replica>>>;
+
+/// Every service's containers as the proxy last listed them (container events keep it current),
+/// or a fresh listing before its first one.
+pub async fn known_replicas(app: &App) -> Result<Listing> {
+    if let Some(r) = crate::util::read(&app.proxy.replicas).clone() {
+        return Ok(r);
+    }
+    Ok(std::sync::Arc::new(all_replicas(app).await?))
+}
+
 /// (service id, replica) of matching containers on every reachable server, newest first.
 async fn list(app: &App, labels: &[(&str, &str)]) -> Result<Vec<(String, Replica)>> {
     let opts = ListContainersOptions { all: true, filters: Some(label_filter(labels)), ..Default::default() };

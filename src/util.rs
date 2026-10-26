@@ -123,6 +123,45 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 /// Lock a mutex, recovering the data if a panicking thread poisoned it.
+/// Slow values kept in memory by key, with when they were fetched.
+pub type Cache<V> = std::sync::Mutex<std::collections::BTreeMap<String, (std::time::Instant, V)>>;
+
+/// `fetch`'s value for `key`, from `cache` when there is one. Older than `max_age`, it is still
+/// served while one background fetch replaces it; only the very first fetch is waited for.
+pub async fn cached<V: Clone + Send + 'static>(
+    cache: &'static Cache<V>,
+    key: &str,
+    max_age: Duration,
+    fetch: impl Future<Output = Result<V>> + Send + 'static,
+) -> Result<V> {
+    let hit = lock(cache).get_mut(key).map(|(at, v)| {
+        let stale = at.elapsed() > max_age;
+        if stale {
+            // Marked fresh now so concurrent requests don't start more fetches.
+            *at = std::time::Instant::now();
+        }
+        (stale, v.clone())
+    });
+    let key = key.to_string();
+    match hit {
+        Some((stale, v)) => {
+            if stale {
+                tokio::spawn(async move {
+                    if let Ok(v) = fetch.await {
+                        lock(cache).insert(key, (std::time::Instant::now(), v));
+                    }
+                });
+            }
+            Ok(v)
+        }
+        None => {
+            let v = fetch.await?;
+            lock(cache).insert(key, (std::time::Instant::now(), v.clone()));
+            Ok(v)
+        }
+    }
+}
+
 pub fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -165,6 +204,18 @@ pub fn ct_eq(a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cached_serves_stale_while_refreshing() {
+        static C: Cache<u32> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        assert_eq!(cached(&C, "k", Duration::from_secs(60), async { Ok(1) }).await.unwrap(), 1);
+        // Fresh: the cached value, without fetching.
+        assert_eq!(cached(&C, "k", Duration::from_secs(60), async { Ok(2) }).await.unwrap(), 1);
+        // Stale: still the old value now, the new one once the background fetch lands.
+        assert_eq!(cached(&C, "k", Duration::ZERO, async { Ok(3) }).await.unwrap(), 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cached(&C, "k", Duration::from_secs(60), async { Ok(4) }).await.unwrap(), 3);
+    }
 
     #[test]
     fn names() {

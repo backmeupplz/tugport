@@ -164,7 +164,6 @@
   /* Sections */
   section { padding: 112px 0; border-top: 1px solid var(--line); }
   section.band { background: var(--band); }
-  .label { font: 500 13px/1 "JetBrains Mono", monospace; color: var(--accent-text); letter-spacing: 0.02em; margin-bottom: 16px; }
   h2 { font-size: clamp(30px, 3.6vw, 44px); line-height: 1.08; max-width: 18em; }
   .intro { margin-top: 18px; color: var(--dim); font-size: 18px; max-width: 40em; }
 
@@ -340,7 +339,6 @@
 
   <section id="film" class="band">
     <div class="wrap">
-      <p class="label">Launch film</p>
       <h2>See what Tugport does in four minutes.</h2>
       <div class="film">
         <video controls playsinline preload="none" poster="/shots/film-poster.webp" width="1920" height="1080" aria-label="Tugport launch film, 4 minutes 5 seconds, narrated, with a metal soundtrack">
@@ -353,7 +351,6 @@
 
   <section id="features">
     <div class="wrap">
-      <p class="label">What it does</p>
       <h2>Everything a deploy needs comes in the same binary.</h2>
       <p class="intro">Tugport replaces the panel, the reverse proxy, the metrics server and the log shipper you would otherwise run next to your apps, and it keeps working when a build fails or a server goes away.</p>
       <div class="grid">
@@ -442,7 +439,6 @@ Certificates: 1 imported, so nothing is re-issued</pre>
   <section id="agents" class="band">
     <div class="wrap agents">
       <div>
-        <p class="label">Agents</p>
         <h2>AI agents get their own users, keys and limits.</h2>
         <p class="intro">An agent is a user without a password. Give it a role on the projects it needs, and Tugport hands you its key along with setup lines for Claude Code, Codex, the CLI and curl. The MCP endpoint, the CLI and the API all check the same permissions.</p>
         <ul class="points">
@@ -468,7 +464,6 @@ Certificates: 1 imported, so nothing is re-issued</pre>
 
   <section id="security">
     <div class="wrap">
-      <p class="label">Security</p>
       <h2>Secrets only reach the containers that use them.</h2>
       <p class="intro">Every environment value is stored encrypted, and the key that opens them is sealed to the server's TPM when it has one. The rest of the design assumes that one of your services will be compromised someday, and keeps that from becoming a problem for the others.</p>
       <div class="facts">
@@ -484,7 +479,6 @@ Certificates: 1 imported, so nothing is re-issued</pre>
 
   <section id="install" class="band">
     <div class="wrap">
-      <p class="label">Install</p>
       <h2>You can try it on a fresh server in a few minutes.</h2>
       <p class="intro">Any Linux server with systemd works, from a small cloud machine to the box under your desk. Tugport needs ports 80 and 443 for your sites and 8484 for the panel until you give the panel a domain of its own.</p>
       <ol class="steps">

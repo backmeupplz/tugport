@@ -845,6 +845,8 @@ function useServices() {
 
 function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onClose: () => void; onSaved: () => void }) {
   const { f, set, bind } = useForm({ kind: "database", service: "", volume: "", target: props.targets[0]?.id ?? "", schedule: "0 3 * * *", keep: "7" });
+  const detail = useApi<{ service: { spec: { mounts?: { type: string; name?: string }[] } } }>(f.kind === "volume" && f.service ? `/services/${f.service}` : null);
+  const volumes = (detail.data?.service.spec.mounts ?? []).flatMap((m) => (m.type === "volume" && m.name ? [m.name] : []));
   const s = useSubmit(async () => {
     await post("/backups/jobs", {
       kind: f.kind,
@@ -875,7 +877,7 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
           <Field label="Service">
             <Select
               value={f.service}
-              onChange={(service) => set({ service })}
+              onChange={(service) => set({ service, volume: "" })}
               options={[
                 ["", props.services ? "Choose…" : "Loading…"],
                 ...(props.services ?? []).filter((x) => f.kind !== "database" || x.kind === "database").map((x): [string, string] => [x.id, `${x.project}.${x.name}`]),
@@ -883,7 +885,16 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
             />
           </Field>
         )}
-        {f.kind === "volume" && <Input label="Volume name" class="font-mono" required {...bind("volume")} />}
+        {f.kind === "volume" && f.service && (
+          <Field label="Volume" hint={detail.data && !volumes.length ? "This service has no named volumes to back up." : undefined}>
+            <Select
+              class="font-mono"
+              value={f.volume}
+              onChange={(volume) => set({ volume })}
+              options={[["", detail.data ? "Choose…" : "Loading…"], ...volumes.map((v): [string, string] => [v, v])]}
+            />
+          </Field>
+        )}
         <div class="grid gap-4 sm:grid-cols-3">
           <Field label="Target">
             <Select value={f.target} onChange={(target) => set({ target })} options={props.targets.map((t): [string, string] => [t.id, t.name])} />
@@ -891,7 +902,7 @@ function JobForm(props: { targets: Target[]; services: ServiceRef[] | null; onCl
           <Input label="Schedule" hint="Use cron format in the server's time zone." class="font-mono" required {...bind("schedule")} />
           <Input label="Keep the last" type="number" min={1} {...bind("keep")} />
         </div>
-        <FormButtons s={s} submit="Add job" onCancel={props.onClose} disabled={f.kind !== "state" && !f.service} />
+        <FormButtons s={s} submit="Add job" onCancel={props.onClose} disabled={(f.kind !== "state" && !f.service) || (f.kind === "volume" && !f.volume)} />
       </form>
     </Modal>
   );

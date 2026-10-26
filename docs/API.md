@@ -243,6 +243,8 @@ The settings fields are:
 | GET | `/api/services/{id}/logs/stream` | SSE `line` events with `{ts, replica, stream, line}` |
 | GET | `/api/logs/tugport?limit&level` | `{lines: [{ts, level, target, message}]}` (Tugport's own log) |
 | GET | `/api/logs/usage` | `{total_bytes, services: [{id, bytes}]}` |
+| GET | `/api/requests?route&method&who&status&min_ms&hours&slowest&before&limit` | Owner only. The API request log, kept for 7 days: `{entries: [{id, at, method, route, path, query, status, us, bytes, who, key_id, ip, agent}]}`, newest first (`slowest=true`: slowest first). `at` is epoch ms, `us` the time to the answer's headers in microseconds; `route` is the matched pattern (`/api/services/{id}`), `status` is `5xx`-style or exact, `before` an `id` for the next page. Secret query values are left out. |
+| GET | `/api/requests/summary?hours` | Owner only. Per route over the last `hours` (default 24, at most 168): `{hours, routes: [{method, route, count, errors, p50_ms, p95_ms, p99_ms, max_ms, total_ms}]}`, slowest p95 first; `errors` counts 5xx answers. |
 
 ## Metrics
 

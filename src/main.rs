@@ -32,6 +32,7 @@ mod proc;
 mod proxy;
 mod registry;
 mod replicas;
+mod requests;
 mod runtime;
 mod secrets;
 mod shim;
@@ -266,6 +267,7 @@ async fn serve() -> Result<()> {
     tokio::spawn(alerts::watch_events(app.clone()));
     tokio::spawn(cleanup::run(app.clone()));
     tokio::spawn(api::warm_docker_usage(app.clone()));
+    tokio::spawn(requests::run(app.clone()));
     tokio::spawn(autoupdate::run(app.clone()));
     tokio::spawn(backup::scheduler(app.clone()));
     tokio::spawn(tunnel::run(app.clone()));

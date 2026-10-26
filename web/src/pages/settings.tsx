@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
-import { useState } from "preact/hooks";
-import { del, patch, post, put, useApi, useMe, useNodes } from "../api";
+import { useEffect, useState } from "preact/hooks";
+import { del, get, patch, post, put, useApi, useMe, useNodes } from "../api";
 import { Icon } from "../icons";
 import {
   Action,
@@ -13,6 +13,7 @@ import {
   FormButtons,
   IconButton,
   Input,
+  ListSkeleton,
   Loaded,
   Modal,
   Note,
@@ -28,7 +29,7 @@ import {
   useForm,
   useSubmit,
 } from "../ui";
-import { ago, bytes, cidr, mergePatch, num, sentence, str, when, words } from "../util";
+import { ago, bytes, cidr, mergePatch, num, qs, sentence, str, when, words } from "../util";
 import { Progress, RunLog, type RunProgress } from "./actions";
 import { PROVIDER_KINDS } from "./new-service";
 
@@ -39,6 +40,7 @@ const TABS: [string, string][] = [
   ["registries", "Registries"],
   ["backups", "Backups"],
   ["tunnel", "Cloudflare Tunnel"],
+  ["requests", "Requests"],
   ["about", "About"],
 ];
 
@@ -60,6 +62,7 @@ export function Settings(props: { tab?: string }) {
             {tab === "registries" && <Registries />}
             {tab === "backups" && <Backups />}
             {tab === "tunnel" && <Tunnel />}
+            {tab === "requests" && <Requests />}
             {tab === "about" && <About />}
           </>
         )}
@@ -1127,6 +1130,180 @@ function Row(props: { label: string; children: ComponentChildren }) {
     <>
       <dt class="text-dim">{props.label}</dt>
       <dd class="min-w-0">{props.children}</dd>
+    </>
+  );
+}
+
+// ---- Requests ----
+
+type RouteStats = { method: string; route: string; count: number; errors: number; p50_ms: number; p95_ms: number; p99_ms: number; max_ms: number };
+type LoggedRequest = {
+  id: number;
+  at: number;
+  method: string;
+  path: string;
+  query: string | null;
+  status: number;
+  us: number;
+  bytes: number | null;
+  who: string | null;
+  key_id: string | null;
+  ip: string | null;
+  agent: string | null;
+};
+
+const PAGE = 100;
+const ms = (v: number) => `${v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString()} ms`;
+const speed = (v: number) => (v >= 200 ? "text-bad" : v >= 50 ? "text-warn" : "");
+
+function Requests() {
+  const [hours, setHours] = useState("24");
+  const [route, setRoute] = useState("");
+  const [minMs, setMinMs] = useState("");
+  const [status, setStatus] = useState("");
+  const [slowest, setSlowest] = useState(false);
+  const summary = useApi<{ routes: RouteStats[] }>(`/requests/summary${qs({ hours })}`);
+  const [entries, setEntries] = useState<LoggedRequest[] | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [more, setMore] = useState(false);
+  const [method, path] = route ? route.split(" ") : [];
+
+  const load = async (before?: number) => {
+    try {
+      const filter = { method, route: path, min_ms: minMs, status, hours: slowest ? hours : null, slowest: slowest ? "true" : null };
+      const r = await get<{ entries: LoggedRequest[] }>(`/requests${qs({ ...filter, before, limit: PAGE })}`);
+      setEntries((cur) => (before ? [...(cur ?? []), ...r.entries] : r.entries));
+      setMore(!slowest && r.entries.length === PAGE);
+      setError(null);
+    } catch (e) {
+      setError(e);
+    }
+  };
+  useEffect(() => {
+    setEntries(null);
+    load();
+  }, [route, minMs, status, slowest, hours]);
+
+  return (
+    <>
+      <p class="text-dim">
+        Every API request is kept here for a week: its route, status, how long Tugport took to answer and who asked. Times over 50 ms are yellow, over 200 ms red.
+      </p>
+      <Card
+        title="Routes"
+        pad={false}
+        actions={
+          <>
+            <Select
+              class="w-auto"
+              aria-label="Period"
+              value={hours}
+              onChange={setHours}
+              options={[
+                ["1", "Last hour"],
+                ["24", "Last 24 hours"],
+                ["168", "Last 7 days"],
+              ]}
+            />
+            <Action run={summary.reload}>Refresh</Action>
+          </>
+        }
+      >
+        <Loaded r={summary} skeleton={<RowsSkeleton n={5} />}>
+          {(d) => (
+            <Rows items={d.routes} empty="No API requests were recorded in this period.">
+              {(r) => (
+                <li key={`${r.method} ${r.route}`}>
+                  <button
+                    class="w-full px-4 py-2.5 text-left hover:bg-raised md:px-5"
+                    title="Show these requests below"
+                    onClick={() => setRoute(`${r.method} ${r.route}`)}
+                  >
+                    <code class="text-[13px] [overflow-wrap:anywhere]">
+                      {r.method} {r.route}
+                    </code>
+                    <p class="mt-0.5 text-xs tabular-nums text-muted">
+                      {r.count.toLocaleString()} {r.count === 1 ? "request" : "requests"} · median {ms(r.p50_ms)} · p95 <span class={speed(r.p95_ms)}>{ms(r.p95_ms)}</span> · p99{" "}
+                      <span class={speed(r.p99_ms)}>{ms(r.p99_ms)}</span> · max {ms(r.max_ms)}
+                      {r.errors > 0 && <span class="text-bad"> · {r.errors} failed</span>}
+                    </p>
+                  </button>
+                </li>
+              )}
+            </Rows>
+          )}
+        </Loaded>
+      </Card>
+      <Card title="Requests" pad={false}>
+        <div class="flex flex-wrap gap-3 border-b border-line px-4 py-3 md:px-5">
+          <Field label="Route" class="min-w-0 flex-1 basis-56">
+            <Select
+              value={route}
+              onChange={setRoute}
+              options={[["", "All routes"], ...(summary.data?.routes ?? []).map((r): [string, string] => [`${r.method} ${r.route}`, `${r.method} ${r.route}`]), ...(route && !summary.data?.routes.some((r) => `${r.method} ${r.route}` === route) ? [route] : [])]}
+            />
+          </Field>
+          <Field label="Took" class="min-w-36">
+            <Select
+              value={minMs}
+              onChange={setMinMs}
+              options={[
+                ["", "Any time"],
+                ["50", "Over 50 ms"],
+                ["200", "Over 200 ms"],
+                ["1000", "Over 1 s"],
+              ]}
+            />
+          </Field>
+          <Field label="Status" class="min-w-32">
+            <Select value={status} onChange={setStatus} options={[["", "Any"], ["2xx", "2xx"], ["3xx", "3xx"], ["4xx", "4xx"], ["5xx", "5xx"]]} />
+          </Field>
+          <Field label="Order" class="min-w-36">
+            <Select
+              value={slowest ? "slowest" : "newest"}
+              onChange={(v) => setSlowest(v === "slowest")}
+              options={[
+                ["newest", "Newest first"],
+                ["slowest", "Slowest first"],
+              ]}
+            />
+          </Field>
+        </div>
+        {error ? (
+          <div class="p-4 md:p-5">
+            <ErrorBox error={error} />
+          </div>
+        ) : !entries ? (
+          <ListSkeleton n={6} />
+        ) : (
+          <>
+            <Rows items={entries} empty="No request matches these filters.">
+              {(e) => (
+                <li key={e.id} class="px-4 py-2.5 md:px-5">
+                  <div class="flex items-baseline gap-2">
+                    <code class="min-w-0 flex-1 text-[13px] [overflow-wrap:anywhere]">
+                      {e.method} {e.path}
+                      {e.query && <span class="text-muted">?{e.query}</span>}
+                    </code>
+                    <span class={`tabular-nums ${e.status >= 500 ? "text-bad" : e.status >= 400 ? "text-warn" : "text-dim"}`}>{e.status}</span>
+                    <span class={`w-20 shrink-0 text-right tabular-nums ${speed(e.us / 1000)}`}>{ms(e.us / 1000)}</span>
+                  </div>
+                  <p class="mt-0.5 text-xs text-muted [overflow-wrap:anywhere]" title={e.agent ?? undefined}>
+                    {[when(Math.floor(e.at / 1000)), e.who ?? "not signed in", e.key_id ? `key ${e.key_id}` : "", e.ip ?? "", e.bytes != null ? bytes(e.bytes) : ""].filter(Boolean).join(" · ")}
+                  </p>
+                </li>
+              )}
+            </Rows>
+            {more && (
+              <div class="border-t border-line p-3 text-center">
+                <button class="btn" onClick={() => load(entries[entries.length - 1]?.id)}>
+                  Load older requests
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </Card>
     </>
   );
 }

@@ -149,6 +149,66 @@ pub async fn warm_docker_usage(app: AppState) {
     let _ = util::cached(&DOCKER_USAGE, "local", Duration::ZERO, docker_df(app.docker.clone())).await;
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct RequestQuery {
+    route: Option<String>,
+    method: Option<String>,
+    who: Option<String>,
+    /// `5xx`, `4xx`, ... or an exact status.
+    status: Option<String>,
+    min_ms: Option<f64>,
+    /// Only the last this many hours.
+    hours: Option<i64>,
+    /// Slowest first instead of newest first.
+    slowest: bool,
+    before: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// Logged API requests, newest (or slowest) first.
+pub async fn requests(State(app): State<AppState>, _: Owner, Query(q): Query<RequestQuery>) -> ApiResult<Json<Value>> {
+    let (lo, hi) = match q.status.as_deref() {
+        None | Some("") => (0, 999),
+        Some(s) => match (s.strip_suffix("xx").and_then(|d| d.parse::<u16>().ok()), s.parse::<u16>().ok()) {
+            (Some(d), _) => (d * 100, d * 100 + 99),
+            (None, Some(n)) => (n, n),
+            _ => return Err(ApiError::bad_request("status is like 5xx or 404")),
+        },
+    };
+    let since = q.hours.map_or(0, |h| util::now_ms() - h.clamp(1, 24 * 7) * 3_600_000);
+    let order = if q.slowest { "us DESC" } else { "id DESC" };
+    let sql = format!(
+        "SELECT id, at, method, route, path, query, status, us, bytes, who, key_id, ip, agent FROM requests
+         WHERE (?1 IS NULL OR route = ?1) AND (?2 IS NULL OR method = ?2) AND (?3 IS NULL OR who = ?3) AND status BETWEEN ?4 AND ?5
+           AND us >= ?6 AND at >= ?7 AND (?8 IS NULL OR id < ?8)
+         ORDER BY {order} LIMIT ?9"
+    );
+    let min_us = (q.min_ms.unwrap_or(0.0) * 1000.0) as i64;
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let rows = crate::requests::read(&app, move |c| {
+        let mut stmt = c.prepare(&sql)?;
+        let rows = stmt.query_map(params![q.route, q.method, q.who, lo, hi, min_us, since, q.before, limit], row_json)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .await?;
+    Ok(Json(json!({ "entries": rows })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct SummaryQuery {
+    hours: Option<i64>,
+}
+
+/// Per route over the last hours (24 by default): calls, server errors and time percentiles.
+pub async fn request_summary(State(app): State<AppState>, _: Owner, Query(q): Query<SummaryQuery>) -> ApiResult<Json<Value>> {
+    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 7);
+    let since = util::now_ms() - hours * 3_600_000;
+    let routes = crate::requests::read(&app, move |c| crate::requests::summary(c, since)).await?;
+    Ok(Json(json!({ "hours": hours, "routes": routes })))
+}
+
 pub async fn list_channels(State(app): State<AppState>, _: Owner) -> ApiResult<Json<Value>> {
     let rows = app.db.rows("SELECT id, kind, name, events, enabled, created_at FROM notification_channels ORDER BY created_at", [], |r| {
         Ok(json!({ "id": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "name": r.get::<_, String>(2)?,

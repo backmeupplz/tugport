@@ -21,6 +21,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
+use crate::requests;
 use crate::store::Service;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
@@ -45,6 +46,8 @@ pub fn router(app: AppState) -> Router {
         .route("/api/keys/{id}/rotate", post(access::rotate_key))
         .route("/api/settings", get(access::get_settings).patch(access::update_settings))
         .route("/api/audit", get(access::audit))
+        .route("/api/requests", get(observe::requests))
+        .route("/api/requests/summary", get(observe::request_summary))
         .route("/api/projects", get(projects::list_projects).post(projects::create_project))
         .route("/api/projects/{id}", get(projects::get_project).patch(projects::update_project).delete(projects::delete_project))
         .route("/api/projects/{id}/vars", get(projects::get_vars).put(projects::put_vars))
@@ -119,7 +122,43 @@ pub fn router(app: AppState) -> Router {
         .fallback(crate::web::static_handler)
         .layer(axum::middleware::from_fn(json_errors))
         .layer(axum::middleware::from_fn(same_origin))
+        .layer(axum::middleware::from_fn(log_request))
         .with_state(app)
+}
+
+/// Time every `/api` request for the request log (`requests.rs`): from arrival until the
+/// answer's headers are ready (for streams, until they start).
+async fn log_request(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::body::HttpBody;
+    if !req.uri().path().starts_with("/api/") || !requests::enabled() {
+        return next.run(req).await;
+    }
+    let start = std::time::Instant::now();
+    let (mut parts, body) = req.into_parts();
+    let who = requests::Who::default();
+    parts.extensions.insert(who.clone());
+    let route = parts.extensions.get::<axum::extract::MatchedPath>().map_or("(no route)", |m| m.as_str()).to_string();
+    // Deploy hook tokens are secrets: those paths are logged as their route.
+    let path = if route.contains("{token}") { route.clone() } else { parts.uri.path().to_string() };
+    let header = |h: &HeaderMap, n: header::HeaderName| h.get(n).and_then(|v| v.to_str().ok()).map(String::from);
+    let (method, query, ip) = (parts.method.to_string(), parts.uri.query().map(requests::redact_query), client_ip(&parts).map(|i| i.to_string()));
+    let agent = header(&parts.headers, header::USER_AGENT).map(|a| a.chars().take(200).collect());
+    let resp = next.run(axum::extract::Request::from_parts(parts, body)).await;
+    let bytes = header(resp.headers(), header::CONTENT_LENGTH).and_then(|l| l.parse().ok()).or_else(|| resp.body().size_hint().exact());
+    requests::record(requests::Entry {
+        at: crate::util::now_ms(),
+        method,
+        route,
+        path,
+        query,
+        status: resp.status().as_u16(),
+        us: start.elapsed().as_micros() as u64,
+        bytes,
+        who: crate::util::lock(&who.0).take(),
+        ip,
+        agent,
+    });
+    resp
 }
 
 /// Browsers attach the session cookie to requests other pages start, and a page on another
@@ -177,7 +216,7 @@ async fn json_errors(req: axum::extract::Request, next: axum::middleware::Next) 
 
 /// Only the deploy webhooks, for listeners exposed to the internet.
 pub fn hooks_router(app: AppState) -> Router {
-    hook_routes().with_state(app)
+    hook_routes().layer(axum::middleware::from_fn(log_request)).with_state(app)
 }
 
 fn hook_routes() -> Router<AppState> {
@@ -435,6 +474,9 @@ impl FromRequestParts<AppState> for Auth {
         let mut p = auth::load_principal(&app.db, &user_id)?.ok_or_else(|| ApiError::unauthorized("user is disabled"))?;
         p.key_id = key_id;
         p.ip = ip.map(|i| i.to_string());
+        if let Some(who) = parts.extensions.get::<requests::Who>() {
+            *crate::util::lock(&who.0) = Some((p.name.clone(), p.key_id.clone()));
+        }
         Ok(Auth(p))
     }
 }

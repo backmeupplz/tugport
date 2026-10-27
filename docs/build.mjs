@@ -61,7 +61,7 @@ function render(markdown) {
         }
         const ours = names.indexOf("Tugport");
         return `<div class="table"><table class="grid">\n<thead><tr>${header.map((h, i) => `<th scope="col"${i === ours ? ' class="ours"' : ""}>${cell(h)}</th>`).join("")}</tr></thead>\n<tbody>\n${
-          rows.map((r) => `<tr>${r.map((c, i) => i === 0 ? `<th scope="row">${cell(c)}</th>` : `<td data-label="${esc(names[i])}"${i === ours ? ' class="ours"' : ""}>${cell(c)}</td>`).join("")}</tr>`).join("\n")}\n</tbody></table></div>\n`;
+          rows.map((r) => `<tr>${r.map((c, i) => i === 0 ? `<th scope="row">${cell(c)}</th>` : `<td data-label="${esc(names[i])}"${i === ours ? ' class="ours"' : ""}><span>${cell(c)}</span></td>`).join("")}</tr>`).join("\n")}\n</tbody></table></div>\n`;
       },
     },
   });

@@ -3,13 +3,9 @@
 // agents. The Pages workflow runs it on every push that touches docs/ or website/.
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { Marked } from "marked";
+import { GUIDES } from "./guides.mjs";
 
 const REPO = "https://github.com/backmeupplz/tugport/blob/main";
-const GUIDES = [
-  { file: "API.md", slug: "api", title: "API reference", blurb: "Every endpoint of the panel, its roles and grants, the service spec, the CLI and the MCP endpoint for agents." },
-  { file: "MIGRATION.md", slug: "migration", title: "Moving from Easypanel or Coolify", blurb: "How tugport migrate reads the old panel, what maps to what, and how the cutover and the rollback work." },
-  { file: "COMPARE.md", slug: "compare", title: "Tugport compared with Coolify, Dokploy, Easypanel and CapRover", blurb: "License, price, servers, deploys, backups, AI agents and moving over, side by side, with sources, checked on October 27, 2026." },
-];
 const out = new URL("../website/docs/", import.meta.url);
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -44,19 +40,36 @@ function render(markdown) {
         const id = slug(html);
         if (depth === 2 || depth === 3) toc.push({ depth, id, html });
         if (depth === 1) return "";
-        return `<h${depth} id="${id}"><a class="anchor" href="#${id}" aria-hidden="true">#</a>${html}</h${depth}>\n`;
+        // tabindex -1: a mouse shortcut, kept out of the tab order and the accessibility tree
+        return `<h${depth} id="${id}"><a class="anchor" href="#${id}" aria-hidden="true" tabindex="-1">#</a>${html}</h${depth}>\n`;
       },
       link({ href: link, title, tokens }) {
         return `<a href="${esc(href(link))}"${title ? ` title="${esc(title)}"` : ""}>${this.parser.parseInline(tokens)}</a>`;
       },
+      // Tables in the Markdown read well on GitHub; on the site they become what reads well on a phone too:
+      // Method/Path/Notes tables a list of endpoints, two-column tables a definition list, and anything wider a
+      // table whose rows turn into labelled cards on narrow screens (docs.css), with Tugport's column tinted.
+      table({ header, rows }) {
+        const cell = (c) => this.parser.parseInline(c.tokens);
+        const names = header.map((h) => h.text.trim());
+        if (names[0] === "Method" && names[1] === "Path") {
+          return `<dl class="endpoints">\n${rows.map((r) => `<div><dt><span class="method">${cell(r[0])}</span> ${cell(r[1])}</dt>` +
+            `<dd>${r.slice(2).map(cell).join(" ")}</dd></div>`).join("\n")}\n</dl>\n`;
+        }
+        if (names.length === 2) {
+          return `<dl class="defs">\n${rows.map((r) => `<div><dt>${cell(r[0])}</dt><dd>${cell(r[1])}</dd></div>`).join("\n")}\n</dl>\n`;
+        }
+        const ours = names.indexOf("Tugport");
+        return `<div class="table"><table class="grid">\n<thead><tr>${header.map((h, i) => `<th scope="col"${i === ours ? ' class="ours"' : ""}>${cell(h)}</th>`).join("")}</tr></thead>\n<tbody>\n${
+          rows.map((r) => `<tr>${r.map((c, i) => i === 0 ? `<th scope="row">${cell(c)}</th>` : `<td data-label="${esc(names[i])}"${i === ours ? ' class="ours"' : ""}>${cell(c)}</td>`).join("")}</tr>`).join("\n")}\n</tbody></table></div>\n`;
+      },
     },
   });
-  // Wide tables scroll inside their box instead of widening the page.
-  const html = marked.parse(markdown).replace(/<table>/g, '<div class="table"><table>').replace(/<\/table>/g, "</table></div>");
-  return { html, toc };
+  return { html: marked.parse(markdown), toc };
 }
 
-const page = ({ title, description, path, body }) => `<!doctype html>
+const CSS = readFileSync(new URL("docs.css", import.meta.url), "utf8");
+const page = ({ title, description, path, body, image, alt }) => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -69,14 +82,15 @@ const page = ({ title, description, path, body }) => `<!doctype html>
 <meta property="og:url" content="https://tugport.com${path}">
 <meta property="og:title" content="${esc(title)}">
 <meta property="og:description" content="${esc(description)}">
-<meta property="og:image" content="https://tugport.com/og.png">
+<meta property="og:image" content="https://tugport.com/og/${image}.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Tugport: deploy your apps to servers you own, from one Rust binary.">
+<meta property="og:image:alt" content="${esc(alt)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${esc(title)}">
 <meta name="twitter:description" content="${esc(description)}">
-<meta name="twitter:image" content="https://tugport.com/og.png">
+<meta name="twitter:image" content="https://tugport.com/og/${image}.png">
+<meta name="twitter:image:alt" content="${esc(alt)}">
 <link rel="icon" href="/logo.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -84,9 +98,9 @@ const page = ({ title, description, path, body }) => `<!doctype html>
 <meta name="theme-color" content="#F7F6F2" media="(prefers-color-scheme: light)">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
-<noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet"></noscript>
-<link rel="stylesheet" href="/docs/docs.css">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=optional" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=optional" rel="stylesheet"></noscript>
+<style>${CSS}</style>
 <script defer src="https://lumen.borodutch.com/l.js"></script>
 </head>
 <body>
@@ -118,29 +132,31 @@ ${body}
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
-writeFileSync(new URL("docs.css", out), readFileSync(new URL("docs.css", import.meta.url)));
 
 for (const g of GUIDES) {
   const markdown = readFileSync(new URL(g.file, import.meta.url), "utf8");
   const { html, toc } = render(markdown);
   const source = `${REPO}/docs/${g.file}`;
   const nav = toc.map((t) => `<li class="d${t.depth}"><a href="#${t.id}">${t.html.replace(/<\/?a[^>]*>/g, "")}</a></li>`).join("\n");
+  // The contents: a list beside the text on wide screens, a folded block above it on phones (no script, no shift).
   const body = `<div class="wrap doc">
-  <aside aria-label="On this page"><details open><summary>On this page</summary><ul>
+  <aside>
+    <nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul>
 ${nav}
-  </ul></details></aside>
+    </ul></nav>
+    <details class="toc-fold"><summary>On this page</summary><ul>
+${nav}
+    </ul></details>
+  </aside>
   <main>
     <h1>${esc(g.title)}</h1>
     <p class="meta">Also as <a href="/docs/${g.slug}.md">Markdown</a> for agents, and on <a href="${source}">GitHub</a>.</p>
 ${html}
   </main>
-</div>
-<script>
-  // On phones the contents start folded, above the text.
-  if (matchMedia("(max-width: 860px)").matches) document.querySelector(".doc details").open = false;
-</script>`;
+</div>`;
   mkdirSync(new URL(`${g.slug}/`, out), { recursive: true });
-  writeFileSync(new URL(`${g.slug}/index.html`, out), page({ title: g.title, description: g.blurb, path: `/docs/${g.slug}/`, body }));
+  writeFileSync(new URL(`${g.slug}/index.html`, out), page({ title: g.title, description: g.blurb, path: `/docs/${g.slug}/`, body,
+    image: g.slug, alt: `${g.title}. Tugport docs.` }));
   writeFileSync(new URL(`${g.slug}.md`, out), markdown);
 }
 
@@ -155,7 +171,8 @@ const index = `<main class="wrap index">
 ${cards.map((c) => `    <li><a href="${c.href}"><h2>${esc(c.title)}</h2><p>${esc(c.blurb)}</p></a></li>`).join("\n")}
   </ul>
 </main>`;
-writeFileSync(new URL("index.html", out), page({ title: "Documentation", description: "Guides for Tugport: the API reference and moving from Easypanel or Coolify.", path: "/docs/", body: index }));
+writeFileSync(new URL("index.html", out), page({ title: "Documentation", description: "Guides for Tugport: the API reference and moving from Easypanel or Coolify.", path: "/docs/", body: index,
+  image: "docs", alt: "Tugport documentation: the API reference, moving from Easypanel or Coolify, and how Tugport compares." }));
 console.log(`wrote ${GUIDES.length} guides and the index to website/docs/`);
 
 // The sitemap and llms.txt follow the guide list, so a new guide shows up in both on the next deploy.

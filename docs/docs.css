@@ -1,5 +1,7 @@
-/* tugport.com/docs: the landing page's tokens, navigation and footer, plus styles for the guides. */
+/* tugport.com/docs: the landing page's tokens, navigation and footer, plus styles for the guides. Inlined into
+   every page by build.mjs, so nothing blocks the first paint. */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
 
 :root {
   --bg: #0A0E14;
@@ -72,8 +74,12 @@ footer a:hover { color: var(--text); }
 /* A guide: contents on the left, the text on the right */
 .doc { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 48px; padding-top: 40px; }
 .doc aside { position: sticky; top: 88px; align-self: start; max-height: calc(100vh - 110px); overflow-y: auto; font-size: 14px; }
-.doc aside summary { list-style: none; font-weight: 600; color: var(--text); margin-bottom: 10px; cursor: default; }
+.doc .toc-title, .doc aside summary { font-weight: 600; color: var(--text); margin-bottom: 10px; }
+.doc .toc-fold { display: none; }
+.doc aside summary { list-style: none; cursor: pointer; }
 .doc aside summary::-webkit-details-marker { display: none; }
+.doc aside summary::after { content: " +"; color: var(--muted); }
+.doc aside details[open] summary::after { content: " −"; }
 .doc aside ul { list-style: none; }
 .doc aside li a { display: block; padding: 4px 0; color: var(--dim); text-decoration: none; line-height: 1.4; }
 .doc aside li a:hover { color: var(--text); }
@@ -92,24 +98,51 @@ footer a:hover { color: var(--text); }
 .doc main strong { color: var(--text); font-weight: 600; }
 .doc main a { color: var(--accent-text); text-decoration: none; }
 /* Links inside running text need more than color to stand out (WCAG 1.4.1) */
-.doc main :is(p, li, td) a { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.doc main :is(p, li, td, dd) a { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
 .doc main a:hover { text-decoration: underline; }
 .doc main :not(pre) > code { -webkit-box-decoration-break: clone; box-decoration-break: clone; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; overflow-wrap: anywhere; color: var(--text); }
 .doc main pre { margin: 16px 0; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; }
-.doc .table { margin: 16px 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
-.doc table { border-collapse: collapse; width: 100%; font-size: 14px; }
-.doc th, .doc td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--line); color: var(--dim); }
-.doc th { color: var(--text); font-weight: 600; background: var(--surface); white-space: nowrap; }
-.doc tr:last-child td { border-bottom: 0; }
-/* Methods and paths stay on one line; longer shapes (the spec table) wrap. */
-.doc td:first-child code, .doc tr:has(td:nth-child(3)) td:nth-child(2) code { white-space: nowrap; overflow-wrap: normal; }
+
+/* Comparison tables: short values in a grid, Tugport's column tinted; on phones each row becomes a card. */
+.doc .table { margin: 18px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.doc table { border-collapse: collapse; width: 100%; font-size: 15px; }
+.doc th, .doc td { text-align: left; vertical-align: top; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--dim); }
+.doc thead th { color: var(--text); font-weight: 600; background: var(--surface); }
+.doc tbody th { color: var(--text); font-weight: 600; }
+.doc tbody tr:last-child > * { border-bottom: 0; }
+.doc .ours { background: color-mix(in srgb, var(--accent) 9%, transparent); color: var(--text); }
+.doc thead .ours { background: color-mix(in srgb, var(--accent) 16%, var(--surface)); }
+
+/* Two-column tables read as terms and their explanations; Method/Path tables as a list of endpoints. */
+.doc dl { margin: 18px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.doc dl > div { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.doc dl > div:last-child { border-bottom: 0; }
+.doc dt { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.doc dd { margin-top: 4px; color: var(--dim); }
+.doc dl.defs > div { display: grid; grid-template-columns: minmax(150px, 32%) minmax(0, 1fr); gap: 6px 18px; }
+.doc dl.defs dd { margin-top: 0; }
+.doc .method { display: inline-block; min-width: 3.4em; margin-right: 6px; font: 500 12.5px/1.9 "JetBrains Mono", ui-monospace, monospace; color: var(--accent-text); }
 
 @media (max-width: 860px) {
   .doc { grid-template-columns: 1fr; gap: 0; padding-top: 24px; }
-  .doc aside { position: static; max-height: none; margin-bottom: 24px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; background: var(--surface); }
-  .doc aside summary { cursor: pointer; margin: 0; }
-  .doc aside details[open] summary { margin-bottom: 8px; }
+  .doc aside { position: static; max-height: none; margin-bottom: 24px; border: 1px solid var(--line); border-radius: 12px; padding: 4px 16px; background: var(--surface); }
+  .doc .toc { display: none; }
+  .doc .toc-fold { display: block; }
+  .doc aside summary { margin: 0; padding: 10px 0; }
+  .doc aside li a { padding: 7px 0; }
   .doc .anchor { display: none; }
+}
+@media (max-width: 720px) {
+  .doc dl.defs > div { display: block; }
+  .doc dl.defs dd { margin-top: 4px; }
+  .doc .table { border: 0; border-radius: 0; overflow: visible; }
+  .doc table, .doc tbody, .doc tr, .doc th, .doc td { display: block; }
+  .doc thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .doc tbody tr { margin: 0 0 12px; padding: 4px 0 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+  .doc tbody th { padding: 10px 14px 6px; border: 0; font-size: 16px; }
+  .doc tbody td { display: grid; grid-template-columns: 6.8em minmax(0, 1fr); gap: 12px; padding: 6px 14px; border: 0; }
+  .doc tbody td::before { content: attr(data-label); color: var(--muted); font-size: 14px; }
+  .doc tbody td.ours { margin: 2px 8px; padding: 6px; border-radius: 8px; }
 }
 @media (max-width: 640px) {
   .wrap { padding: 0 16px; }

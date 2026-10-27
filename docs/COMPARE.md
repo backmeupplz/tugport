@@ -8,21 +8,33 @@ Tugport is by far the youngest and smallest of the five, and the table says plai
 
 | Feature | Tugport | Coolify | Dokploy | Easypanel | CapRover |
 |---|---|---|---|---|---|
-| License | MIT | Apache-2.0 | Apache-2.0, except a source-available folder of enterprise features | Proprietary | Apache-2.0, with an appendix about its paid features |
+| License | MIT | Apache-2.0 | Apache-2.0, enterprise folder excepted | Proprietary | Apache-2.0, with an appendix |
 | Written in | Rust, one binary | PHP (Laravel) | TypeScript | Not published | TypeScript |
-| GitHub stars | 4 | 64,982 | 38,063 | The panel's source isn't public | 15,193 |
-| Public since | October 2026 | 2021 | 2024 | – | 2017 |
-| Self-hosted price | Free | Free, every feature | Free; enterprise features are paid | Free for 3 projects, then $14.90 to $37.90 per server a month ($10.90 to $29.90 billed yearly) | Free; a paid Pro plan adds 2FA, build notifications and login alerts |
-| Hosted panel | No | Coolify Cloud: $5 a month for 2 servers, $3 per extra server | Dokploy Cloud: from $4.50 per server a month | No | No |
-| More than one server | Servers join an encrypted WireGuard network with one command, or Tugport creates them at Hetzner or AWS; replicas spread across servers and move when one goes away | Standalone servers over SSH, behind a load balancer you provide; Swarm support is experimental | Remote servers, or Docker Swarm nodes | Docker Swarm worker nodes | Docker Swarm nodes |
-| Zero-downtime deploys | Yes: traffic moves after the new version passes its health check | Rolling updates, unless a container has a fixed name | Yes, with a health check route | Yes, a per-service option | Not stated in its docs |
-| Scale to zero and autoscaling | Yes: idle sites sleep until a request wakes them, and replicas follow CPU or request rate | Not documented | Not documented | Not documented | Not documented |
-| Docker Compose | Yes | Yes | Yes | Yes | Partly: an experimental subset |
-| One-click app templates | None | 360+ | Yes | Yes | Yes, dozens |
-| Database backups | Scheduled, to S3-compatible storage or a disk, with test restores; volumes too | Scheduled, to S3 | Scheduled, to S3 | Scheduled, to several destinations | No built-in database backups |
+| GitHub stars | 4 | 64,982 | 38,063 | Closed source | 15,193 |
+| Public since | 2026 | 2021 | 2024 | – | 2017 |
+| Self-hosted | Free | Free | Free; enterprise paid | 3 projects free, then from $14.90/server | Free; Pro paid |
+| Hosted panel | No | From $5 a month | From $4.50/server | No | No |
+| Many servers | Built-in network | SSH servers | Remote servers, Swarm | Swarm | Swarm |
+| Zero-downtime deploys | Yes | Rolling updates | Yes | Optional | Not documented |
+| Autoscaling, scale to zero | Yes | Not documented | Not documented | Not documented | Not documented |
+| Docker Compose | Yes | Yes | Yes | Yes | Partly |
+| One-click templates | None | 360+ | Yes | Yes | Dozens |
+| Database backups | S3 or disk, tested | To S3 | To S3 | Several targets | None built in |
 | Preview deployments | No | Yes | Yes, on GitHub | Not documented | Not documented |
-| AI agents | Agents are users with roles and keys; deleting and reading secrets need separate grants; MCP endpoint; audit log | Built-in MCP server, used with team API tokens | Built-in AI assistant that uses your own model's API key | Remote MCP server that acts with a chosen user's permissions | API and CLI |
-| Moving from another panel | `tugport migrate easypanel` and `tugport migrate coolify`, with `rollback` | No importer documented | No importer documented | No importer documented | No importer documented |
+| AI agents | Agent users, MCP | MCP server | AI assistant | Remote MCP | API and CLI |
+| Moving from another panel | One command, with rollback | No importer | No importer | No importer | No importer |
+
+### Behind the table
+
+- **Licenses.** Dokploy is Apache-2.0 except a source-available folder of enterprise features, and CapRover's Apache-2.0 license has an appendix about its paid features.
+- **Prices.** Easypanel is free for 3 projects, then $14.90 to $37.90 per server a month ($10.90 to $29.90 billed yearly). CapRover's paid Pro plan adds 2FA, build notifications and login alerts. Coolify Cloud costs $5 a month for 2 servers and $3 per extra server; Dokploy Cloud starts at $4.50 per server a month. Coolify's self-hosted version is free with every feature.
+- **More than one server.** Tugport servers join an encrypted WireGuard network with one command, or Tugport creates them at Hetzner or AWS; replicas spread across servers and move when one goes away. Coolify runs standalone servers over SSH, behind a load balancer you provide, and its Swarm support is experimental. Dokploy uses remote servers or Docker Swarm nodes, Easypanel Docker Swarm worker nodes, and CapRover Docker Swarm nodes.
+- **Zero-downtime deploys.** Tugport moves traffic once the new version passes its health check. Coolify rolls updates unless a container has a fixed name, Dokploy needs a health check route, and in Easypanel it's a per-service option.
+- **Scale to zero and autoscaling.** In Tugport, idle sites sleep until a request wakes them, and replicas follow CPU or request rate. The other four don't document either.
+- **Docker Compose.** CapRover supports an experimental subset.
+- **Backups.** Tugport schedules them to S3-compatible storage or a disk, with test restores, and backs up volumes too. Coolify and Dokploy back up to S3, and Easypanel to several kinds of destinations.
+- **AI agents.** In Tugport, agents are users with roles and keys: deleting and reading secrets need separate grants, there's an MCP endpoint, and every action lands in an audit log. Coolify has a built-in MCP server used with team API tokens. Dokploy has a built-in AI assistant that uses your own model's API key. Easypanel has a remote MCP server that acts with a chosen user's permissions, and CapRover has an API and a CLI.
+- **Moving over.** `tugport migrate easypanel` and `tugport migrate coolify` move a running server, and `tugport migrate rollback` undoes it.
 
 Dokku and Kamal come up in the same searches. Both are command-line tools: Dokku's web panel is part of the paid Dokku Pro, and Kamal deploys from your own machine or CI over SSH, with no panel.
 

@@ -59,6 +59,8 @@ cd website && "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --h
   --window-size=1200,630 --virtual-time-budget=10000 --screenshot="$PWD/og.png" "file://$PWD/og.html"
 ```
 
+Each docs page has its own card in `website/og/<slug>.png`; after adding or renaming a guide in `docs/guides.mjs`, run `node docs/og.mjs`.
+
 ## License
 
 MIT

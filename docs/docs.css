@@ -91,6 +91,8 @@ footer a:hover { color: var(--text); }
 .doc main li { margin: 4px 0 4px 22px; }
 .doc main strong { color: var(--text); font-weight: 600; }
 .doc main a { color: var(--accent-text); text-decoration: none; }
+/* Links inside running text need more than color to stand out (WCAG 1.4.1) */
+.doc main :is(p, li, td) a { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
 .doc main a:hover { text-decoration: underline; }
 .doc main :not(pre) > code { -webkit-box-decoration-break: clone; box-decoration-break: clone; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; overflow-wrap: anywhere; color: var(--text); }
 .doc main pre { margin: 16px 0; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; }

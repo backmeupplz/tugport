@@ -83,8 +83,10 @@ const page = ({ title, description, path, body }) => `<!doctype html>
 <meta name="theme-color" content="#F7F6F2" media="(prefers-color-scheme: light)">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet"></noscript>
 <link rel="stylesheet" href="/docs/docs.css">
+<script defer src="https://lumen.borodutch.com/l.js"></script>
 </head>
 <body>
 <header class="top">
@@ -154,3 +156,29 @@ ${cards.map((c) => `    <li><a href="${c.href}"><h2>${esc(c.title)}</h2><p>${esc
 </main>`;
 writeFileSync(new URL("index.html", out), page({ title: "Documentation", description: "Guides for Tugport: the API reference and moving from Easypanel or Coolify.", path: "/docs/", body: index }));
 console.log(`wrote ${GUIDES.length} guides and the index to website/docs/`);
+
+// The sitemap and llms.txt follow the guide list, so a new guide shows up in both on the next deploy.
+const site = new URL("../website/", import.meta.url);
+const pages = ["/", "/docs/", ...GUIDES.map((g) => `/docs/${g.slug}/`)];
+writeFileSync(new URL("sitemap.xml", site), `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${pages.map((p) => `  <url><loc>https://tugport.com${p}</loc></url>`).join("\n")}
+</urlset>
+`);
+writeFileSync(new URL("llms.txt", site), `# Tugport
+
+> Tugport is a self-hosted deploy platform in one Rust binary. It runs next to Docker on servers you own, builds every git push, switches traffic once the new version is healthy, serves it over HTTPS, and comes with logs, charts, backups, many-server networking and scoped API keys for AI agents.
+
+It's an alternative to panels such as Coolify, Easypanel and Dokploy, and \`tugport migrate\` moves an existing Easypanel or Coolify server over. It is MIT licensed and made by Nikita Kolmogorov.
+
+## Docs
+
+${GUIDES.map((g) => `- [${g.title}](https://tugport.com/docs/${g.slug}.md): ${g.blurb}`).join("\n")}
+- [Moving a server to Tugport, for AI agents](https://tugport.com/agents.md): Step-by-step instructions an AI agent follows to move the apps on a Linux server into Tugport.
+
+## Links
+
+- [Home page](https://tugport.com/)
+- [Source code](https://github.com/backmeupplz/tugport)
+- [Releases](https://github.com/backmeupplz/tugport/releases)
+`);

@@ -31,7 +31,8 @@
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet"></noscript>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -201,7 +202,7 @@
   .term pre.log { white-space: pre-wrap; overflow-wrap: anywhere; }
   .term pre.log > span { display: block; padding-left: 9ch; text-indent: -9ch; }
   .term .p { color: #FF8A63; user-select: none; }
-  .term .c { color: #6E7B8F; }
+  .term .c { color: #748195; }
   .term .ok { color: #4ADE80; }
   .term .k { color: #93C5FD; }
   .term-copy { background: none; border: 1px solid #2A3546; color: #C9D2DE; border-radius: 6px; padding: 4px 8px; font: 500 11.5px/1 Inter, sans-serif; cursor: pointer; }
@@ -279,6 +280,15 @@
     html { scroll-behavior: auto; }
   }
 </style>
+<script type="application/ld+json">
+{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Tugport", "url": "https://tugport.com/",
+ "description": "Tugport is a self-hosted deploy platform in one Rust binary. It builds every push, switches traffic once the new version is healthy, serves it over HTTPS, and comes with logs, charts, backups, many-server networking and scoped API keys for AI agents.",
+ "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux", "image": "https://tugport.com/og.png",
+ "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}, "license": "https://opensource.org/licenses/MIT",
+ "downloadUrl": "https://github.com/backmeupplz/tugport/releases", "sameAs": ["https://github.com/backmeupplz/tugport"],
+ "author": {"@type": "Person", "name": "Nikita Kolmogorov", "url": "https://borodutch.com"}}
+</script>
+<script defer src="https://lumen.borodutch.com/l.js"></script>
 </head>
 <body>
 <header class="top" id="top">

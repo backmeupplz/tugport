@@ -39,6 +39,7 @@ There is deliberately no app store, no one-click templates, no teams or organiza
 
 - [API reference](docs/API.md), including the MCP endpoint, at https://tugport.com/docs/api/
 - [Moving from Easypanel or Coolify](docs/MIGRATION.md), at https://tugport.com/docs/migration/
+- [Tugport compared with Coolify, Dokploy, Easypanel and CapRover](docs/COMPARE.md), at https://tugport.com/docs/compare/
 - [Moving a server to Tugport, for AI agents](website/agents.md), served at https://tugport.com/agents.md
 
 ## Repository

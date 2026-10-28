@@ -1,0 +1,49 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.tugport/tugport",
+  "title": "Tugport",
+  "description": "Deploy, roll back, read logs and manage apps, databases and backups on your self-hosted Tugport.",
+  "websiteUrl": "https://tugport.com/docs/api/",
+  "repository": {
+    "url": "https://github.com/backmeupplz/tugport",
+    "source": "github"
+  },
+  "version": "0.1.30",
+  "icons": [
+    {
+      "src": "https://tugport.com/apple-touch-icon.png",
+      "mimeType": "image/png",
+      "sizes": ["180x180"]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{panel_host}/mcp",
+      "variables": {
+        "panel_host": {
+          "description": "Your Tugport panel's HTTPS domain (each Tugport is self-hosted, so the endpoint is yours)",
+          "placeholder": "panel.example.com",
+          "isRequired": true
+        }
+      },
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer API key from your Tugport panel; the agent gets exactly that key's roles and grants",
+          "value": "Bearer {api_key}",
+          "isRequired": true,
+          "isSecret": true,
+          "variables": {
+            "api_key": {
+              "description": "Tugport API key",
+              "placeholder": "tpk_...",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

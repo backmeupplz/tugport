@@ -69,7 +69,7 @@ function render(markdown) {
 }
 
 const CSS = readFileSync(new URL("docs.css", import.meta.url), "utf8");
-const page = ({ title, description, path, body, image, alt }) => `<!doctype html>
+const page = ({ title, description, path, body, image, alt, ld }) => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -101,7 +101,7 @@ const page = ({ title, description, path, body, image, alt }) => `<!doctype html
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=optional" rel="stylesheet" media="print" onload="this.media='all'">
 <noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=optional" rel="stylesheet"></noscript>
 <style>${CSS}</style>
-<script defer src="https://lumen.borodutch.com/l.js"></script>
+<script defer src="https://lumen.borodutch.com/l.js"></script>${ld ? `\n<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, "\\u003c")}</script>` : ""}
 </head>
 <body>
 <header class="top">
@@ -130,6 +130,35 @@ ${body}
 </html>
 `;
 
+/** Plain text of a Markdown snippet: links, code marks and emphasis dropped. */
+const plain = (md) => md.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/[`*]/g, "").replace(/\s+/g, " ").trim();
+
+/** Structured data for a tested guide: TechArticle, a HowTo from its "Step N:" sections and a FAQPage from its questions. */
+function guideLd(g, markdown) {
+  const url = `https://tugport.com/docs/${g.slug}/`;
+  const author = { "@type": "Person", name: "Nikita Kolmogorov", url: "https://borodutch.com" };
+  const sections = (level) => markdown.split(new RegExp(`^${level} `, "m")).slice(1).map((chunk) => {
+    const [head, ...rest] = chunk.split("\n");
+    const paragraphs = rest.join("\n").replace(/```[\s\S]*?```/g, "").split(/\n\s*\n/).map((x) => x.trim()).filter((x) => x && !/^(\d+\.|-|#)/.test(x));
+    return { head: head.trim(), text: plain(paragraphs[0] ?? ""), all: plain(paragraphs.join(" ")) };
+  });
+  const steps = sections("##").filter((x) => /^Step \d+:/.test(x.head));
+  const faq = markdown.includes("## Frequently asked questions") ? sections("###").filter((x) => x.head.endsWith("?")) : [];
+  const ids = markdown.match(/^## (.+)$/gm).map((h) => h.slice(3));
+  const anchor = (h) => `${url}#${h.toLowerCase().replace(/[^\p{L}\p{N}\- ]/gu, "").replace(/ /g, "-")}`;
+  return {
+    "@context": "https://schema.org",
+    "@graph": [
+      { "@type": "TechArticle", headline: g.title, description: g.blurb, url, mainEntityOfPage: url, inLanguage: "en",
+        datePublished: g.tested, dateModified: g.tested, author, publisher: { "@type": "Organization", name: "Tugport", url: "https://tugport.com/" },
+        image: `https://tugport.com/og/${g.slug}.png`, proficiencyLevel: "Beginner" },
+      { "@type": "HowTo", name: g.title, description: g.blurb,
+        step: steps.map((x, i) => ({ "@type": "HowToStep", position: i + 1, name: x.head.replace(/^Step \d+:\s*/, ""), url: anchor(ids.find((h) => h === x.head)), text: x.all })) },
+      ...(faq.length ? [{ "@type": "FAQPage", mainEntity: faq.map((x) => ({ "@type": "Question", name: x.head, acceptedAnswer: { "@type": "Answer", text: x.all } })) }] : []),
+    ],
+  };
+}
+
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 
@@ -156,7 +185,7 @@ ${html}
 </div>`;
   mkdirSync(new URL(`${g.slug}/`, out), { recursive: true });
   writeFileSync(new URL(`${g.slug}/index.html`, out), page({ title: g.title, description: g.blurb, path: `/docs/${g.slug}/`, body,
-    image: g.slug, alt: `${g.title}. Tugport docs.` }));
+    image: g.slug, alt: `${g.title}. Tugport docs.`, ld: g.tested ? guideLd(g, markdown) : undefined }));
   writeFileSync(new URL(`${g.slug}.md`, out), markdown);
 }
 
@@ -171,7 +200,7 @@ const index = `<main class="wrap index">
 ${cards.map((c) => `    <li><a href="${c.href}"><h2>${esc(c.title)}</h2><p>${esc(c.blurb)}</p></a></li>`).join("\n")}
   </ul>
 </main>`;
-writeFileSync(new URL("index.html", out), page({ title: "Documentation", description: "Guides for Tugport: the API reference and moving from Easypanel or Coolify.", path: "/docs/", body: index,
+writeFileSync(new URL("index.html", out), page({ title: "Documentation", description: "Guides for Tugport: the API reference, moving from Easypanel or Coolify, the comparison with other panels and a tested Uptime Kuma deploy.", path: "/docs/", body: index,
   image: "docs", alt: "Tugport documentation: the API reference, moving from Easypanel or Coolify, and how Tugport compares." }));
 console.log(`wrote ${GUIDES.length} guides and the index to website/docs/`);
 

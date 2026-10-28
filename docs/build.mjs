@@ -69,6 +69,8 @@ function render(markdown) {
 }
 
 const CSS = readFileSync(new URL("docs.css", import.meta.url), "utf8");
+// The @font-face rules, shared with the landing page so both use the same self-hosted files.
+const FONTS = readFileSync(new URL("../website/index.html", import.meta.url), "utf8").match(/(@font-face[^<]*)<\/style>/)[1];
 const page = ({ title, description, path, body, image, alt, ld }) => `<!doctype html>
 <html lang="en">
 <head>
@@ -96,10 +98,12 @@ const page = ({ title, description, path, body, image, alt, ld }) => `<!doctype 
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta name="theme-color" content="#0A0E14" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#F7F6F2" media="(prefers-color-scheme: light)">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=optional" rel="stylesheet" media="print" onload="this.media='all'">
-<noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=optional" rel="stylesheet"></noscript>
+<link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
+<!-- Self-hosted fonts (Google Fonts' latin variable files, cut to the weights and characters the site uses), preloaded
+     and declared inline with font-display: optional, so they are in place for the first paint and never move the text. -->
+<style>${FONTS}</style>
 <style>${CSS}</style>
 <script defer src="https://lumen.borodutch.com/l.js"></script>${ld ? `\n<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, "\\u003c")}</script>` : ""}
 </head>

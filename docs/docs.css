@@ -115,6 +115,9 @@ footer a:hover { color: var(--text); }
 
 /* Two-column tables read as terms and their explanations; Method/Path tables as a list of endpoints. */
 .doc dl { margin: 18px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+/* The API page is ~1,400 elements, most in these lists: off-screen ones skip layout and paint until scrolled near
+   (PageSpeed mobile read 99, the first paint waiting on laying out the whole page). */
+.doc dl { content-visibility: auto; contain-intrinsic-size: auto 420px; }
 .doc dl > div { padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .doc dl > div:last-child { border-bottom: 0; }
 .doc dt { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }

@@ -98,12 +98,10 @@ const page = ({ title, description, path, body, image, alt, ld }) => `<!doctype 
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta name="theme-color" content="#0A0E14" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#F7F6F2" media="(prefers-color-scheme: light)">
-<link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="preload" href="/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>
-<!-- Self-hosted fonts (Google Fonts' latin variable files, cut to the weights and characters the site uses), preloaded
-     and declared inline with font-display: optional, so they are in place for the first paint and never move the text.
-     JetBrains Mono isn't preloaded: its 26 KB counted against the first paint on PageSpeed's slow phone (docs/api 99), and
-     a first visit's code in the system monospace looks nearly the same. -->
+<!-- Self-hosted fonts (Google Fonts' latin variable files, cut to the weights and characters the site uses), declared
+     inline with font-display: optional, so they never move the text. None is preloaded: on PageSpeed's slow phone a
+     preloaded font counts against the first paint (docs/api read 97-99 with Inter and Space Grotesk preloaded, 99 with
+     JetBrains Mono too). A first visit may show the system fonts; every later page has them from the cache. -->
 <style>${FONTS}</style>
 <style>${CSS}</style>
 <script defer src="https://lumen.borodutch.com/l.js"></script>${ld ? `\n<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, "\\u003c")}</script>` : ""}

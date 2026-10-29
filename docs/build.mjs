@@ -100,9 +100,10 @@ const page = ({ title, description, path, body, image, alt, ld }) => `<!doctype 
 <meta name="theme-color" content="#F7F6F2" media="(prefers-color-scheme: light)">
 <link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="preload" href="/fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
 <!-- Self-hosted fonts (Google Fonts' latin variable files, cut to the weights and characters the site uses), preloaded
-     and declared inline with font-display: optional, so they are in place for the first paint and never move the text. -->
+     and declared inline with font-display: optional, so they are in place for the first paint and never move the text.
+     JetBrains Mono isn't preloaded: its 26 KB counted against the first paint on PageSpeed's slow phone (docs/api 99), and
+     a first visit's code in the system monospace looks nearly the same. -->
 <style>${FONTS}</style>
 <style>${CSS}</style>
 <script defer src="https://lumen.borodutch.com/l.js"></script>${ld ? `\n<script type="application/ld+json">${JSON.stringify(ld).replace(/</g, "\\u003c")}</script>` : ""}

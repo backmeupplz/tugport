@@ -34,15 +34,16 @@
 <link rel="preload" href="/fonts/jetbrains-mono.woff2" media="(min-width: 641px)" as="font" type="font/woff2" crossorigin>
 <!-- Fonts. Wide screens preload self-hosted copies (Google Fonts' latin variable files, cut to the weights and characters
      the site uses) declared inline with font-display: optional, so they are in place for the first paint and never
-     move the text. Phones load Google Fonts after the first paint instead, because on PageSpeed's slow mobile profile
-     the font files would compete with the hero text and images; docs/build.mjs uses the self-hosted faces everywhere. -->
+     move the text. Phones load Google Fonts (font-display: swap) only once the page has loaded: when they arrived before
+     the first paint, the hero text waited for them and PageSpeed's slow mobile profile charged their download to the
+     first paint (91 on one run). docs/build.mjs uses the self-hosted faces everywhere. -->
 <style media="(min-width: 641px)">
 @font-face { font-family: "Inter"; font-weight: 400 600; font-display: optional; src: url(/fonts/inter.woff2) format("woff2"); }
 @font-face { font-family: "Space Grotesk"; font-weight: 500 700; font-display: optional; src: url(/fonts/space-grotesk.woff2) format("woff2"); }
 @font-face { font-family: "JetBrains Mono"; font-weight: 400 500; font-display: optional; src: url(/fonts/jetbrains-mono.woff2) format("woff2"); }
 </style>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" media="print" onload="this.media='(max-width: 640px)'">
+<script>addEventListener("load", function () { var l = document.createElement("link"); l.rel = "stylesheet"; l.media = "(max-width: 640px)"; l.href = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap"; document.head.appendChild(l) })</script>
 <noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet" media="(max-width: 640px)"></noscript>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }

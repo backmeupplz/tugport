@@ -60,6 +60,10 @@ pub enum Client {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Serve MCP over standard input and output, for agents that start a command instead of
+    /// connecting to `/mcp`. Calls go to the panel from `tugport login` (or TUGPORT_URL and
+    /// TUGPORT_TOKEN); without one it still lists its tools, so MCP directories can inspect it.
+    Mcp,
     /// Create an agent user and print its API key.
     Agent {
         name: String,
@@ -208,9 +212,11 @@ fn time(ts: &Value) -> String {
 pub async fn run(cmd: Client, json: bool) -> Result<i32> {
     let api = Api::new(match &cmd {
         Client::Login { url, token } => Config { url: url.clone(), token: token.clone() },
+        Client::Mcp => return mcp_stdio(config().ok()).await,
         _ => config()?,
     })?;
     match cmd {
+        Client::Mcp => unreachable!("served above"),
         Client::Login { url, .. } => {
             let me = api.get("/api/me").await.context("the key was not accepted")?;
             let path = config_path()?;
@@ -386,4 +392,31 @@ mod tests {
         assert_eq!(w(&["grep", "a; curl x|sh", "f"]), "grep 'a; curl x|sh' f");
         assert_eq!(w(&["echo", "it's"]), "echo 'it'\\''s'");
     }
+}
+
+/// One JSON-RPC message per line in, one per line out (MCP's stdio transport).
+async fn mcp_stdio(cfg: Option<Config>) -> Result<i32> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let api = cfg.map(Api::new).transpose()?;
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut out = tokio::io::stdout();
+    while let Some(line) = lines.next_line().await? {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let reply = match &api {
+            Some(api) => {
+                let resp = api.http.post(api.url("/mcp")).bearer_auth(&api.cfg.token).json(&msg).send().await;
+                match resp {
+                    Ok(r) if r.status() == reqwest::StatusCode::ACCEPTED => None,
+                    Ok(r) => r.json::<Value>().await.ok(),
+                    Err(e) => msg.get("id").map(|id| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": format!("can't reach {}: {e}", api.cfg.url) } })),
+                }
+            }
+            None => crate::mcp::offline(msg).await,
+        };
+        if let Some(r) = reply {
+            out.write_all(format!("{r}\n").as_bytes()).await?;
+            out.flush().await?;
+        }
+    }
+    Ok(0)
 }

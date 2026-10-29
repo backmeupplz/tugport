@@ -128,6 +128,17 @@ pub async fn handle(req: Request) -> Response {
     }
 }
 
+/// `tugport mcp` with no panel configured: the same answers to initialize and tools/list, and a
+/// pointer to `tugport login` for tool calls.
+pub async fn offline(m: Value) -> Option<Value> {
+    if m["method"] == "tools/call" {
+        let id = m.get("id").cloned()?;
+        let msg = "Not connected to a Tugport panel: run `tugport login <url> --token <key>` or set TUGPORT_URL and TUGPORT_TOKEN.";
+        return Some(json!({ "jsonrpc": "2.0", "id": id, "result": text_result(msg, true) }));
+    }
+    one(&HeaderMap::new(), None, m).await
+}
+
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
@@ -234,6 +245,15 @@ fn text_result(text: &str, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn offline_lists_tools_and_explains_calls() {
+        let list = offline(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await.unwrap();
+        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), tools().len());
+        let call = offline(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "list_projects" } })).await.unwrap();
+        assert_eq!(call["result"]["isError"], true);
+        assert!(offline(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await.is_none());
+    }
 
     #[test]
     fn tools_have_valid_names_and_paths() {

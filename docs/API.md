@@ -375,3 +375,9 @@ The project gets `<DB>_READ_URL` (for MongoDB, a replica-set URL that reads from
 ## MCP
 
 `POST /mcp` speaks streamable HTTP JSON-RPC (`initialize`, `tools/list`, `tools/call`). It uses the same bearer key and the same permissions as the REST API (never a browser's session cookie). Its tools cover projects, services, deploys, logs, exec, env, domains, metrics, servers, backups, database replicas and the audit log.
+
+Agents that start a command instead of connecting to a URL (MCP's stdio transport) run `tugport mcp`: the same tools, forwarded to the panel saved by `tugport login`, or to `TUGPORT_URL` with `TUGPORT_TOKEN`. Any machine can run it (the release binary needs nothing else). For example, in an MCP client's config:
+
+```json
+{ "mcpServers": { "tugport": { "command": "tugport", "args": ["mcp"], "env": { "TUGPORT_URL": "https://panel.example.com", "TUGPORT_TOKEN": "tpk_..." } } } }
+```

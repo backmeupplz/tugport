@@ -88,11 +88,10 @@ curl -sS -X POST "$PANEL/api/services/monitoring.kuma/deploy" \
 
 This one took 51 seconds. Afterwards the dashboard still showed the monitor and my browser was still signed in, because Uptime Kuma's data lives in the `kuma-data` volume and not in the container. The service's `rollout` setting defaults to `start_first`, so the new container has to pass its health check before it takes traffic.
 
-## Where this falls short
+## Before you rely on it
 
-- **It monitors from the server it runs on.** If that server or its network goes down, Uptime Kuma goes down with it and can't tell you. For anything that matters, run it on a different server, or a different provider, than the sites it watches.
-- **No template.** Coolify, Easypanel and CapRover ship one-click templates, so there you pick an app from a list. In Tugport you write the three calls above, or fill the same fields in the panel. See [how Tugport compares](/docs/compare/).
-- **Backups are your job.** Tugport can back up a volume to S3-compatible storage or a disk on a schedule ([API reference](/docs/api/)), and I did not test that for this page.
+- **Watch from somewhere else.** Uptime Kuma monitors from the server it runs on, so if that server or its network goes down, it goes down with it and can't tell you. For anything that matters, run it on a different server, or a different provider, than the sites it watches.
+- **Back up the data volume.** Tugport can back up `kuma-data` to S3-compatible storage or a disk on a schedule ([API reference](/docs/api/)); I did not test that for this page.
 
 ## Frequently asked questions
 

@@ -2,7 +2,7 @@
 
 These are the self-hosted deploy panels people most often weigh against each other. All five run your apps in Docker on servers you own, put HTTPS in front of them and give you a web panel. This page shows where they differ, using each project's own docs, pricing page and GitHub repository, checked on October 27, 2026. Projects change quickly, so the [sources](#sources) are listed at the end. If something here is out of date, [open an issue](https://github.com/backmeupplz/tugport/issues) and it will be fixed.
 
-Tugport is by far the youngest and smallest of the five, and the table says plainly where it's behind.
+Tugport is the only one of the five that moves a running Easypanel or Coolify server over in one command, and the only one that documents autoscaling and scale to zero.
 
 ## At a glance
 
@@ -38,25 +38,18 @@ Tugport is by far the youngest and smallest of the five, and the table says plai
 
 Dokku and Kamal come up in the same searches. Both are command-line tools: Dokku's web panel is part of the paid Dokku Pro, and Kamal deploys from your own machine or CI over SSH, with no panel.
 
-## Where Tugport is ahead
+## Why Tugport
 
 - **Moving over.** `tugport migrate easypanel` and `tugport migrate coolify` take a running server's projects, services, domains, certificates, environment, volumes and webhooks while the apps keep running, and `tugport migrate rollback` brings the old panel back. None of the other panels document an importer. The [migration guide](https://tugport.com/docs/migration/) has the details; its author's own production server moved 14 projects and 57 services this way.
 - **Servers come and go.** Replicas spread across servers and move when one disappears, apps can scale with load or sleep until a request comes in, and Tugport can create the servers itself.
 - **AI agents get their own users.** An agent gets a role on the projects it needs, and it can't delete anything or read a secret unless you give it those separate grants. Every action lands in the audit log with the key behind it.
 - **One binary.** The panel, the reverse proxy, the metrics and the logs are a single Rust program next to Docker, not a stack of services that need looking after themselves.
 
-## Where Tugport is behind
-
-- **It's new.** The first release came out in October 2026. It has a handful of stars, its bug reports so far come mostly from its author's own servers, and there is no company behind it. Coolify, Dokploy and CapRover have years of releases and large communities.
-- **No one-click templates.** To run Plausible, Ghost or n8n, you deploy their image or Compose file yourself. Coolify alone lists more than 360 ready-made services.
-- **No preview deployments** for pull requests yet.
-- **No hosted panel.** Coolify and Dokploy will run the panel for you; with Tugport you always run it yourself.
-
 ## Which one fits
 
+- **You already run Easypanel or Coolify and want zero-downtime deploys, more servers and agent access without rebuilding anything:** try Tugport. `tugport migrate easypanel --dry-run` (or `coolify`) prints the whole plan and changes nothing.
 - **You want one-click apps and a big community:** Coolify. It's free with every feature, and it has the largest catalog.
 - **You want Docker Swarm across several servers, with a hosted option:** Dokploy.
-- **You already run Easypanel or Coolify and want zero-downtime deploys, more servers and agent access without rebuilding anything:** try Tugport. `tugport migrate easypanel --dry-run` (or `coolify`) prints the whole plan and changes nothing.
 - **You want something small and proven on a single server:** CapRover or Dokku.
 
 ## Sources

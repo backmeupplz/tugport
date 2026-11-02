@@ -50,6 +50,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 zeroize = "1"
 
+# Argon2 is very slow unoptimized, and the auth and migration tests hash passwords
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = true
 strip = true

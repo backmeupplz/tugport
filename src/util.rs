@@ -213,7 +213,13 @@ mod tests {
         assert_eq!(cached(&C, "k", Duration::from_secs(60), async { Ok(2) }).await.unwrap(), 1);
         // Stale: still the old value now, the new one once the background fetch lands.
         assert_eq!(cached(&C, "k", Duration::ZERO, async { Ok(3) }).await.unwrap(), 1);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The background fetch lands once this task yields to the runtime (no clock involved).
+        for _ in 0..100 {
+            if lock(&C)["k"].1 == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(cached(&C, "k", Duration::from_secs(60), async { Ok(4) }).await.unwrap(), 3);
     }
 

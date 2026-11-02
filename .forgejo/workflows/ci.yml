@@ -14,20 +14,30 @@ jobs:
   check:
     # Our pushes and PRs run on the Mac runners with a persistent, incremental target dir; outsider PRs (bridged in by
     # the `github` bot) never touch the Mac and run on Linux.
-    runs-on: ${{ (github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude"]'), github.event.pull_request.user.login)) && 'macos-latest' || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || contains(fromJSON('["backmeupplz","renovate","claude","radiant"]'), github.event.pull_request.user.login)) && 'macos-latest' || 'ubuntu-latest' }}
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Persistent target dir (Mac)
+      - name: Persistent target and source dirs (Mac)
         if: runner.os == 'macOS'
         run: |
           # One per runner instance (each runs one job at a time); wiped past 10 GB, since cargo never prunes it.
           d="$RUNNER_TOOL_CACHE/tugport-target"
           [ ! -d "$d" ] || [ "$(du -sm "$d" | cut -f1)" -lt 10000 ] || rm -rf "$d"
           echo "CARGO_TARGET_DIR=$d" >> "$GITHUB_ENV"
+          # Every job checks out to a new path, and rustc drops its incremental cache when the path changes (a full
+          # recompile of the crate, ~35 CPU s). So the build runs in one fixed copy per runner instance. Copied by
+          # content (-c, no -t): unchanged files keep their old mtimes, so cargo only rebuilds what the PR changed.
+          src="$RUNNER_TOOL_CACHE/tugport-src"
+          mkdir -p "$src"
+          rsync -rlpc --delete --exclude /.git --exclude /target --exclude node_modules --exclude /web/dist ./ "$src/"
+          echo "SRC=$src" >> "$GITHUB_ENV"
+          # Cargo's package-cache lock lives in CARGO_HOME, which all runner instances share: every cargo command
+          # waited seconds on other jobs' cargo. One CARGO_HOME per instance (shared by its repos) never waits.
+          echo "CARGO_HOME=$RUNNER_TOOL_CACHE/cargo-home" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         if: runner.os == 'Linux'
         with:
@@ -37,11 +47,13 @@ jobs:
         if: runner.os == 'Linux'
       - name: Web panel, clippy and tests
         run: |
+          cd "${SRC:-.}"
           rustc --version; node --version
           # The web build, clippy (own target dir, so it doesn't wait on the build lock) and the test build run side
           # by side; the debug build reads web/dist at run time, so it only has to exist while compiling.
           mkdir -p web/dist
-          (cd web && npm ci --no-audit --no-fund && npm run build) > "$RUNNER_TEMP/web.log" 2>&1 &
+          # node_modules stays in the Mac's fixed source dir; npm ci (which always reinstalls) only when the lock changed
+          (cd web && { cmp -s package-lock.json node_modules/.ci-lock || { npm ci --no-audit --no-fund && cp package-lock.json node_modules/.ci-lock; }; } && npm run build) > "$RUNNER_TEMP/web.log" 2>&1 &
           web=$!
           CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/clippy" cargo clippy --locked -- -D clippy::unwrap_used -D clippy::expect_used > "$RUNNER_TEMP/clippy.log" 2>&1 &
           clippy=$!

@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Docker run to Docker Compose converter · Tugport</title>
+<meta name="description" content="Paste one or more docker run commands and get a Compose file: ports, volumes, env, networks, restart and health checks converted, and every flag that has no Compose equivalent listed. Runs in your browser.">
+<link rel="canonical" href="https://tugport.com/tools/docker-run-to-compose/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Tugport">
+<meta property="og:url" content="https://tugport.com/tools/docker-run-to-compose/">
+<meta property="og:title" content="Docker run to Docker Compose converter">
+<meta property="og:description" content="Paste one or more docker run commands and get a Compose file: ports, volumes, env, networks, restart and health checks converted, and every flag that has no Compose equivalent listed. Runs in your browser.">
+<meta property="og:image" content="https://tugport.com/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Tugport: deploy your apps to servers you own, from one Rust binary.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Docker run to Docker Compose converter">
+<meta name="twitter:description" content="Paste one or more docker run commands and get a Compose file: ports, volumes, env, networks, restart and health checks converted, and every flag that has no Compose equivalent listed. Runs in your browser.">
+<meta name="twitter:image" content="https://tugport.com/og.png">
+<meta name="twitter:image:alt" content="Tugport: deploy your apps to servers you own, from one Rust binary.">
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#0A0E14" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F7F6F2" media="(prefers-color-scheme: light)">
+<style>@font-face { font-family: "Inter"; font-weight: 400 600; font-display: optional; src: url(/fonts/inter.woff2) format("woff2"); }
+@font-face { font-family: "Space Grotesk"; font-weight: 500 700; font-display: optional; src: url(/fonts/space-grotesk.woff2) format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-weight: 400 500; font-display: optional; src: url(/fonts/jetbrains-mono.woff2) format("woff2"); }
+</style>
+<style>/* tugport.com/docs: the landing page's tokens, navigation and footer, plus styles for the guides. Inlined into
+   every page by build.mjs, so nothing blocks the first paint. */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+
+:root {
+  --bg: #0A0E14;
+  --surface: #10161F;
+  --line: #1C2533;
+  --line-strong: #2A3546;
+  --text: #E8EDF3;
+  --dim: #A0ABBA;
+  --muted: #7A8698;
+  --accent: #FF6A3D;
+  --accent-text: #FF8A63;
+  --code-bg: #121923;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #F7F6F2;
+    --surface: #FFFFFF;
+    --line: #E6E1D8;
+    --line-strong: #D4CDC1;
+    --text: #141B26;
+    --dim: #4A5567;
+    --muted: #5F6979;
+    --accent-text: #B8401C;
+    --code-bg: #EFECE6;
+    color-scheme: light;
+  }
+}
+
+html { scroll-padding-top: 80px; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 400 16px/1.65 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; }
+code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+h1, h2, h3 { font-family: "Space Grotesk", Inter, system-ui, sans-serif; letter-spacing: -0.02em; font-weight: 600; text-wrap: balance; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+/* Navigation and footer, as on the landing page */
+.top { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 84%, transparent); backdrop-filter: saturate(1.4) blur(14px); -webkit-backdrop-filter: saturate(1.4) blur(14px); border-bottom: 1px solid var(--line); }
+nav { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+.brand img { width: 30px; height: 30px; }
+.brand span { font: 700 20px/1 "Space Grotesk", sans-serif; letter-spacing: -0.02em; }
+.links { display: flex; align-items: center; gap: 22px; font-size: 15px; color: var(--dim); }
+.links a { text-decoration: none; }
+.links a:hover { color: var(--text); }
+.links .gh { color: var(--text); padding: 7px 12px; border: 1px solid var(--line-strong); border-radius: 9px; }
+footer { border-top: 1px solid var(--line); padding: 36px 0 48px; color: var(--muted); font-size: 14px; margin-top: 64px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 16px 28px; flex-wrap: wrap; }
+footer nav { height: auto; gap: 22px; flex-wrap: wrap; justify-content: flex-start; }
+footer a { text-decoration: none; color: var(--dim); }
+footer a:hover { color: var(--text); }
+
+/* The index */
+.index { padding-top: 56px; }
+.index h1 { font-size: clamp(34px, 5vw, 48px); line-height: 1.1; }
+.index .lead { margin-top: 14px; color: var(--dim); font-size: 18px; max-width: 40em; }
+.cards { list-style: none; margin-top: 36px; display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.cards a { display: block; height: 100%; padding: 22px 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); text-decoration: none; }
+.cards a:hover { border-color: var(--line-strong); }
+.cards h2 { font-size: 20px; }
+.cards p { margin-top: 8px; color: var(--dim); font-size: 15px; }
+
+/* A guide: contents on the left, the text on the right */
+.doc { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 48px; padding-top: 40px; }
+.doc aside { position: sticky; top: 88px; align-self: start; max-height: calc(100vh - 110px); overflow-y: auto; font-size: 14px; }
+.doc .toc-title, .doc aside summary { font-weight: 600; color: var(--text); margin-bottom: 10px; }
+.doc .toc-fold { display: none; }
+.doc aside summary { list-style: none; cursor: pointer; }
+.doc aside summary::-webkit-details-marker { display: none; }
+.doc aside summary::after { content: " +"; color: var(--muted); }
+.doc aside details[open] summary::after { content: " −"; }
+.doc aside ul { list-style: none; }
+.doc aside li a { display: block; padding: 4px 0; color: var(--dim); text-decoration: none; line-height: 1.4; }
+.doc aside li a:hover { color: var(--text); }
+.doc aside li.d3 a { padding-left: 14px; font-size: 13.5px; color: var(--muted); }
+.doc main { min-width: 0; max-width: 820px; }
+.doc h1 { font-size: clamp(32px, 4.5vw, 44px); line-height: 1.1; }
+.doc .meta { margin-top: 10px; color: var(--muted); font-size: 14px; }
+.doc .meta a { color: var(--accent-text); text-decoration: none; }
+.doc main h2 { font-size: 26px; margin: 44px 0 14px; border-top: 1px solid var(--line); padding-top: 28px; }
+.doc main h3 { font-size: 19px; margin: 30px 0 10px; }
+.doc main h2, .doc main h3 { position: relative; }
+.doc .anchor { position: absolute; left: -0.9em; color: var(--muted); text-decoration: none; opacity: 0; }
+.doc h2:hover .anchor, .doc h3:hover .anchor { opacity: 1; }
+.doc main p, .doc main ul, .doc main ol { margin: 12px 0; color: var(--dim); }
+.doc main li { margin: 4px 0 4px 22px; }
+.doc main strong { color: var(--text); font-weight: 600; }
+.doc main a { color: var(--accent-text); text-decoration: none; }
+/* Links inside running text need more than color to stand out (WCAG 1.4.1) */
+.doc main :is(p, li, td, dd) a { text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.doc main a:hover { text-decoration: underline; }
+.doc main :not(pre) > code { -webkit-box-decoration-break: clone; box-decoration-break: clone; font-size: 0.86em; background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; overflow-wrap: anywhere; color: var(--text); }
+.doc main pre { margin: 16px 0; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; }
+
+/* Comparison tables: short values in a grid, Tugport's column tinted; on phones each row becomes a card. */
+.doc .table { margin: 18px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.doc table { border-collapse: collapse; width: 100%; font-size: 15px; }
+.doc th, .doc td { text-align: left; vertical-align: top; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--dim); }
+.doc thead th { color: var(--text); font-weight: 600; background: var(--surface); }
+.doc tbody th { color: var(--text); font-weight: 600; }
+.doc tbody tr:last-child > * { border-bottom: 0; }
+.doc .ours { background: color-mix(in srgb, var(--accent) 9%, transparent); color: var(--text); }
+.doc thead .ours { background: color-mix(in srgb, var(--accent) 16%, var(--surface)); }
+
+/* Two-column tables read as terms and their explanations; Method/Path tables as a list of endpoints. */
+.doc dl { margin: 18px 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+/* The API page is ~1,400 elements, most in these lists: off-screen ones skip layout and paint until scrolled near
+   (PageSpeed mobile read 99, the first paint waiting on laying out the whole page). */
+.doc dl { content-visibility: auto; contain-intrinsic-size: auto 420px; }
+.doc dl > div { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.doc dl > div:last-child { border-bottom: 0; }
+.doc dt { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.doc dd { margin-top: 4px; color: var(--dim); }
+.doc dl.defs > div { display: grid; grid-template-columns: minmax(150px, 32%) minmax(0, 1fr); gap: 6px 18px; }
+.doc dl.defs dd { margin-top: 0; }
+.doc .method { display: inline-block; min-width: 3.4em; margin-right: 6px; font: 500 12.5px/1.9 "JetBrains Mono", ui-monospace, monospace; color: var(--accent-text); }
+
+@media (max-width: 860px) {
+  .doc { grid-template-columns: 1fr; gap: 0; padding-top: 24px; }
+  .doc aside { position: static; max-height: none; margin-bottom: 24px; border: 1px solid var(--line); border-radius: 12px; padding: 4px 16px; background: var(--surface); }
+  .doc .toc { display: none; }
+  .doc .toc-fold { display: block; }
+  .doc aside summary { margin: 0; padding: 10px 0; }
+  .doc aside li a { padding: 7px 0; }
+  .doc .anchor { display: none; }
+}
+@media (max-width: 720px) {
+  .doc dl.defs > div { display: block; }
+  .doc dl.defs dd { margin-top: 4px; }
+  .doc .table { border: 0; border-radius: 0; overflow: visible; }
+  .doc table, .doc tbody, .doc tr, .doc th, .doc td { display: block; }
+  .doc thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .doc tbody tr { margin: 0 0 12px; padding: 4px 0 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+  .doc tbody th { padding: 10px 14px 6px; border: 0; font-size: 16px; }
+  .doc tbody td { display: grid; grid-template-columns: 6.8em minmax(0, 1fr); gap: 12px; padding: 6px 14px; border: 0; }
+  .doc tbody td::before { content: attr(data-label); color: var(--muted); font-size: 14px; }
+  .doc tbody td.ours { margin: 2px 8px; padding: 6px; border-radius: 8px; }
+}
+@media (max-width: 640px) {
+  .wrap { padding: 0 16px; }
+  .links { gap: 14px; }
+  footer nav a { padding: 8px 0; }
+}
+
+
+.tool main { max-width: 860px; margin: 0 auto; }
+.doc.tool { grid-template-columns: minmax(0, 1fr); }
+.tool h1 { font-size: clamp(30px, 5vw, 44px); line-height: 1.12; }
+.tool .lead { margin-top: 14px; color: var(--dim); font-size: 18px; }
+.tool label { display: block; margin: 28px 0 8px; font-weight: 600; }
+.tool textarea { width: 100%; min-height: 150px; padding: 14px 16px; background: var(--code-bg); color: var(--text); border: 1px solid var(--line-strong); border-radius: 10px; font: 400 14px/1.55 "JetBrains Mono", ui-monospace, monospace; resize: vertical; }
+.tool .row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.tool button { min-height: 44px; padding: 8px 16px; background: var(--surface); color: var(--text); border: 1px solid var(--line-strong); border-radius: 9px; font: 500 15px Inter, system-ui, sans-serif; cursor: pointer; }
+.tool button:hover { border-color: var(--accent); }
+.tool #out { min-height: 60px; margin: 8px 0 0; padding: 14px 16px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; color: var(--text); white-space: pre; }
+.tool #msgs { margin: 12px 0; padding-left: 20px; color: var(--dim); }
+.tool #msgs li.err { color: var(--accent-text); }
+.tool .cta { margin-top: 44px; padding: 22px 24px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); }
+.tool .cta h2 { border: 0; padding: 0; margin: 0 0 8px; font-size: 22px; }
+.tool .cta p { margin: 8px 0 0; }
+.tool .grid { width: 100%; border-collapse: collapse; font-size: 15px; }
+.tool .grid th, .tool .grid td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tool .grid thead th { color: var(--muted); font-weight: 500; }
+@media (max-width: 720px) {
+  .tool .grid thead { display: none; }
+  .tool .grid, .tool .grid tbody, .tool .grid tr, .tool .grid th, .tool .grid td { display: block; }
+  .tool .grid tr { margin: 0 0 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  .tool .grid th, .tool .grid td { border: 0; padding: 2px 0; }
+  .tool .grid td::before { content: attr(data-label) ": "; color: var(--muted); }
+}
+</style>
+<script defer src="https://lumen.borodutch.com/l.js"></script>
+<script type="application/ld+json">{"@context": "https://schema.org", "@graph": [{"@type": "WebApplication", "name": "Docker run to Docker Compose converter", "url": "https://tugport.com/tools/docker-run-to-compose/", "description": "Paste one or more docker run commands and get a Compose file: ports, volumes, env, networks, restart and health checks converted, and every flag that has no Compose equivalent listed. Runs in your browser.", "applicationCategory": "DeveloperApplication", "operatingSystem": "Any", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}, "author": {"@type": "Person", "name": "Nikita Kolmogorov", "url": "https://borodutch.com"}}, {"@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Does it send my command anywhere?", "acceptedAnswer": {"@type": "Answer", "text": "No. The conversion is plain JavaScript on this page. Nothing you paste is uploaded, stored or logged; the page only counts a visit and whether the converter was used."}}, {"@type": "Question", "name": "Why is there no version key in the output?", "acceptedAnswer": {"@type": "Answer", "text": "The Compose Specification made the top-level version key obsolete, and current Docker Compose ignores it and prints a warning if it is there. The file starts with services instead."}}, {"@type": "Question", "name": "What does it do with flags Compose cannot express?", "acceptedAnswer": {"@type": "Answer", "text": "It lists each one under the output instead of dropping it silently. --rm and -P have no Compose equivalent, and flags it does not know are named so you can check them by hand."}}, {"@type": "Question", "name": "Why are named networks marked external?", "acceptedAnswer": {"@type": "Answer", "text": "In docker run a network named with --network must already exist, so the converter writes it as external: true. Delete that line if you want Compose to create the network for you."}}, {"@type": "Question", "name": "Does it handle several commands at once?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Put each docker run on its own line, or join lines with a trailing backslash, and every command becomes a service in one file. Duplicate names get a number."}}]}]}</script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <nav aria-label="Main">
+      <a class="brand" href="/" aria-label="Tugport home"><img src="/logo.svg" alt="" width="30" height="30"><span>Tugport</span></a>
+      <div class="links">
+        <a href="/docs/">Docs</a>
+        <a class="gh" href="https://github.com/backmeupplz/tugport">GitHub</a>
+      </div>
+    </nav>
+  </div>
+</header>
+<div class="wrap doc tool">
+<main>
+<h1>Docker run to Docker Compose converter</h1>
+<p class="lead">Paste one or more <code>docker run</code> commands and get a Compose file. It runs in your browser, so nothing you paste leaves the page.</p>
+<label for="inp">Your docker run command</label>
+<textarea id="inp" spellcheck="false" autocomplete="off" aria-describedby="msgs">docker run -d --name uptime-kuma \
+  -p 3001:3001 \
+  -v uptime-kuma:/app/data \
+  --restart=always \
+  louislam/uptime-kuma:2</textarea>
+<div class="row"><button type="button" id="example">Reset to the example</button><button type="button" id="clear">Clear</button></div>
+<h2 id="result" style="margin-top:28px;font-size:22px">compose.yaml</h2>
+<pre id="out" aria-live="polite"></pre>
+<div class="row"><button type="button" id="copy">Copy the file</button></div>
+<ul id="msgs" aria-live="polite"></ul>
+
+<h2>How the conversion works</h2>
+<p>The command is split the way a shell would split it: quotes, backslash line continuations and several commands, one per line. Every option is then matched to its Compose key, with the image first, and the result is written out as YAML. Named volumes become top-level <code>volumes</code>, and a volume path that starts with <code>/</code>, <code>.</code> or <code>~</code> stays a bind mount. The output has no <code>version:</code> key, because the <a href="https://github.com/compose-spec/compose-spec/blob/main/spec.md">Compose Specification</a> no longer uses one.</p>
+<p>These are the options it converts. Anything else is listed under the output instead of being dropped, so you can check it by hand.</p>
+<div class="table"><table class="grid">
+<thead><tr><th scope="col">docker run</th><th scope="col">Compose key</th></tr></thead>
+<tbody>
+<tr><th scope="row">-p, --publish</th><td data-label="Compose key"><span>ports</span></td></tr>
+<tr><th scope="row">--expose</th><td data-label="Compose key"><span>expose</span></td></tr>
+<tr><th scope="row">-v, --volume, --mount</th><td data-label="Compose key"><span>volumes, tmpfs, top-level volumes</span></td></tr>
+<tr><th scope="row">-e, --env, --env-file</th><td data-label="Compose key"><span>environment, env_file</span></td></tr>
+<tr><th scope="row">--restart</th><td data-label="Compose key"><span>restart</span></td></tr>
+<tr><th scope="row">--network, --network-alias</th><td data-label="Compose key"><span>network_mode, networks</span></td></tr>
+<tr><th scope="row">--name, -h, -u, -w, --entrypoint</th><td data-label="Compose key"><span>container_name, hostname, user, working_dir, entrypoint</span></td></tr>
+<tr><th scope="row">--cap-add, --cap-drop, --privileged, --device</th><td data-label="Compose key"><span>cap_add, cap_drop, privileged, devices</span></td></tr>
+<tr><th scope="row">--health-*, --no-healthcheck</th><td data-label="Compose key"><span>healthcheck</span></td></tr>
+<tr><th scope="row">-m, --cpus, --shm-size, --ulimit</th><td data-label="Compose key"><span>mem_limit, cpus, shm_size, ulimits</span></td></tr>
+<tr><th scope="row">-l, --label, --add-host, --dns</th><td data-label="Compose key"><span>labels, extra_hosts, dns</span></td></tr>
+<tr><th scope="row">--log-driver, --log-opt, --gpus</th><td data-label="Compose key"><span>logging, deploy.resources.reservations.devices</span></td></tr>
+<tr><th scope="row">--rm, -P</th><td data-label="Compose key"><span>Listed, not converted</span></td></tr>
+</tbody></table></div>
+<p>It is a translation of flags, not a check of your setup: it does not start anything, and it does not know whether an image or a network exists. Run <code>docker compose config</code> on the result before you rely on it. The flags are those of the <a href="https://docs.docker.com/reference/cli/docker/container/run/">docker run reference</a>.</p>
+
+<h2>Frequently asked questions</h2>
+<h3>Does it send my command anywhere?</h3>
+<p>No. The conversion is plain JavaScript on this page. Nothing you paste is uploaded, stored or logged; the page only counts a visit and whether the converter was used.</p>
+<h3>Why is there no version key in the output?</h3>
+<p>The Compose Specification made the top-level version key obsolete, and current Docker Compose ignores it and prints a warning if it is there. The file starts with services instead.</p>
+<h3>What does it do with flags Compose cannot express?</h3>
+<p>It lists each one under the output instead of dropping it silently. --rm and -P have no Compose equivalent, and flags it does not know are named so you can check them by hand.</p>
+<h3>Why are named networks marked external?</h3>
+<p>In docker run a network named with --network must already exist, so the converter writes it as external: true. Delete that line if you want Compose to create the network for you.</p>
+<h3>Does it handle several commands at once?</h3>
+<p>Yes. Put each docker run on its own line, or join lines with a trailing backslash, and every command becomes a service in one file. Duplicate names get a number.</p>
+
+<section class="cta">
+<h2>Then deploy the file</h2>
+<p>Tugport is a free, open-source deploy platform in one Rust binary. It deploys a Compose file like this one to your own server on every push, with zero-downtime rollouts and HTTPS. <a href="https://github.com/backmeupplz/tugport?utm_source=tool&amp;utm_campaign=docker-run-to-compose">See Tugport on GitHub</a> or read <a href="/docs/migration/">how it moves a server over</a>.</p>
+</section>
+</main>
+</div>
+<footer>
+  <div class="wrap">
+    <span>Tugport is MIT licensed. © 2026 Nikita Kolmogorov.</span>
+    <nav aria-label="Footer">
+      <a href="https://github.com/backmeupplz/tugport">Source code</a>
+      <a href="https://github.com/backmeupplz/tugport/releases">Releases</a>
+      <a href="/docs/">Docs</a>
+      <a href="https://github.com/backmeupplz/tugport/issues">Issues</a>
+    </nav>
+  </div>
+</footer>
+<script>
+/* docker run -> Compose. Pure functions: convert(text) returns { yaml, notes, errors }. */
+function splitCommands(text) {
+  // A command ends at a newline that is not escaped by a trailing backslash and not inside quotes.
+  const cmds = [];
+  let cur = "", q = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { cur += c; if (c === q && (q === "'" || text[i - 1] !== "\\")) q = null; continue; }
+    if (c === "'" || c === '"') { q = c; cur += c; continue; }
+    if (c === "\\" && (text[i + 1] === "\n" || (text[i + 1] === "\r" && text[i + 2] === "\n"))) { i += text[i + 1] === "\r" ? 2 : 1; cur += " "; continue; }
+    if (c === "\n" || c === ";" ) { if (cur.trim()) cmds.push(cur.trim()); cur = ""; continue; }
+    cur += c;
+  }
+  if (cur.trim()) cmds.push(cur.trim());
+  return cmds;
+}
+
+function tokenize(s) {
+  const out = [];
+  let cur = "", has = false, q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = null; else cur += c; continue; }
+    if (q === '"') {
+      if (c === '"') q = null;
+      else if (c === "\\" && /["\\$`]/.test(s[i + 1] || "")) cur += s[++i];
+      else cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"') { q = c; has = true; continue; }
+    if (c === "\\" && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
+    if (/\s/.test(c)) { if (has || cur) { out.push(cur); cur = ""; has = false; } continue; }
+    cur += c; has = true;
+  }
+  if (q) throw new Error("A quote is not closed.");
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+// Flags that take a value (long names, and the short ones that map to them).
+const VALUE = new Set(["name", "publish", "volume", "env", "env-file", "restart", "network", "workdir", "user", "entrypoint",
+  "hostname", "cap-add", "cap-drop", "device", "label", "health-cmd", "health-interval", "health-timeout", "health-retries",
+  "health-start-period", "memory", "cpus", "add-host", "dns", "dns-search", "tmpfs", "mount", "platform", "pull", "shm-size",
+  "sysctl", "ulimit", "security-opt", "group-add", "ipc", "pid", "stop-signal", "stop-timeout", "log-driver", "log-opt", "gpus",
+  "expose", "link", "memory-swap", "mac-address", "cpu-shares", "cpuset-cpus", "pids-limit", "runtime", "userns", "uts",
+  "volumes-from", "network-alias", "ip", "domainname", "oom-score-adj", "cgroup-parent", "annotation", "label-file", "detach-keys",
+  "cidfile", "restart-policy", "isolation", "kernel-memory", "memory-reservation", "blkio-weight", "device-cgroup-rule"]);
+const SHORT = { p: "publish", v: "volume", e: "env", w: "workdir", u: "user", h: "hostname", l: "label", m: "memory", c: "cpu-shares" };
+const BOOL = new Set(["detach", "interactive", "tty", "rm", "privileged", "read-only", "init", "sig-proxy", "oom-kill-disable", "no-healthcheck", "publish-all", "quiet", "disable-content-trust"]);
+const SHORT_BOOL = { d: "detach", i: "interactive", t: "tty", P: "publish-all", q: "quiet" };
+
+function parseRun(tokens) {
+  let i = 0;
+  if (tokens[i] === "sudo") i++;
+  if (tokens[i] !== "docker") throw new Error('A command must start with "docker run".');
+  i++;
+  if (tokens[i] === "container") i++;
+  if (tokens[i] !== "run") throw new Error('Only "docker run" is converted; this one is "docker ' + (tokens[i] || "") + '".');
+  i++;
+  const opts = [];
+  for (; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "--") { i++; break; }
+    if (!t.startsWith("-") || t === "-") break;
+    if (t.startsWith("--")) {
+      let [name, val] = t.slice(2).split(/=(.*)/s);
+      if (BOOL.has(name)) { opts.push([name, val === undefined ? "true" : val]); continue; }
+      if (name.startsWith("no-") && BOOL.has(name.slice(3))) { opts.push([name, "true"]); continue; }
+      if (val === undefined && (VALUE.has(name) || !BOOL.has(name))) {
+        // Unknown flags are assumed to take a value only if the next token is not an image-looking word; be careful: assume yes.
+        if (VALUE.has(name) || i + 2 < tokens.length) val = tokens[++i];
+        else { opts.push([name, "?"]); continue; }
+      }
+      opts.push([name, val]);
+      continue;
+    }
+    // Short flags, possibly combined (-dit) or with an attached value (-p8080:80, -ti).
+    let k = 1;
+    while (k < t.length) {
+      const f = t[k];
+      if (SHORT_BOOL[f]) { opts.push([SHORT_BOOL[f], "true"]); k++; continue; }
+      if (SHORT[f]) {
+        let val = t.slice(k + 1);
+        if (val.startsWith("=")) val = val.slice(1);
+        if (!val) val = tokens[++i];
+        opts.push([SHORT[f], val]);
+        break;
+      }
+      opts.push(["-" + f, "?"]); k++;
+    }
+  }
+  const image = tokens[i];
+  if (!image) throw new Error("No image found after the options.");
+  return { opts, image, command: tokens.slice(i + 1) };
+}
+
+const PLAIN = /^[A-Za-z0-9_./@+-][A-Za-z0-9_./@+:=-]*$/;
+function scalar(s) {
+  s = String(s);
+  if (PLAIN.test(s) && !(/^\d/.test(s) && s.includes(":")) && !/^(true|false|yes|no|on|off|null|~|y|n)$/i.test(s) && !/^[+-]?(\d[\d_]*\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(s) && !/^0[0-9xob]/i.test(s)) return s;
+  return JSON.stringify(s);
+}
+
+function nameFromImage(image) {
+  let n = image.split("@")[0].split("/").pop().split(":")[0];
+  n = n.toLowerCase().replace(/[^a-z0-9_.-]/g, "-").replace(/^[^a-z0-9]+/, "");
+  return n || "app";
+}
+
+function convertOne(tokens, taken) {
+  const { opts, image, command } = parseRun(tokens);
+  const notes = [];
+  const svc = {};
+  const volumes = new Set();
+  const networks = new Set();
+  const lists = (k) => (svc[k] = svc[k] || []);
+  let name = null;
+  const hc = {};
+  let ignored = [];
+
+  for (const [flag, val] of opts) {
+    switch (flag) {
+      case "name": name = val; break;
+      case "detach": case "interactive": case "sig-proxy": case "quiet": case "disable-content-trust": break;
+      case "tty": svc.tty = true; break;
+      case "rm": notes.push("--rm has no Compose equivalent: use `docker compose run --rm` for one-off runs; a service in a Compose file stays defined."); break;
+      case "publish": lists("ports").push(val); break;
+      case "expose": lists("expose").push(val); break;
+      case "publish-all": notes.push("-P (publish all exposed ports) has no Compose equivalent: list the ports you need under ports."); break;
+      case "volume": {
+        lists("volumes").push(val);
+        const src = val.split(":")[0];
+        if (src && !/^[./~$]/.test(src) && val.includes(":")) volumes.add(src);
+        break;
+      }
+      case "mount": {
+        const kv = Object.fromEntries(val.split(",").map((p) => { const [a, ...b] = p.split("="); return [a, b.join("=") === "" ? "true" : b.join("=")]; }));
+        const src = kv.source || kv.src, dst = kv.target || kv.destination || kv.dst;
+        if (!dst) { ignored.push("--mount " + val); break; }
+        const type = kv.type || "volume";
+        if (type === "tmpfs") { lists("tmpfs").push(dst); break; }
+        const ro = kv.readonly === "true" || kv.ro === "true" || kv.readonly === "1";
+        lists("volumes").push((src ? src + ":" : "") + dst + (ro ? ":ro" : ""));
+        if (type === "volume" && src) volumes.add(src);
+        break;
+      }
+      case "env": lists("environment").push(val); break;
+      case "env-file": lists("env_file").push(val); break;
+      case "restart": svc.restart = val === "no" ? '"no"' : val; if (val === "no") svc.restart = "no"; break;
+      case "network": case "net": {
+        if (["host", "none"].includes(val)) svc.network_mode = val;
+        else if (val.startsWith("container:")) svc.network_mode = val;
+        else if (val === "bridge") notes.push("--network bridge is Compose's default, so it is left out.");
+        else { lists("networks").push(val); networks.add(val); }
+        break;
+      }
+      case "network-alias": svc._alias = (svc._alias || []).concat(val); break;
+      case "workdir": svc.working_dir = val; break;
+      case "user": svc.user = val; break;
+      case "entrypoint": svc.entrypoint = val; break;
+      case "hostname": svc.hostname = val; break;
+      case "domainname": svc.domainname = val; break;
+      case "cap-add": lists("cap_add").push(val); break;
+      case "cap-drop": lists("cap_drop").push(val); break;
+      case "privileged": svc.privileged = true; break;
+      case "read-only": svc.read_only = true; break;
+      case "init": svc.init = true; break;
+      case "device": lists("devices").push(val); break;
+      case "label": lists("labels").push(val); break;
+      case "add-host": lists("extra_hosts").push(val.replace(/^([^:=]+)[:=]/, "$1=").replace(/=/, ":")); break;
+      case "dns": lists("dns").push(val); break;
+      case "dns-search": lists("dns_search").push(val); break;
+      case "tmpfs": lists("tmpfs").push(val); break;
+      case "platform": svc.platform = val; break;
+      case "pull": svc.pull_policy = { always: "always", missing: "missing", never: "never" }[val] || val; break;
+      case "shm-size": svc.shm_size = val; break;
+      case "memory": svc.mem_limit = val; break;
+      case "memory-swap": svc.memswap_limit = val; break;
+      case "memory-reservation": svc.mem_reservation = val; break;
+      case "cpus": svc.cpus = isNaN(val) ? val : +val; break;
+      case "cpu-shares": svc.cpu_shares = val; break;
+      case "cpuset-cpus": svc.cpuset = val; break;
+      case "pids-limit": svc.pids_limit = val; break;
+      case "sysctl": lists("sysctls").push(val); break;
+      case "security-opt": lists("security_opt").push(val); break;
+      case "group-add": lists("group_add").push(val); break;
+      case "ipc": svc.ipc = val; break;
+      case "pid": svc.pid = val; break;
+      case "uts": svc.uts = val; break;
+      case "runtime": svc.runtime = val; break;
+      case "userns": svc.userns_mode = val; break;
+      case "stop-signal": svc.stop_signal = val; break;
+      case "stop-timeout": svc.stop_grace_period = val + "s"; break;
+      case "mac-address": svc.mac_address = val; break;
+      case "volumes-from": lists("volumes_from").push(val); break;
+      case "link": lists("links").push(val); break;
+      case "oom-score-adj": svc.oom_score_adj = val; break;
+      case "cgroup-parent": svc.cgroup_parent = val; break;
+      case "log-driver": svc._logDriver = val; break;
+      case "log-opt": (svc._logOpt = svc._logOpt || []).push(val); break;
+      case "ulimit": (svc._ulimit = svc._ulimit || []).push(val); break;
+      case "gpus": svc._gpus = val; break;
+      case "health-cmd": hc.test = val; break;
+      case "health-interval": hc.interval = val; break;
+      case "health-timeout": hc.timeout = val; break;
+      case "health-retries": hc.retries = val; break;
+      case "health-start-period": hc.start_period = val; break;
+      case "no-healthcheck": hc.disable = true; break;
+      default: ignored.push(flag.startsWith("-") ? flag : "--" + flag); break;
+    }
+  }
+
+  if (ignored.length) notes.push("Not converted: " + ignored.map((f) => "`" + f + "`").join(", ") + ". Compose has no matching key, or the converter does not know the flag; check it by hand.");
+
+  const key = name ? name.replace(/[^A-Za-z0-9_.-]/g, "-") : nameFromImage(image);
+  let id = key, n = 2;
+  while (taken.has(id)) id = key + "-" + n++;
+  taken.add(id);
+
+  const out = [];
+  const put = (k, v) => out.push([k, v]);
+  put("image", image);
+  if (name) put("container_name", name);
+  if (svc.hostname) put("hostname", svc.hostname);
+  if (svc.domainname) put("domainname", svc.domainname);
+  if (svc.platform) put("platform", svc.platform);
+  if (svc.pull_policy) put("pull_policy", svc.pull_policy);
+  if (svc.entrypoint) {
+    let ep; try { ep = tokenizeSafe(svc.entrypoint); } catch { ep = [svc.entrypoint]; }
+    put("entrypoint", ep.length > 1 || /^\[/.test(svc.entrypoint) ? ep : ep[0]);
+  }
+  if (command.length) put("command", command);
+  if (svc.working_dir) put("working_dir", svc.working_dir);
+  if (svc.user) put("user", svc.user);
+  if (svc.restart) put("restart", svc.restart);
+  if (svc.network_mode) put("network_mode", svc.network_mode);
+  if (svc.ports) put("ports", svc.ports);
+  if (svc.expose) put("expose", svc.expose);
+  if (svc.volumes) put("volumes", svc.volumes);
+  if (svc.tmpfs) put("tmpfs", svc.tmpfs);
+  if (svc.environment) put("environment", svc.environment);
+  if (svc.env_file) put("env_file", svc.env_file);
+  if (svc.networks) {
+    if (svc._alias) {
+      const m = {}; svc.networks.forEach((nn, idx) => { m[nn] = idx === 0 ? { aliases: svc._alias } : null; });
+      put("networks", m);
+    } else put("networks", svc.networks);
+  } else if (svc._alias) notes.push("--network-alias only works on a user-defined network; add `--network <name>` first.");
+  if (svc.extra_hosts) put("extra_hosts", svc.extra_hosts);
+  if (svc.dns) put("dns", svc.dns);
+  if (svc.dns_search) put("dns_search", svc.dns_search);
+  if (svc.links) put("links", svc.links);
+  if (svc.volumes_from) put("volumes_from", svc.volumes_from);
+  for (const k of ["privileged", "read_only", "init", "tty"]) if (svc[k]) put(k, true);
+  if (svc.cap_add) put("cap_add", svc.cap_add);
+  if (svc.cap_drop) put("cap_drop", svc.cap_drop);
+  if (svc.devices) put("devices", svc.devices);
+  if (svc.security_opt) put("security_opt", svc.security_opt);
+  if (svc.group_add) put("group_add", svc.group_add);
+  for (const k of ["ipc", "pid", "uts", "runtime", "userns_mode", "shm_size", "mem_limit", "memswap_limit", "mem_reservation", "cpus", "cpu_shares", "cpuset", "pids_limit", "oom_score_adj", "cgroup_parent", "mac_address", "stop_signal", "stop_grace_period"])
+    if (svc[k] !== undefined) put(k, svc[k]);
+  if (svc.sysctls) put("sysctls", svc.sysctls);
+  if (svc.labels) put("labels", svc.labels);
+  if (svc._ulimit) {
+    const m = {};
+    for (const u of svc._ulimit) {
+      const [k, v] = u.split("=");
+      const [soft, hard] = (v || "").split(":");
+      m[k] = hard !== undefined ? { soft: +soft, hard: +hard } : +soft;
+    }
+    put("ulimits", m);
+  }
+  if (svc._logDriver || svc._logOpt) {
+    const l = {};
+    if (svc._logDriver) l.driver = svc._logDriver;
+    if (svc._logOpt) l.options = Object.fromEntries(svc._logOpt.map((o) => { const [a, ...b] = o.split("="); return [a, b.join("=")]; }));
+    put("logging", l);
+  }
+  if (svc._gpus) {
+    const all = svc._gpus === "all";
+    const count = all ? "all" : (/^\d+$/.test(svc._gpus) ? +svc._gpus : null);
+    if (count === null) notes.push("--gpus " + svc._gpus + " has device selectors; write the matching `deploy.resources.reservations.devices` entry by hand.");
+    else put("deploy", { resources: { reservations: { devices: [{ driver: "nvidia", count, capabilities: ["gpu"] }] } } });
+  }
+  if (hc.test || hc.disable) {
+    const h = {};
+    if (hc.disable) h.disable = true;
+    else {
+      h.test = /^(CMD|CMD-SHELL|NONE)\b/.test(hc.test) ? tokenizeSafe(hc.test) : ["CMD-SHELL", hc.test];
+      for (const k of ["interval", "timeout", "retries", "start_period"]) if (hc[k] !== undefined) h[k] = k === "retries" ? +hc[k] : hc[k];
+    }
+    put("healthcheck", h);
+  } else if (Object.keys(hc).length) notes.push("Health check timings were given without --health-cmd, so Compose would apply them to the image's own check; they are written under healthcheck anyway.");
+  if (Object.keys(hc).length && !hc.test && !hc.disable) {
+    const h = {};
+    for (const k of ["interval", "timeout", "retries", "start_period"]) if (hc[k] !== undefined) h[k] = k === "retries" ? +hc[k] : hc[k];
+    put("healthcheck", h);
+  }
+  return { id, entries: out, volumes, networks, notes };
+}
+
+function tokenizeSafe(s) {
+  const t = s.trim();
+  if (t.startsWith("[")) { try { return JSON.parse(t); } catch { /* fall through */ } }
+  return tokenize(t);
+}
+
+function emit(v, indent) {
+  const pad = "  ".repeat(indent);
+  if (Array.isArray(v)) return v.map((x) => pad + "- " + (typeof x === "object" && x !== null ? emitInline(x, indent + 1) : scalarOf(x))).join("\n");
+  return Object.entries(v).map(([k, x]) => {
+    if (x === null) return pad + scalar(k) + ": {}";
+    if (typeof x === "object") return pad + scalar(k) + ":\n" + emit(x, indent + 1);
+    return pad + scalar(k) + ": " + scalarOf(x);
+  }).join("\n");
+}
+function emitInline(obj, indent) {
+  return emit(obj, indent).trimStart();
+}
+function scalarOf(x) {
+  if (typeof x === "boolean" || typeof x === "number") return String(x);
+  return scalar(x);
+}
+
+function convert(text) {
+  const errors = [], notes = [];
+  const services = [];
+  const taken = new Set();
+  const volumes = new Set(), networks = new Set();
+  const cmds = splitCommands(text.replace(/\r/g, ""));
+  cmds.forEach((c, idx) => {
+    try {
+      const r = convertOne(tokenize(c), taken);
+      services.push(r);
+      r.volumes.forEach((x) => volumes.add(x));
+      r.networks.forEach((x) => networks.add(x));
+      r.notes.forEach((nn) => notes.push((cmds.length > 1 ? r.id + ": " : "") + nn));
+    } catch (e) {
+      errors.push((cmds.length > 1 ? "Command " + (idx + 1) + ": " : "") + e.message);
+    }
+  });
+  if (!services.length) return { yaml: "", notes, errors };
+  const doc = { services: {} };
+  for (const s of services) doc.services[s.id] = Object.fromEntries(s.entries);
+  let yaml = "services:\n" + services.map((s) => "  " + scalar(s.id) + ":\n" + emit(Object.fromEntries(s.entries), 2)).join("\n");
+  if (networks.size) yaml += "\n\nnetworks:\n" + [...networks].map((x) => "  " + scalar(x) + ":\n    external: true").join("\n");
+  if (networks.size) notes.push("Networks named on the command line already exist on the host in a docker run, so they are marked `external: true`. Remove that line to let Compose create them.");
+  if (volumes.size) yaml += "\n\nvolumes:\n" + [...volumes].map((x) => "  " + scalar(x) + ":").join("\n");
+  return { yaml: yaml + "\n", notes, errors };
+}
+
+
+(function () {
+  var inp = document.getElementById("inp"), out = document.getElementById("out"), msgs = document.getElementById("msgs"), used = false;
+  var EXAMPLE = inp.value;
+  function run() {
+    var r = convert(inp.value);
+    out.textContent = r.yaml;
+    msgs.textContent = "";
+    r.errors.forEach(function (m) { var li = document.createElement("li"); li.className = "err"; li.textContent = m; msgs.appendChild(li); });
+    r.notes.forEach(function (m) { var li = document.createElement("li"); li.textContent = m.replace(/`/g, ""); msgs.appendChild(li); });
+    if (!used && r.yaml && inp.value !== EXAMPLE && typeof window.lumen === "function") { used = true; window.lumen("tool-use"); }
+  }
+  inp.addEventListener("input", run);
+  document.getElementById("example").addEventListener("click", function () { inp.value = EXAMPLE; run(); });
+  document.getElementById("clear").addEventListener("click", function () { inp.value = ""; run(); inp.focus(); });
+  document.getElementById("copy").addEventListener("click", function (e) {
+    var b = e.target; if (navigator.clipboard) navigator.clipboard.writeText(out.textContent).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy the file"; }, 1500); });
+  });
+  run();
+})();
+</script>
+</body>
+</html>

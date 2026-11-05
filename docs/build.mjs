@@ -209,7 +209,10 @@ console.log(`wrote ${GUIDES.length} guides and the index to website/docs/`);
 
 // The sitemap and llms.txt follow the guide list, so a new guide shows up in both on the next deploy.
 const site = new URL("../website/", import.meta.url);
-const pages = ["/", "/docs/", ...GUIDES.map((g) => `/docs/${g.slug}/`)];
+const TOOLS = [
+  { path: "/tools/docker-run-to-compose/", title: "Docker run to Compose converter", blurb: "Paste docker run commands, get a Compose file, with every flag Compose cannot express listed. Runs in the browser." },
+];
+const pages = ["/", "/docs/", ...GUIDES.map((g) => `/docs/${g.slug}/`), ...TOOLS.map((t) => t.path)];
 writeFileSync(new URL("sitemap.xml", site), `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${pages.map((p) => `  <url><loc>https://tugport.com${p}</loc></url>`).join("\n")}
@@ -226,9 +229,14 @@ It's an alternative to panels such as Coolify, Easypanel and Dokploy, and \`tugp
 ${GUIDES.map((g) => `- [${g.title}](https://tugport.com/docs/${g.slug}.md): ${g.blurb}`).join("\n")}
 - [Moving a server to Tugport, for AI agents](https://tugport.com/agents.md): Step-by-step instructions an AI agent follows to move the apps on a Linux server into Tugport.
 
+## Tools
+
+${TOOLS.map((t) => `- [${t.title}](https://tugport.com${t.path}): ${t.blurb}`).join("\n")}
+
 ## Links
 
 - [Home page](https://tugport.com/)
 - [Source code](https://github.com/backmeupplz/tugport)
 - [Releases](https://github.com/backmeupplz/tugport/releases)
 `);
+

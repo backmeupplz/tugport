@@ -331,6 +331,9 @@ async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, gi
             run(&["init", "-q"]).await?;
             run(&["remote", "add", "origin", &url]).await?;
         } else {
+            for lock in clear_stale_locks(&dest.join(".git")) {
+                log(&format!("Removed {lock}, left by an interrupted deploy"));
+            }
             run(&["remote", "set-url", "origin", &url]).await?;
         }
         let commit = format!("{git_ref}^{{commit}}");
@@ -365,6 +368,29 @@ async fn fetch(app: &App, s: &Service, provider_id: Option<&str>, repo: &str, gi
     let (sha, msg) = fetched?;
     log(&format!("Checked out {} {}", sha.get(..7).unwrap_or(&sha), msg.lines().next().unwrap_or("")));
     Ok((sha, msg))
+}
+
+/// Remove the `*.lock` files in a checkout's `.git` folder (submodules' included). A deploy that is
+/// cancelled or interrupted kills git mid-command, and its lock (config.lock, index.lock, a ref's
+/// lock) then fails every later deploy of the service. Deploys of a service run one at a time, so
+/// no other git can hold them. Returns the removed locks, relative to `.git`.
+fn clear_stale_locks(git_dir: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                walk(root, &path, out);
+            } else if kind.is_file() && path.extension().is_some_and(|e| e == "lock") && std::fs::remove_file(&path).is_ok() {
+                out.push(path.strip_prefix(root).unwrap_or(&path).display().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(git_dir, git_dir, &mut out);
+    out.sort();
+    out
 }
 
 /// A full commit id: one that may already be in the clone.
@@ -658,6 +684,23 @@ mod tests {
         std::fs::remove_file(root.join("a/b/out")).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", root.join("abs")).unwrap();
         assert!(check_links(&root).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clears_locks_left_by_an_interrupted_git() {
+        let root = std::env::temp_dir().join(format!("tp-locks-{}", util::id()));
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("refs/remotes/origin")).unwrap();
+        std::fs::create_dir_all(git.join("modules/sub")).unwrap();
+        for f in ["config.lock", "index.lock", "refs/remotes/origin/main.lock", "modules/sub/index.lock", "config", "HEAD"] {
+            std::fs::write(git.join(f), "").unwrap();
+        }
+        // The working tree's lockfiles are source code, not git's.
+        std::fs::write(root.join("bun.lock"), "").unwrap();
+        assert_eq!(clear_stale_locks(&git), ["config.lock", "index.lock", "modules/sub/index.lock", "refs/remotes/origin/main.lock"]);
+        assert!(git.join("config").exists() && git.join("HEAD").exists() && root.join("bun.lock").exists());
+        assert!(clear_stale_locks(&git).is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -32,12 +32,41 @@ fn pump(pipe: impl AsyncRead + Unpin + Send + 'static, tx: tokio::sync::mpsc::Un
     });
 }
 
-/// Run to completion, sending every output line to `log`. Killed if the future is dropped
-/// (a cancelled deploy). Errors include the last lines of output.
+/// A child started in a process group of its own. Dropped before the child exited (a cancelled
+/// deploy), it kills the whole group: git and buildx start children of their own (submodule
+/// clones, a foreground auto-gc), which would otherwise keep running, change the checkout and
+/// hold its locks while the next deploy uses it.
+struct Group(Option<i32>);
+
+impl Group {
+    fn spawn(cmd: &mut Command, program: &str) -> Result<(tokio::process::Child, Group)> {
+        cmd.process_group(0).kill_on_drop(true);
+        let child = cmd.spawn().map_err(|e| cannot_run(program, e))?;
+        // Until the child is reaped its pid, and so the group id, cannot be reused.
+        let group = Group(child.id().and_then(|id| i32::try_from(id).ok()));
+        Ok((child, group))
+    }
+
+    fn exited(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: kill(2) takes plain integers; a negative pid signals the group.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Run to completion, sending every output line to `log`. Killed, with the processes it
+/// started, if the future is dropped (a cancelled deploy). Errors include the last lines of output.
 pub async fn run_streamed(mut cmd: Command, log: &(dyn Fn(&str) + Sync)) -> Result<()> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null()).kill_on_drop(true);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
     let program = program(cmd.as_std());
-    let mut child = cmd.spawn().map_err(|e| cannot_run(&program, e))?;
+    let (mut child, group) = Group::spawn(&mut cmd, &program)?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     if let Some(p) = child.stdout.take() {
         pump(p, tx.clone());
@@ -54,17 +83,21 @@ pub async fn run_streamed(mut cmd: Command, log: &(dyn Fn(&str) + Sync)) -> Resu
         }
     }
     let status = child.wait().await?;
+    group.exited();
     if !status.success() {
         bail!("{program} exited with {}: {}", status.code().map_or("a signal".into(), |c| c.to_string()), Vec::from(tail).join(" | "));
     }
     Ok(())
 }
 
-/// Run and capture stdout; stderr goes into the error.
+/// Run and capture stdout; stderr goes into the error. Killed like `run_streamed` if dropped.
 pub async fn output(mut cmd: Command) -> Result<String> {
-    cmd.stdin(Stdio::null()).kill_on_drop(true);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let program = program(cmd.as_std());
-    stdout(&program, cmd.output().await.map_err(|e| cannot_run(&program, e))?)
+    let (child, group) = Group::spawn(&mut cmd, &program)?;
+    let out = child.wait_with_output().await?;
+    group.exited();
+    stdout(&program, out)
 }
 
 /// Run a short blocking command and capture its trimmed stdout; stderr goes into the error.
@@ -96,7 +129,35 @@ pub fn tool_env(env: &BTreeMap<String, zeroize::Zeroizing<String>>) -> impl Iter
 
 #[cfg(test)]
 mod tests {
-    use super::steers_tools;
+    use super::{output, run_streamed, steers_tools};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    /// A shell whose own child (standing in for git's submodule clones or auto-gc) creates `file`
+    /// after a second; `wait` keeps the shell running until then.
+    fn shell(file: &std::path::Path, wait: bool) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!("(sleep 1; touch '{}') >/dev/null 2>&1 & echo started{}", file.display(), if wait { "; wait" } else { "" }));
+        cmd
+    }
+
+    #[tokio::test]
+    async fn a_dropped_command_takes_its_children_with_it() {
+        let dir = std::env::temp_dir().join(format!("tp-group-{}", crate::util::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (dropped, finished) = (dir.join("dropped"), dir.join("finished"));
+        let started = Mutex::new(false);
+        let log = |l: &str| *started.lock().unwrap() |= l == "started";
+        assert!(tokio::time::timeout(Duration::from_millis(500), run_streamed(shell(&dropped, true), &log)).await.is_err());
+        assert!(*started.lock().unwrap());
+        // A command that finished leaves what it started alone.
+        assert_eq!(output(shell(&finished, false)).await.unwrap().trim(), "started");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!dropped.exists(), "the cancelled command's child kept running");
+        assert!(finished.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn tool_variables() {

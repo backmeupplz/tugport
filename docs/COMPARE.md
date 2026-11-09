@@ -1,8 +1,8 @@
 # Tugport compared with Coolify, Dokploy, Easypanel and CapRover
 
-These are the self-hosted deploy panels people most often weigh against each other. All five run your apps in Docker on servers you own, put HTTPS in front of them and give you a web panel. This page shows where they differ, using each project's own docs, pricing page and GitHub repository, checked on October 27, 2026. Projects change quickly, so the [sources](#sources) are listed at the end. If something here is out of date, [open an issue](https://github.com/backmeupplz/tugport/issues) and it will be fixed.
+**Short answer (November 9, 2026):** for a few apps on one server, pick Coolify if you want the biggest catalog of one-click apps and community, Dokploy if you want Docker Swarm with a hosted option, and Tugport if you already run Easypanel or Coolify, or want zero-downtime deploys, scale to zero, several servers and scoped keys for AI agents from one Rust binary. Tugport is the only one of the five that moves a running Easypanel or Coolify server over in one command (`tugport migrate easypanel`, with `tugport migrate rollback` to undo it), and the only one that documents autoscaling and scale to zero. It is also the youngest and smallest: 10 GitHub stars against Coolify's 65,823, and no one-click template catalog.
 
-Tugport is the only one of the five that moves a running Easypanel or Coolify server over in one command, and the only one that documents autoscaling and scale to zero.
+Coolify, Dokploy, Easypanel, CapRover and Tugport all run your apps in Docker on servers you own, put HTTPS in front of them and give you a web panel. This page compares them using each project's own docs, pricing page and GitHub repository. Prices, licenses, GitHub stars and the Coolify template count were re-checked on November 9, 2026; the other rows were checked on October 27, 2026. Projects change quickly, so the [sources](#sources) are listed at the end. If something here is out of date, [open an issue](https://github.com/backmeupplz/tugport/issues) and it will be fixed.
 
 ## At a glance
 
@@ -10,7 +10,7 @@ Tugport is the only one of the five that moves a running Easypanel or Coolify se
 |---|---|---|---|---|---|
 | License | MIT | Apache-2.0 | Apache-2.0, enterprise folder excepted | Proprietary | Apache-2.0, with an appendix |
 | Written in | Rust, one binary | PHP (Laravel) | TypeScript | Not published | TypeScript |
-| GitHub stars | 4 | 64,982 | 38,063 | Closed source | 15,193 |
+| GitHub stars | 10 | 65,823 | 38,309 | Closed source | 15,202 |
 | Public since | 2026 | 2021 | 2024 | – | 2017 |
 | Self-hosted | Free | Free | Free; enterprise paid | 3 projects free, then from $14.90/server | Free; Pro paid |
 | Hosted panel | No | From $5 a month | From $4.50/server | No | No |
@@ -18,7 +18,7 @@ Tugport is the only one of the five that moves a running Easypanel or Coolify se
 | Zero-downtime deploys | Yes | Rolling updates | Yes | Optional | Not documented |
 | Autoscaling, scale to zero | Yes | Not documented | Not documented | Not documented | Not documented |
 | Docker Compose | Yes | Yes | Yes | Yes | Partly |
-| One-click templates | None | 360+ | Yes | Yes | Dozens |
+| One-click templates | None | 300+ | Yes | Yes | Dozens |
 | Database backups | S3 or disk, tested | To S3 | To S3 | Several targets | None built in |
 | Preview deployments | No | Yes | Yes, on GitHub | Not documented | Not documented |
 | AI agents | Agent users, MCP | MCP server | AI assistant | Remote MCP | API and CLI |
@@ -54,7 +54,7 @@ Dokku and Kamal come up in the same searches. Both are command-line tools: Dokku
 
 ## Sources
 
-Checked on October 27, 2026.
+Checked on October 27, 2026; prices, licenses, stars and the Coolify template count again on November 9, 2026.
 
 - Tugport: [tugport.com](https://tugport.com/), [API reference](https://tugport.com/docs/api/), [migration guide](https://tugport.com/docs/migration/), [GitHub](https://github.com/backmeupplz/tugport)
 - Coolify: [docs](https://coolify.io/docs), [pricing](https://coolify.io/pricing), [rolling updates](https://coolify.io/docs/applications/deployments/rolling-updates), [GitHub](https://github.com/coollabsio/coolify)

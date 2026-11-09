@@ -110,8 +110,22 @@ async fn run(mut cmd: Command, context: &Path, sha: Option<&str>, log: &DeployLo
 }
 
 /// The systemd slice that caps CPU and memory for every build step, if the installer made it.
+/// BuildKit takes the parent as a cgroupfs path: a bare `tugport-builds.slice` became a new
+/// top-level cgroup with no limits. A slice only exists once started, so start it on first use;
+/// until then builds shared the CPU equally with every container and starved on a busy host.
 fn build_slice() -> Option<&'static str> {
-    Path::new("/sys/fs/cgroup/tugport.slice/tugport-builds.slice").exists().then_some("tugport-builds.slice")
+    const CGROUP: &str = "/tugport.slice/tugport-builds.slice";
+    if !Path::new("/etc/systemd/system/tugport-builds.slice").exists() {
+        return None;
+    }
+    if !Path::new("/sys/fs/cgroup").join(&CGROUP[1..]).exists() {
+        let started = std::process::Command::new("systemctl").args(["start", "tugport-builds.slice"]).status();
+        if !started.is_ok_and(|s| s.success()) {
+            tracing::warn!("could not start tugport-builds.slice; building without it");
+            return None;
+        }
+    }
+    Some(CGROUP)
 }
 
 /// Names declared with ARG, several per line too (`ARG CI NODE_ENV`, as Nixpacks writes them).

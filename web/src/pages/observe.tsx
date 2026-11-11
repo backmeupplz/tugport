@@ -4,7 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { get, useApi, type Node, type Replica, type Service } from "../api";
 import { Chart, RANGES, fmt, type Points } from "../charts";
 import { Card, Empty, ErrorBox, Field, Input, Loaded, Loading, Note, Pill, Select, Skel, errText } from "../ui";
-import { ago, bytes, clock, qs, sentence, stripAnsi, toMs } from "../util";
+import { ago, byProject, bytes, clock, qs, sentence, stripAnsi, toMs, type Use } from "../util";
 
 /** A log box that stays scrolled to the newest line, unless the reader scrolled up. `lines` changes as lines arrive. */
 export function useStickToBottom<T extends HTMLElement>(lines: unknown) {
@@ -444,6 +444,128 @@ function Gpu(props: { gpu: Now["gpus"][number]; range: string; node: string | nu
         )}
       </Loaded>
     </Card>
+  );
+}
+
+/**
+ * What each project uses right now on these servers ("local" is the panel's own), heaviest
+ * first, and what runs outside projects: builds, Tugport and the system.
+ */
+export function ProjectUsage(props: { nodes: string[] }) {
+  const key = props.nodes.join(",");
+  const known = useApi<{ services: { id: string; name: string; project: string }[] }>("/services");
+  const [samples, setSamples] = useState<(Now | null)[] | null>(null);
+  const [sort, setSort] = useState<"cpu" | "memory">("cpu");
+  useEffect(() => {
+    let live = true;
+    const load = () =>
+      Promise.all(key.split(",").map((n) => get<Now>(`/metrics/now${qs({ node: n === "local" ? null : n })}`).catch(() => null))).then((s) => live && setSamples(s));
+    load();
+    const t = setInterval(load, 10000);
+    return () => {
+      live = false;
+      clearInterval(t);
+    };
+  }, [key]);
+  const ok = (samples ?? []).filter((s): s is Now => !!s?.at);
+  const cores = ok.reduce((a, s) => a + s.cores.length, 0) || 1;
+  const memory = ok.reduce((a, s) => a + s.memory.total, 0) || 1;
+  const projects = known.data ? byProject(ok, known.data.services) : [];
+  const heavier = (a: Use, b: Use) => b[sort] - a[sort];
+  projects.sort(heavier).forEach((p) => p.services.sort(heavier));
+  // Host CPU is the average over its cores; service CPU is percent of one core.
+  const used = { cpu: ok.reduce((a, s) => a + s.cpu * s.cores.length, 0), memory: ok.reduce((a, s) => a + s.memory.used, 0) };
+  const rest = { cpu: Math.max(0, used.cpu - projects.reduce((a, p) => a + p.cpu, 0)), memory: Math.max(0, used.memory - projects.reduce((a, p) => a + p.memory, 0)) };
+  const cells = (u: { cpu: number; memory: number }) => (
+    <>
+      <Share label="CPU" value={fmt.pct(u.cpu / cores)} sub={`${(u.cpu / 100).toFixed(2)} cores`} pct={u.cpu / cores} />
+      <Share label="Memory" value={bytes(u.memory)} sub={`${fmt.pct((100 * u.memory) / memory)} of ${bytes(memory)}`} pct={(100 * u.memory) / memory} />
+    </>
+  );
+  const net = (u: Use) => `↓ ${fmt.rate(u.net_rx)} · ↑ ${fmt.rate(u.net_tx)}`;
+  return (
+    <Card
+      title={props.nodes.length > 1 ? `Usage by project across ${props.nodes.length} servers` : "Usage by project"}
+      pad={false}
+      actions={
+        <Select
+          aria-label="Sort projects"
+          value={sort}
+          onChange={(v) => setSort(v as "cpu" | "memory")}
+          options={[
+            ["cpu", "Most CPU first"],
+            ["memory", "Most memory first"],
+          ]}
+        />
+      }
+    >
+      {!samples || !known.data ? (
+        <div class="p-4 md:p-5">
+          <Loading />
+        </div>
+      ) : !ok.length ? (
+        <div class="p-4 md:p-5">
+          <Empty>There are no measurements from {props.nodes.length > 1 ? "these servers" : "this server"} yet. They arrive every 10 seconds while it is online.</Empty>
+        </div>
+      ) : (
+        <ul class="divide-y divide-line">
+          {projects.map((p) => (
+            <li key={p.name}>
+              <details>
+                <summary class="row cursor-pointer list-none hover:bg-raised/60">
+                  <div class="min-w-0 flex-1">
+                    <a class="link font-medium" href={`/projects/${p.name}`}>
+                      {p.name}
+                    </a>
+                    <p class="truncate text-xs text-muted tabular-nums">
+                      {p.services.length} {p.services.length === 1 ? "service" : "services"} running · {net(p)}
+                    </p>
+                  </div>
+                  {cells(p)}
+                </summary>
+                <ul class="divide-y divide-line border-t border-line bg-raised/30">
+                  {p.services.map((s) => (
+                    <li key={s.name} class="row pl-8 md:pl-10">
+                      <div class="min-w-0 flex-1">
+                        <a class="link text-sm" href={`/projects/${p.name}/${s.name}`}>
+                          {s.name}
+                        </a>
+                        <p class="truncate text-xs text-muted tabular-nums">{net(s)}</p>
+                      </div>
+                      {cells(s)}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </li>
+          ))}
+          <li class="row">
+            <div class="min-w-0 flex-1">
+              <p class="font-medium text-dim">Outside projects</p>
+              <p class="text-xs text-muted">Builds, Tugport, the system and anything else on the {props.nodes.length > 1 ? "servers" : "server"}.</p>
+            </div>
+            {cells(rest)}
+          </li>
+        </ul>
+      )}
+    </Card>
+  );
+}
+
+/** A share of a server's capacity: the amount, what it means, and a bar. */
+function Share(props: { label: string; value: string; sub: string; pct: number }) {
+  const p = Math.min(100, Math.max(0, props.pct));
+  return (
+    <div class="w-36 shrink-0" title={props.label}>
+      <p class="flex justify-between gap-2 text-sm tabular-nums">
+        <span class="text-xs text-muted">{props.label}</span>
+        {props.value}
+      </p>
+      <div class="mt-1 h-1 overflow-hidden rounded-full bg-raised" role="meter" aria-valuenow={Math.round(p)} aria-valuemin={0} aria-valuemax={100} aria-label={props.label}>
+        <div class="h-full rounded-full bg-accent" style={{ width: `${p}%` }} />
+      </div>
+      <p class="mt-0.5 truncate text-xs text-muted tabular-nums">{props.sub}</p>
+    </div>
   );
 }
 

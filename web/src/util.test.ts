@@ -19,6 +19,7 @@ import {
   splitArgs,
   stripAnsi,
   str,
+  byProject,
   sumUsage,
   varName,
 } from "./util.ts";
@@ -118,6 +119,30 @@ test("usage adds up over servers and skips servers without the service", () => {
   });
   assert.deepEqual(sumUsage([s(1.5, 100, 2), null, s(2, 50)], "a"), { cpu: 3.5, memory: 150, restarts: 2 });
   assert.equal(sumUsage([null, { services: [] }], "a"), null);
+});
+
+test("usage groups by project over servers, skipping unknown and crash-only services", () => {
+  const s = (id: string, cpu: number, memory: number) => ({ id, cpu, memory, restarts: 0, net_rx: 1, net_tx: 2 });
+  const known = [
+    { id: "a", name: "api", project: "web" },
+    { id: "b", name: "db", project: "web" },
+    { id: "c", name: "bot", project: "bots" },
+  ];
+  const got = byProject([{ services: [s("a", 10, 100), s("c", 5, 50), s("gone", 99, 99)] }, null, { services: [s("a", 20, 200), s("b", 0, 0), s("b", 1, 10)] }], known);
+  assert.deepEqual(got, [
+    {
+      name: "web",
+      cpu: 31,
+      memory: 310,
+      net_rx: 3,
+      net_tx: 6,
+      services: [
+        { name: "api", cpu: 30, memory: 300, net_rx: 2, net_tx: 4 },
+        { name: "db", cpu: 1, memory: 10, net_rx: 1, net_tx: 2 },
+      ],
+    },
+    { name: "bots", cpu: 5, memory: 50, net_rx: 1, net_tx: 2, services: [{ name: "bot", cpu: 5, memory: 50, net_rx: 1, net_tx: 2 }] },
+  ]);
 });
 
 test("paths match patterns with parameters and optional ones, and nothing longer", () => {

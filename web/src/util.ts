@@ -151,7 +151,37 @@ export function matchServers<S extends Server>(servers: S[], p: { node?: string 
   );
 }
 
-type Sample = { services: { id: string; cpu: number; memory: number; restarts: number }[] } | null;
+type Sample = { services: { id: string; cpu: number; memory: number; restarts: number; net_rx?: number; net_tx?: number }[] } | null;
+
+export type Use = { cpu: number; memory: number; net_rx: number; net_tx: number };
+export type ProjectUse = Use & { name: string; services: (Use & { name: string })[] };
+/**
+ * Services' current usage over several servers' samples, grouped by project. Services missing
+ * from `known` (removed, or not visible) and crash-only entries (no CPU and no memory) are left out.
+ */
+export function byProject(samples: Sample[], known: { id: string; name: string; project: string }[]): ProjectUse[] {
+  const names = new Map(known.map((s) => [s.id, s]));
+  const projects = new Map<string, ProjectUse>();
+  const services = new Map<string, Use & { name: string }>();
+  const add = (a: Use, x: Partial<Use>) => {
+    a.cpu += x.cpu ?? 0;
+    a.memory += x.memory ?? 0;
+    a.net_rx += x.net_rx ?? 0;
+    a.net_tx += x.net_tx ?? 0;
+  };
+  for (const x of samples.flatMap((s) => s?.services ?? [])) {
+    const s = names.get(x.id);
+    if (!s || (!x.cpu && !x.memory)) continue;
+    let p = projects.get(s.project);
+    if (!p) projects.set(s.project, (p = { name: s.project, cpu: 0, memory: 0, net_rx: 0, net_tx: 0, services: [] }));
+    let sv = services.get(x.id);
+    if (!sv) p.services.push((sv = { name: s.name, cpu: 0, memory: 0, net_rx: 0, net_tx: 0 }));
+    services.set(x.id, sv);
+    add(p, x);
+    add(sv, x);
+  }
+  return [...projects.values()];
+}
 /**
  * A service's usage added up over the latest samples of several servers; null when none of them
  * runs it. Crashes are counted once, in the panel's own sample, so adding them up stays right.

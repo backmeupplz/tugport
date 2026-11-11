@@ -26,7 +26,7 @@ import {
 } from "../ui";
 import { ago, bytes, labelsText, requireLabels } from "../util";
 import { PROVIDERS, ServerTabs, machineText, providerOf, useCloud, type Machine, type Pool } from "./cloud";
-import { DockerUsage, ServerCharts, TugportLog } from "./observe";
+import { DockerUsage, ProjectUsage, ServerCharts, TugportLog } from "./observe";
 
 type Nodes = { mesh: boolean; nodes: Node[] };
 
@@ -50,6 +50,8 @@ const STATUS: Record<string, [string, string]> = {
 const status = (n: Node) => STATUS[n.status] ?? [n.status, ""];
 /** Broken swarm mode, as of the server's latest answer (an old answer may be stale). */
 const swarmProblem = (n: Node) => (n.status === "online" ? n.info?.swarm_problem : null);
+/** The server's name in metric queries ("local" is the panel's own). */
+const nodeKey = (n: Node) => (n.local ? "local" : n.id);
 const lastAnswer = (n: Node) => (n.last_seen_at ? ` It last answered ${ago(n.last_seen_at)}.` : "");
 
 const NoAccess = () => (
@@ -118,6 +120,7 @@ export function Servers() {
                 </li>
               ))}
             </ul>
+            <ProjectUsage nodes={d.nodes.filter((n) => n.local || n.status === "online").map(nodeKey)} />
             {d.nodes.length === 1 && (
               <Card title="Add a second server">
                 <div class="space-y-3 text-dim">
@@ -300,6 +303,7 @@ export function ServerPage(props: { id?: string }) {
           </p>
         </Card>
         <ServerCharts node={n.id} />
+        <ProjectUsage nodes={[nodeKey(n)]} />
         {n.local && (
           <div class="grid gap-6 lg:grid-cols-2">
             <DockerUsage />

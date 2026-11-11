@@ -233,7 +233,9 @@ async fn containers(app: &App, prev: &mut HashMap<String, ContainerPrev>) -> Vec
         live.insert(id.clone());
         let Some(cg) = cgroup_dir(&id) else { continue };
         let cpu_usec = read_kv(&cg.join("cpu.stat"), "usage_usec").unwrap_or(0);
-        let mut memory = std::fs::read_to_string(cg.join("memory.current")).ok().and_then(|s| s.trim().parse::<u64>().ok());
+        // Without the reclaimable page cache, like `docker stats`, so file-heavy services do not look huge.
+        let cache = read_kv(&cg.join("memory.stat"), "inactive_file ").unwrap_or(0);
+        let mut memory = std::fs::read_to_string(cg.join("memory.current")).ok().and_then(|s| s.trim().parse::<u64>().ok()).map(|m| m.saturating_sub(cache));
         let mut net = net_bytes(&cg);
         if memory.is_none() || net.is_none() {
             // Nested or restricted cgroups: ask Docker for a one-shot sample instead.

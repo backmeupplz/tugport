@@ -479,7 +479,12 @@ export function ProjectUsage(props: { nodes: string[] }) {
   const cells = (u: { cpu: number; memory: number }) => (
     <>
       <Share label="CPU" value={fmt.pct(u.cpu / cores)} sub={`${(u.cpu / 100).toFixed(2)} cores`} pct={u.cpu / cores} />
-      <Share label="Memory" value={bytes(u.memory)} sub={`${fmt.pct((100 * u.memory) / memory)} of ${bytes(memory)}`} pct={(100 * u.memory) / memory} />
+      {u.memory > 0 ? (
+        <Share label="Memory" value={bytes(u.memory)} sub={`${fmt.pct((100 * u.memory) / memory)} of ${bytes(memory)}`} pct={(100 * u.memory) / memory} />
+      ) : (
+        // Containers' active file cache counts as available on the host, so projects can add up to more than "used".
+        <div class="w-36 shrink-0" />
+      )}
     </>
   );
   const net = (u: Use) => `↓ ${fmt.rate(u.net_rx)} · ↑ ${fmt.rate(u.net_tx)}`;

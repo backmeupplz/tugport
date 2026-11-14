@@ -125,6 +125,7 @@ ${body}
     <nav aria-label="Footer">
       <a href="https://github.com/backmeupplz/tugport">Source code</a>
       <a href="https://github.com/backmeupplz/tugport/releases">Releases</a>
+      <a href="https://blog.tugport.com/">Blog</a>
       <a href="https://github.com/backmeupplz/tugport/issues">Issues</a>
     </nav>
   </div>

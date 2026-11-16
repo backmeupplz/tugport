@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { del, get, patch, post, put, useApi, useMe, useNodes } from "../api";
+import { del, get, patch, post, put, useApi, useMe, useNodes, type Certificate } from "../api";
 import { Icon } from "../icons";
 import {
   Action,
@@ -31,6 +31,7 @@ import {
 } from "../ui";
 import { ago, bytes, cidr, mergePatch, num, qs, sentence, str, when, words } from "../util";
 import { Progress, RunLog, type RunProgress } from "./actions";
+import { CertChip, certError } from "./domains";
 import { PROVIDER_KINDS } from "./new-service";
 
 const TABS: [string, string][] = [
@@ -39,6 +40,7 @@ const TABS: [string, string][] = [
   ["notifications", "Notifications"],
   ["registries", "Registries"],
   ["backups", "Backups"],
+  ["certificates", "Certificates"],
   ["tunnel", "Cloudflare Tunnel"],
   ["requests", "Requests"],
   ["about", "About"],
@@ -61,6 +63,7 @@ export function Settings(props: { tab?: string }) {
             {tab === "notifications" && <Notifications />}
             {tab === "registries" && <Registries />}
             {tab === "backups" && <Backups />}
+            {tab === "certificates" && <Certificates />}
             {tab === "tunnel" && <Tunnel />}
             {tab === "requests" && <Requests />}
             {tab === "about" && <About />}
@@ -997,6 +1000,114 @@ function Runs(props: { job: Job; archived: boolean; onLog: (id: string) => void;
         }
       </Loaded>
     </Modal>
+  );
+}
+
+function Certificates() {
+  const r = useApi<{ dns: { zones: string[] } | null; certificates: Certificate[] }>("/certificates", (e) => e.kind === "certificate");
+  const [replacing, setReplacing] = useState(false);
+  const [token, setToken] = useState("");
+  const s = useSubmit(async () => {
+    const { zones } = await put<{ zones: string[] }>("/certificates/dns", { api_token: token.trim() });
+    setToken("");
+    setReplacing(false);
+    await r.reload();
+    toast(`Token saved. It covers ${zones.join(", ")}.`);
+  });
+  return (
+    <Loaded r={r}>
+      {(d) => (
+        <>
+          <Card title="DNS verification">
+            {d.dns && !replacing ? (
+              <div class="space-y-3">
+                <p class="text-dim">
+                  Names in these Cloudflare zones are proven with a temporary DNS record, so their certificates need no open port, and wildcard domains like
+                  *.example.com work. Other names still use port 80.
+                </p>
+                <div class="flex flex-wrap gap-1.5">
+                  {d.dns.zones.map((z) => (
+                    <span key={z} class="chip font-mono">
+                      {z}
+                    </span>
+                  ))}
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <button type="button" class="btn" onClick={() => setReplacing(true)}>
+                    Replace token
+                  </button>
+                  <Action
+                    class="btn btn-danger"
+                    confirm="Remove the Cloudflare token? Certificates renew over port 80 from then on, and wildcard certificates stop renewing."
+                    run={() => del("/certificates/dns").then(r.reload)}
+                  >
+                    Remove
+                  </Action>
+                </div>
+              </div>
+            ) : (
+              <form class="space-y-4" onSubmit={s.submit}>
+                <p class="text-dim">
+                  Let's Encrypt normally checks a domain by fetching a file from it on port 80. With a Cloudflare API token, Tugport proves names in your Cloudflare zones
+                  with a temporary DNS record instead. That works for servers nobody can reach from the internet, and it is the only way to get wildcard certificates.
+                </p>
+                <Input
+                  label="Cloudflare API token"
+                  hint={
+                    <>
+                      Create one at{" "}
+                      <a class="link" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer">
+                        dash.cloudflare.com
+                      </a>{" "}
+                      from the "Edit zone DNS" template, with Zone → Zone → Read and Zone → DNS → Edit on your domains. The tunnel's token works too.
+                    </>
+                  }
+                  class="font-mono"
+                  type="password"
+                  required
+                  autoComplete="off"
+                  value={token}
+                  onInput={(e) => setToken(e.currentTarget.value)}
+                />
+                <ErrorBox error={s.error} />
+                <div class="flex flex-wrap gap-2">
+                  <button class="btn btn-primary" disabled={s.busy}>
+                    Save token
+                  </button>
+                  {replacing && (
+                    <button type="button" class="btn" onClick={() => setReplacing(false)}>
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </form>
+            )}
+          </Card>
+          <Card title="Certificates" pad={false}>
+            <Rows items={d.certificates} empty="No certificates yet. Each HTTPS domain gets one a few seconds after you add it.">
+              {(c) => (
+                <li key={c.host} class="flex flex-wrap items-center gap-2 px-4 py-3">
+                  <div class="min-w-0 flex-1">
+                    <p class="break-all font-mono font-medium">{c.host}</p>
+                    <div class="mt-1 flex flex-wrap gap-1.5 text-xs">
+                      <CertChip c={c} />
+                    </div>
+                    {c.last_error && (
+                      <p class="mt-1.5 break-words text-xs text-bad">{certError(c)}</p>
+                    )}
+                  </div>
+                  {c.last_error && (
+                    <Action class="btn btn-sm" done="Trying again within a minute." run={() => post("/certificates/retry", { host: c.host }).then(r.reload)}>
+                      Try now
+                    </Action>
+                  )}
+                </li>
+              )}
+            </Rows>
+          </Card>
+        </>
+      )}
+    </Loaded>
   );
 }
 

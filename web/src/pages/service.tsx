@@ -112,7 +112,8 @@ export function ServicePage(props: { project?: string; service?: string; tab?: s
   const base = `/projects/${s.project}/${s.name}`;
   const c: Ctx = { d, reload: r.reload, openLog: setLogId, nodes };
   const label = (x: Replica) => (x.compose_service ?? x.name) + (multiServer(c) ? ` on ${nodeName(nodes, x.node)}` : "");
-  const site = d.domains[0];
+  // A wildcard is no address to open, so link the first real name.
+  const site = d.domains.find((x) => !x.host.startsWith("*."));
   return (
     <Page
       title={s.name}

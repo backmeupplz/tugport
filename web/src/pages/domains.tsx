@@ -1,9 +1,9 @@
 import type { ComponentChildren } from "preact";
-import { useState } from "preact/hooks";
-import { atLeast, del, patch, post, type Domain } from "../api";
+import { useEffect, useState } from "preact/hooks";
+import { atLeast, del, patch, post, useApi, useMe, type Certificate, type Domain } from "../api";
 import { Icon } from "../icons";
-import { Action, Card, Check, Empty, Field, FormButtons, IconButton, Input, Modal, Select, TextArea, useForm, useSubmit } from "../ui";
-import { lines, num, patchAt, removeAt, str } from "../util";
+import { Action, Card, Check, Empty, Field, FormButtons, IconButton, Input, Modal, Note, Select, TextArea, useForm, useSubmit } from "../ui";
+import { ago, lines, num, patchAt, qs, removeAt, str } from "../util";
 import type { Ctx } from "./service";
 
 interface Form {
@@ -112,10 +112,18 @@ export function Domains({ c }: { c: Ctx }) {
             return (
               <li key={d.id} class="flex flex-wrap items-center gap-2 px-3 py-2.5">
                 <div class="min-w-0 flex-1">
-                  <a class="link break-all font-medium" href={url} target="_blank" rel="noreferrer">
-                    {d.host}
-                    {d.path === "/" ? "" : d.path}
-                  </a>
+                  {d.host.startsWith("*.") ? (
+                    <span class="break-all font-medium">
+                      {d.host}
+                      {d.path === "/" ? "" : d.path}
+                      <span class="ml-2 text-xs font-normal text-muted">every name one level under {d.host.slice(2)}</span>
+                    </span>
+                  ) : (
+                    <a class="link break-all font-medium" href={url} target="_blank" rel="noreferrer">
+                      {d.host}
+                      {d.path === "/" ? "" : d.path}
+                    </a>
+                  )}
                   <div class="mt-1 flex flex-wrap gap-1.5 text-xs">
                     <span class="chip">
                       port {d.port}
@@ -127,7 +135,11 @@ export function Domains({ c }: { c: Ctx }) {
                     {o.basic_auth?.length > 0 && <span class="chip">basic auth</span>}
                     {o.forward_auth && <span class="chip">forward auth</span>}
                     {o.maintenance != null && <span class="chip text-warn">maintenance page</span>}
+                    {d.https && !d.via_tunnel && <CertChip c={d.certificate} />}
                   </div>
+                  {d.https && !d.via_tunnel && d.certificate?.last_error && (
+                    <p class="mt-1.5 break-words text-xs text-bad">{certError(d.certificate)}</p>
+                  )}
                 </div>
                 {canEdit && (
                   <span class="flex gap-2">
@@ -149,6 +161,120 @@ export function Domains({ c }: { c: Ctx }) {
       )}
       {edit && <DomainForm c={c} id={edit.id} init={edit.f} onClose={() => setEdit(null)} />}
     </Card>
+  );
+}
+
+/** A failed certificate's reason, as a sentence, and when Tugport tries again. */
+export function certError(c: Certificate): string {
+  const reason = /[.!?]$/.test(c.last_error ?? "") ? c.last_error : `${c.last_error}.`;
+  return c.next_attempt_at ? `${reason} Tugport tries again ${ago(c.next_attempt_at)}.` : (reason ?? "");
+}
+
+/** Where a domain's certificate stands: issued (and how it was proven), failing or on its way. */
+export function CertChip(props: { c?: Certificate | null }) {
+  const c = props.c;
+  if (c?.issued) {
+    const how = c.source === "acme-dns" ? " via DNS" : c.source === "imported" ? " (imported)" : "";
+    const soon = c.not_after != null && c.not_after - Date.now() / 1000 < 14 * 86400;
+    return <span class={`chip ${soon ? "text-warn" : ""}`}>{`certificate${how}, expires ${ago(c.not_after)}`}</span>;
+  }
+  if (c?.last_error) return <span class="chip text-bad">certificate failed</span>;
+  return <span class="chip text-warn">certificate pending</span>;
+}
+
+interface HostRoute {
+  domain_id: string;
+  host: string;
+  path: string;
+  service_id: string | null;
+  service: string | null;
+  project: string | null;
+}
+
+/**
+ * What the typed name means before it is saved: what a wildcard catches, whether its certificate
+ * can be issued, and which other routes share the name (the longest path wins).
+ */
+function HostInfo(props: { id?: string; host: string; path: string; https: boolean; tunnel: boolean }) {
+  const owner = useMe().principal.is_owner;
+  const [host, setHost] = useState(props.host.trim().toLowerCase());
+  useEffect(() => {
+    const t = setTimeout(() => setHost(props.host.trim().toLowerCase()), 300);
+    return () => clearTimeout(t);
+  }, [props.host]);
+  const r = useApi<{ routes: HostRoute[]; dns_certificates: boolean }>(host.includes(".") ? `/hosts${qs({ host })}` : null);
+  const wildcard = host.startsWith("*.");
+  const base = host.slice(2);
+  const others = (r.data?.routes ?? []).filter((x) => x.domain_id !== props.id);
+  const same = others.filter((x) => x.host === host);
+  const covering = others.filter((x) => x.host !== host && x.host.startsWith("*."));
+  const under = others.filter((x) => x.host !== host && !x.host.startsWith("*."));
+  const path = props.path.trim() || "/";
+  const target = (x: HostRoute) =>
+    x.service ? (
+      <a class="link" href={`/projects/${x.project}/${x.service}/domains`}>
+        {x.service}
+        <span class="text-muted"> in {x.project}</span>
+      </a>
+    ) : (
+      <span class="text-muted">a service in another project</span>
+    );
+  const route = (x: HostRoute) => (
+    <li key={x.domain_id} class="flex flex-wrap gap-x-2">
+      <span class="font-mono">
+        {x.host}
+        {x.path}
+      </span>
+      <span class="text-muted">→</span>
+      {target(x)}
+    </li>
+  );
+  return (
+    <>
+      {wildcard && (
+        <Note>
+          This catches every name one level under <span class="font-mono">{base}</span>, like <span class="font-mono">shop.{base}</span>, that has no domain of its own.
+          Names you add separately, here or in other services, keep their own routes.
+        </Note>
+      )}
+      {wildcard && props.tunnel && <Note tone="bad">Wildcards can't go through the Cloudflare Tunnel; add each name instead.</Note>}
+      {wildcard && props.https && r.data && !r.data.dns_certificates && (
+        <Note tone="warn">
+          A wildcard certificate is proven with a DNS record, so it needs a Cloudflare API token.{" "}
+          {owner ? (
+            <a class="link" href="/settings/certificates">
+              Add one in Settings → Certificates
+            </a>
+          ) : (
+            "Ask the owner to add one in Settings → Certificates"
+          )}
+          , or turn HTTPS off.
+        </Note>
+      )}
+      {same.length > 0 && (
+        <Note tone={same.some((x) => x.path === path) ? "bad" : "info"}>
+          <p class="mb-1">
+            {same.some((x) => x.path === path) ? `${host}${path} is already taken. ` : ""}
+            Other routes on this name:
+          </p>
+          <ul class="space-y-0.5">{same.map(route)}</ul>
+          <p class="mt-1 text-xs text-muted">
+            Each request goes to the route with the longest path that matches it, WebSocket upgrades included. The app sees the full path unless you strip the prefix
+            below.
+          </p>
+        </Note>
+      )}
+      {covering.length > 0 && (
+        <Note>
+          This name takes over from the wildcard: <ul class="mt-1 space-y-0.5">{covering.map(route)}</ul>
+        </Note>
+      )}
+      {wildcard && under.length > 0 && (
+        <Note>
+          These names have their own routes and stay with them: <ul class="mt-1 space-y-0.5">{under.map(route)}</ul>
+        </Note>
+      )}
+    </>
   );
 }
 
@@ -183,8 +309,15 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
     <Modal open onClose={props.onClose} title={props.id ? `Edit ${props.init.host}` : "Add domain"} wide>
       <form class="space-y-4" onSubmit={s.submit}>
         <div class="grid gap-4 sm:grid-cols-[1fr_8rem_8rem]">
-          <Input label="Domain" mono required autoFocus={!props.id} placeholder="app.example.com" autoComplete="off" {...bind("host")} />
-          <Input label="Path" class="font-mono" required pattern="/.*" {...bind("path")} />
+          <Input label="Domain" mono required autoFocus={!props.id} placeholder="app.example.com or *.example.com" autoComplete="off" {...bind("host")} />
+          <Input
+            label="Path"
+            info="Requests under this path come to this service. Other services, even in other projects, can take other paths on the same name; the longest matching path wins."
+            class="font-mono"
+            required
+            pattern="/.*"
+            {...bind("path")}
+          />
           <Input label="Container port" class="font-mono" required type="number" min={1} max={65535} placeholder="3000" {...bind("port")} />
           {(props.c.d.exposed_ports?.length ?? 0) > 0 && (
             <p class="-mt-2 text-xs text-muted sm:col-span-3">
@@ -192,12 +325,18 @@ function DomainForm(props: { c: Ctx; id?: string; init: Form; onClose: () => voi
             </p>
           )}
         </div>
+        <HostInfo id={props.id} host={f.host} path={f.path} https={f.https} tunnel={f.via_tunnel} />
         {isCompose && (
           <Field label="Compose service" hint="Pick the container in the stack that receives this domain's traffic.">
             <Select value={f.container} onChange={(container) => set({ container })} options={[["", "Choose…"], ...composeServices.map((n): [string, string] => [n, n])]} />
           </Field>
         )}
-        <Check checked={f.https} onChange={(https) => set({ https })} label="HTTPS" hint="The domain gets a Let's Encrypt certificate, and plain HTTP redirects to HTTPS." />
+        <Check
+          checked={f.https}
+          onChange={(https) => set({ https })}
+          label="HTTPS"
+          hint="The domain gets a Let's Encrypt certificate, and plain HTTP redirects to HTTPS. With a Cloudflare token in Settings → Certificates, names in your Cloudflare zones are proven over DNS, so port 80 can stay closed."
+        />
         <Check
           checked={f.via_tunnel}
           onChange={(via_tunnel) => set({ via_tunnel })}

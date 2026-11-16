@@ -18,7 +18,7 @@ The installer sets up Docker if it is missing, starts Tugport as a system servic
 ## What it does
 
 - **Deploys on push** from GitHub, Forgejo, Gitea, GitLab or any Git server with a deploy key, built with your Dockerfile, Railpack, Nixpacks or buildpacks. A new version gets traffic only after its health check passes, and rolling back takes one click.
-- **Apps, Compose stacks and databases** (Postgres, MySQL, MariaDB, MongoDB, Redis) with domains, automatic HTTPS, environment, volumes and limits.
+- **Apps, Compose stacks and databases** (Postgres, MySQL, MariaDB, MongoDB, Redis) with domains, automatic HTTPS, environment, volumes and limits. Certificates are proven over port 80 or, with a Cloudflare token, over DNS (wildcards included), and one domain can send different paths to services in different projects.
 - **Logs and charts** for every server and service, with alerts to Telegram, email or a webhook.
 - **AI agents as users:** an agent gets a scoped API key in one step, works through the API, the CLI or the MCP endpoint with the same permissions, and every action lands in the audit log.
 - **Secrets that stay secret:** encrypted at rest, delivered only to the containers that use them, and masked everywhere else.

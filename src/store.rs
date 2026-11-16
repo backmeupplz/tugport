@@ -211,6 +211,17 @@ pub fn domain(app: &App, id: &str) -> Result<Option<Domain>> {
     Ok(app.db.row(&format!("{DOMAIN_SELECT} WHERE id = ?1"), [id], domain_row)?)
 }
 
+/// A service domain: a host name, or a wildcard (`*.example.com`) for one level of subdomains.
+pub fn valid_domain_host(host: &str) -> bool {
+    valid_host(host.strip_prefix("*.").unwrap_or(host))
+}
+
+/// The wildcard that covers `host` (`a.example.com` -> `*.example.com`), if any.
+pub fn wildcard_for(host: &str) -> Option<String> {
+    let (_, parent) = host.split_once('.')?;
+    (parent.contains('.') && !host.starts_with("*.")).then(|| format!("*.{parent}"))
+}
+
 pub fn valid_host(host: &str) -> bool {
     let h = host.trim_end_matches('.');
     !h.is_empty()
@@ -236,6 +247,11 @@ mod tests {
         assert!(!valid_host("localhost"));
         assert!(!valid_host("bad_host.com"));
         assert!(!valid_host("-a.com"));
+        assert!(valid_domain_host("*.example.com") && !valid_host("*.example.com"));
+        assert!(!valid_domain_host("*.com") && !valid_domain_host("a.*.example.com") && !valid_domain_host("*"));
+        assert_eq!(wildcard_for("a.example.com").as_deref(), Some("*.example.com"));
+        assert_eq!(wildcard_for("example.com"), None);
+        assert_eq!(wildcard_for("*.example.com"), None);
     }
 
     #[test]

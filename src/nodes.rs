@@ -541,7 +541,7 @@ pub async fn push_certs(app: &App) {
     let panel = app.settings().panel_domain;
     let certs: Vec<Value> = rows
         .into_iter()
-        .filter(|(host, _, _)| panel.as_deref().is_none_or(|p| !p.eq_ignore_ascii_case(host)))
+        .filter(|(host, _, _)| panel.as_deref().is_none_or(|p| !p.eq_ignore_ascii_case(host) && crate::store::wildcard_for(p).as_deref() != Some(host)))
         .filter_map(|(host, cert, key)| {
             let key = app.keys.open_str(&crate::acme::key_context(&host), &key).ok()?;
             Some(json!({ "host": host, "cert": cert, "key": key.as_str() }))

@@ -9,7 +9,7 @@ use crate::model::{Build, DatabaseSpec, DomainOptions, Engine, Health, Mount, Se
 use crate::store::{self, Domain, Service};
 use crate::util;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use rusqlite::params;
 use serde::Deserialize;
@@ -424,7 +424,7 @@ async fn prepare_database(p: &store::Project, name: &str, mut db: DatabaseSpec, 
 pub async fn get_service(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Viewer)?;
     let status = crate::runtime::service_status(&app, &s).await;
-    let domains = store::domains(&app, Some(&s.id))?;
+    let domains = with_certificates(&app, store::domains(&app, Some(&s.id))?)?;
     let env = store::env_names(&app, &s.id)?;
     let files: Vec<String> = store::files(&app, &s.id)?.into_iter().map(|(t, _)| t).collect();
     let last = crate::deploy::recent(&app, &s.id, 1)?.into_iter().next();
@@ -546,7 +546,19 @@ pub struct DomainBody {
 
 pub async fn list_domains(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Viewer)?;
-    Ok(Json(json!({ "domains": store::domains(&app, Some(&s.id))? })))
+    Ok(Json(json!({ "domains": with_certificates(&app, store::domains(&app, Some(&s.id))?)? })))
+}
+
+/// Domains with the state of their certificate (null for HTTP-only and tunnel domains).
+fn with_certificates(app: &AppState, domains: Vec<Domain>) -> ApiResult<Vec<Value>> {
+    let mut out = vec![];
+    for d in domains {
+        let cert = if d.https && !d.via_tunnel { crate::acme::status(app, &d.host)? } else { None };
+        let mut v = serde_json::to_value(&d)?;
+        v["certificate"] = cert.unwrap_or(Value::Null);
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// New basic-auth passwords become Argon2 hashes; users sent without one keep theirs.
@@ -573,9 +585,31 @@ fn check_tunnel(a: &Auth, before: bool, after: bool) -> ApiResult<()> {
     Ok(())
 }
 
-fn check_domain(app: &AppState, project_id: &str, host: &str, path: &str, port: u16, opts: &DomainOptions) -> ApiResult<()> {
-    if !store::valid_host(host) {
+pub struct DomainCheck<'a> {
+    /// The domain being edited, if it exists.
+    id: Option<&'a str>,
+    host: &'a str,
+    path: &'a str,
+    port: u16,
+    https: bool,
+    via_tunnel: bool,
+    opts: &'a DomainOptions,
+}
+
+fn check_domain(app: &AppState, a: &Auth, project_id: &str, d: DomainCheck) -> ApiResult<()> {
+    let DomainCheck { id, host, path, port, https, via_tunnel, opts } = d;
+    if !store::valid_domain_host(host) {
         return Err(ApiError::bad_request(format!("{host} is not a valid domain")));
+    }
+    if host.starts_with("*.") {
+        if via_tunnel {
+            return Err(ApiError::bad_request("wildcard domains can't go through the Cloudflare Tunnel; add each name instead"));
+        }
+        if https && crate::acme::dns_token(app)?.is_none() {
+            return Err(ApiError::bad_request(
+                "a wildcard certificate needs DNS verification: the owner adds a Cloudflare API token in Settings > Certificates first (or turn HTTPS off)",
+            ));
+        }
     }
     if !path.starts_with('/') {
         return Err(ApiError::bad_request("paths start with /"));
@@ -594,20 +628,77 @@ fn check_domain(app: &AppState, project_id: &str, host: &str, path: &str, port: 
     {
         return Err(ApiError::bad_request("the forward auth address is an http:// or https:// URL"));
     }
-    // A host belongs to one project, and the panel's own domain to Tugport: otherwise a route on
-    // it (a longer path, say) would take another project's or the panel's requests and cookies.
+    // The panel's own domain belongs to Tugport: a route there (a longer path, say) would take the
+    // panel's requests and session cookie.
     if app.settings().panel_domain.is_some_and(|d| d.eq_ignore_ascii_case(host)) {
         return Err(ApiError::forbidden(format!("{host} is the panel's own domain")));
     }
-    let taken: bool = app.db.conn().query_row(
-        "SELECT COUNT(*) > 0 FROM domains d JOIN services s ON s.id = d.service_id WHERE d.host = ?1 AND s.project_id != ?2",
-        params![host, project_id],
-        |r| r.get(0),
-    )?;
-    if taken {
-        return Err(ApiError::conflict(format!("{host} is already used by another project")));
+    let wild = store::wildcard_for(host);
+    for r in routes_near(app, host)?.into_iter().filter(|r| id != Some(r.domain_id.as_str())) {
+        let visible = a.0.role_in(&r.project_id).is_some();
+        if r.host == host && r.path == path {
+            let to = if visible { format!("{} in {}", r.service, r.project) } else { "a service in another project".into() };
+            return Err(ApiError::conflict(format!("{host}{path} already goes to {to}")));
+        }
+        // Sharing a name with another project lets each take some of the other's requests (a
+        // longer path, a subdomain under a wildcard) and see its cookies, so whoever does it must
+        // be able to operate both.
+        let overlaps = r.host == host || wild.as_deref() == Some(r.host.as_str()) || store::wildcard_for(&r.host).as_deref() == Some(host);
+        if overlaps && r.project_id != project_id && !a.0.can(&r.project_id, Role::Operator) {
+            let whose = if visible { format!("the {} project", r.project) } else { "another project".into() };
+            return Err(ApiError::forbidden(format!("{} is used by {whose}; sharing it takes someone who can operate both projects", r.host)));
+        }
     }
     Ok(())
+}
+
+/// A route on a host, its wildcard, or (for a wildcard) the names under it.
+struct NearRoute {
+    domain_id: String,
+    host: String,
+    path: String,
+    service_id: String,
+    service: String,
+    project_id: String,
+    project: String,
+}
+
+fn routes_near(app: &AppState, host: &str) -> ApiResult<Vec<NearRoute>> {
+    let wild = store::wildcard_for(host).unwrap_or_default();
+    let under = host.strip_prefix('*').map(|suffix| format!("%{suffix}")).unwrap_or_default();
+    let rows = app.db.rows(
+        "SELECT d.id, d.host, d.path, s.id, s.name, p.id, p.name FROM domains d JOIN services s ON s.id = d.service_id JOIN projects p ON p.id = s.project_id
+         WHERE d.host = ?1 OR d.host = ?2 OR d.host LIKE ?3 ORDER BY d.host, length(d.path) DESC",
+        params![host, wild, under],
+        |r| Ok(NearRoute { domain_id: r.get(0)?, host: r.get(1)?, path: r.get(2)?, service_id: r.get(3)?, service: r.get(4)?, project_id: r.get(5)?, project: r.get(6)? }),
+    )?;
+    // LIKE also matches deeper names (a.b.example.com), which a wildcard does not cover.
+    Ok(rows.into_iter().filter(|r| r.host == host || r.host == wild || store::wildcard_for(&r.host).as_deref() == Some(host)).collect())
+}
+
+#[derive(Deserialize)]
+pub struct HostQuery {
+    host: String,
+}
+
+/// What already routes on a host (and its wildcard), for the domain form: names of projects and
+/// services the caller can't view stay hidden.
+pub async fn host_routes(State(app): State<AppState>, a: Auth, Query(q): Query<HostQuery>) -> ApiResult<Json<Value>> {
+    let host = q.host.trim().to_lowercase();
+    if !store::valid_domain_host(&host) {
+        return Ok(Json(json!({ "routes": [], "dns_certificates": crate::acme::dns_token(&app)?.is_some() })));
+    }
+    let routes: Vec<Value> = routes_near(&app, &host)?
+        .into_iter()
+        .map(|r| {
+            let visible = a.0.role_in(&r.project_id).is_some();
+            json!({
+                "domain_id": r.domain_id, "host": r.host, "path": r.path,
+                "service_id": visible.then_some(r.service_id), "service": visible.then_some(r.service), "project": visible.then_some(r.project),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "routes": routes, "dns_certificates": crate::acme::dns_token(&app)?.is_some() })))
 }
 
 /// A domain and its service, which the caller must operate.
@@ -629,14 +720,17 @@ pub async fn create_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
     let path = b.path.unwrap_or_else(|| "/".into());
     let port = b.port.or_else(|| s.spec.database.as_ref().map(|d| databases::preset(d.engine).port)).unwrap_or(0);
     let via_tunnel = b.via_tunnel.unwrap_or(false);
+    let https = b.https.unwrap_or(true);
     let opts = hash_basic_auth(b.options.unwrap_or_default(), None).await?;
-    check_domain(&app, &s.project_id, &host, &path, port, &opts)?;
+    check_domain(&app, &a, &s.project_id, DomainCheck { id: None, host: &host, path: &path, port, https, via_tunnel, opts: &opts })?;
     check_tunnel(&a, false, via_tunnel)?;
     let did = util::id();
     app.db.exec(
         "INSERT INTO domains (id, service_id, host, path, port, container, https, via_tunnel, options, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![did, s.id, host, path, port, b.container.flatten(), b.https.unwrap_or(true), via_tunnel, serde_json::to_string(&opts)?, util::now()],
+        params![did, s.id, host, path, port, b.container.flatten(), https, via_tunnel, serde_json::to_string(&opts)?, util::now()],
     )?;
+    // A name that failed before (DNS not pointed yet, say) gets a fresh attempt now.
+    crate::acme::retry(&app, Some(&host))?;
     domains_changed(&app, &a, "domain.create", &s, &host);
     Ok(Json(json!({ "domain": store::domain(&app, &did)? })))
 }
@@ -651,12 +745,14 @@ pub async fn update_domain(State(app): State<AppState>, a: Auth, Path(id): Path<
         Some(o) => hash_basic_auth(o, Some(&d.options)).await?,
         None => d.options,
     };
-    check_domain(&app, &s.project_id, &host, &path, port, &opts)?;
+    let https = b.https.unwrap_or(d.https);
+    check_domain(&app, &a, &s.project_id, DomainCheck { id: Some(&id), host: &host, path: &path, port, https, via_tunnel, opts: &opts })?;
     check_tunnel(&a, d.via_tunnel, via_tunnel)?;
     app.db.exec(
         "UPDATE domains SET host = ?1, path = ?2, port = ?3, container = ?4, https = ?5, via_tunnel = ?6, options = ?7 WHERE id = ?8",
-        params![host, path, port, b.container.unwrap_or(d.container), b.https.unwrap_or(d.https), via_tunnel, serde_json::to_string(&opts)?, id],
+        params![host, path, port, b.container.unwrap_or(d.container), https, via_tunnel, serde_json::to_string(&opts)?, id],
     )?;
+    crate::acme::retry(&app, Some(&host))?;
     domains_changed(&app, &a, "domain.update", &s, &host);
     Ok(Json(json!({ "domain": store::domain(&app, &id)? })))
 }

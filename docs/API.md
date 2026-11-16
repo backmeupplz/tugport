@@ -122,8 +122,9 @@ Every field has a default. See `src/model.rs`.
 | GET | `/api/services/{id}/env` | `{env: [names] or {NAME: value}, project_vars: [names], values_visible}` |
 | PUT | `/api/services/{id}/env` | `{NAME: "value" \| null}`. Writing never needs `secrets:read`. |
 | GET / PUT | `/api/services/{id}/files` | PUT takes `{target: "/etc/app.conf", content \| null}` |
-| GET / POST | `/api/services/{id}/domains` | POST takes `{host, path?, port, container?, https?, via_tunnel?, options?}`. A host belongs to one project, the panel's own domain to the panel, and turning on `via_tunnel` (which writes DNS records in the owner's Cloudflare account) needs the owner. |
+| GET / POST | `/api/services/{id}/domains` | POST takes `{host, path?, port, container?, https?, via_tunnel?, options?}`. Each domain in the list carries `certificate`: `{issued, not_after, source, last_error, next_attempt_at}` or null. See [Domains and routing](#domains-and-routing). The panel's own domain belongs to the panel, and turning on `via_tunnel` (which writes DNS records in the owner's Cloudflare account) needs the owner. |
 | PATCH / DELETE | `/api/domains/{id}` | PATCH takes the same fields; `container: null` clears a Compose container target. |
+| GET | `/api/hosts?host=app.example.com` | `{routes: [{domain_id, host, path, service_id, service, project}], dns_certificates}`: what already routes on that name and on the wildcard covering it (or, for a wildcard, on the names under it), longest path first. `service_id`, `service` and `project` are null for projects the caller can't view. |
 | GET | `/api/services/{id}/hook` | The deploy webhook URL `{url}`. Needs `operator` and `secrets:read`. |
 | POST | `/api/services/{id}/hook` | Issues a new deploy webhook URL `{url}`; the old one stops working. Databases have none. |
 | GET | `/api/services/{id}/replicas` | Databases: `{replicas: [{id, name, state, nodes, replication}]}`. `replication` is `copying`, `following` or `failed: <reason>`. |
@@ -310,6 +311,25 @@ The `config` for each kind:
 A run's `status` is `running`, `ok` or `failed`. While it runs, `progress` is restic's latest report, `{percent, bytes_done, total_bytes, files_done, total_files, seconds_remaining}` (null before the first one and once it ends; a database dump has no `total_bytes` up front, so it stays 0). A run's log keeps its steps (dumping, uploading, applying retention, stopping and starting containers), a progress line a minute, and restic's warnings and errors; it stays readable after the run, up to its first 2000 lines. Service jobs need a role on the project to read, other jobs the owner.
 
 `storage_class` is where S3 targets keep backup data: `STANDARD` (the default), `STANDARD_IA`, `GLACIER_IR` or `DEEP_ARCHIVE`. Standard-IA and Glacier Instant Retrieval are cheaper to store, read instantly and bill each file for at least 30 and 90 days. Deep Archive is the cheapest: restic puts only file data there and keeps its config, index, snapshots and folder trees in Standard, so backups and retention never read archived data. A restore first has S3 thaw the data (it waits up to 48 hours, and the key needs `s3:RestoreObject`), a test restore checks only the index and folder trees (a full test thaws and restores the data too, for a retrieval fee), and every file is billed for at least 180 days. Set the class here instead of using a bucket lifecycle rule: a rule would also archive the files that backups read and break them.
+
+## Domains and routing
+
+A domain is a name plus a path prefix (`/` by default). A request goes to the route with the longest prefix that matches its path on a segment boundary (`/api` matches `/api` and `/api/x`, not `/apix`), and WebSocket upgrades and gRPC follow the same route. The service sees the full original path unless `options.strip_prefix` is set; `options.rewrite` then rewrites what is left.
+
+Services in different projects can share a name, each on its own path: `app.example.com/` in one project and `app.example.com/api/speech` in another. Because each can then take some of the other's requests and see its cookies, adding a domain on a name (or under a wildcard) that another project uses needs `operator` on that project too (the owner always has it). The same name and path can't be used twice.
+
+A host can be a wildcard for one level of subdomains: `*.example.com` catches `shop.example.com` but not `example.com` or `a.b.example.com`. A name with domains of its own never falls through to the wildcard, even for paths it has no route for. A wildcard with HTTPS needs the DNS token below, and it can't go through the Cloudflare Tunnel.
+
+## Certificates
+
+Every HTTPS domain gets a Let's Encrypt certificate, renewed 30 days before it expires. By default Let's Encrypt checks a name over port 80. With a Cloudflare API token saved here, names in that token's zones are proven with a temporary TXT record at `_acme-challenge.<name>` instead, so the server needs no open port; Tugport creates its own record and deletes it by id afterwards, leaving any other client's records alone. Wildcard certificates always use this. Failed attempts back off from 5 minutes to a day; adding or editing a domain, saving the token, or the retry call starts over right away.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/certificates` | Owner. `{dns: {zones} \| null, certificates: [{host, issued, not_after, source, last_error, next_attempt_at}]}`. `source` is `acme` (port 80), `acme-dns` or `imported`. |
+| PUT | `/api/certificates/dns` | Owner. `{api_token}`: a Cloudflare token with Zone > Zone > Read and Zone > DNS > Edit (the tunnel's token works too). Checked by listing its zones, then stored sealed. Returns `{zones}`. |
+| DELETE | `/api/certificates/dns` | Owner. Forgets the token; certificates go back to port 80, and wildcards stop renewing. |
+| POST | `/api/certificates/retry` | Owner. `{host?}`: tries a failed certificate (or every one) on the next round, within 30 seconds. |
 
 ## Cloudflare Tunnel
 

@@ -164,7 +164,13 @@ fn compile(table: &Table, me: &str) -> Routes {
 
 impl Routes {
     fn find(&self, host: &str, path: &str) -> Option<Arc<Route>> {
-        self.hosts.get(host)?.iter().find(|r| path_under(path, &r.path)).cloned()
+        // A host with routes of its own never falls through to a wildcard, so its other paths
+        // (a private panel's, say) stay unanswered rather than reach the wildcard's service.
+        let routes = match self.hosts.get(host) {
+            Some(r) => r,
+            None => self.hosts.get(&store::wildcard_for(host)?)?,
+        };
+        routes.iter().find(|r| path_under(path, &r.path)).cloned()
     }
 }
 
@@ -268,6 +274,11 @@ impl Proxy {
     pub fn has_cert(&self, host: &str) -> bool {
         crate::util::read(&self.certs).contains_key(host)
     }
+
+    /// Whether HTTPS works for `host`: its own certificate or its wildcard's.
+    fn serves_https(&self, host: &str) -> bool {
+        self.has_cert(host) || store::wildcard_for(host).is_some_and(|w| self.has_cert(&w))
+    }
 }
 
 impl std::fmt::Debug for Proxy {
@@ -288,7 +299,8 @@ impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let p = &self.0.proxy;
         let certs = crate::util::read(&p.certs);
-        hello.server_name().and_then(|n| certs.get(&n.to_ascii_lowercase()).cloned()).or_else(|| Some(p.fallback.clone()))
+        let name = hello.server_name().map(|n| n.to_ascii_lowercase()).unwrap_or_default();
+        certs.get(&name).or_else(|| certs.get(&store::wildcard_for(&name)?)).cloned().or_else(|| Some(p.fallback.clone()))
     }
 }
 
@@ -616,7 +628,7 @@ async fn handle(app: AppState, mut req: Request<Incoming>, peer: SocketAddr, tls
     let scheme = if tls || forwarded_https { "https" } else { "http" };
     let path_and_query = req.uri().path_and_query().map_or("/", |p| p.as_str());
 
-    if route.https && scheme == "http" && !route.via_tunnel && app.proxy.has_cert(&host) {
+    if route.https && scheme == "http" && !route.via_tunnel && app.proxy.serves_https(&host) {
         return redirect(StatusCode::PERMANENT_REDIRECT, &format!("https://{host}{path_and_query}"));
     }
     if let Some(html) = &route.options.maintenance {
@@ -994,6 +1006,27 @@ mod tests {
         asleep.routes[0].asleep = true;
         assert_eq!(compile(&asleep, "n1").hosts["a.test"][0].upstreams, vec![Upstream::Node(addr("10.99.0.1:80"))]);
         assert!(compile(&asleep, "local").hosts["a.test"][0].upstreams.is_empty());
+    }
+
+    #[test]
+    fn exact_hosts_win_over_wildcards() {
+        let spec = |host: &str, path: &str, sid: &str| RouteSpec {
+            host: host.into(), path: path.into(), service_id: Some(sid.into()), project_id: None,
+            https: true, via_tunnel: false, options: DomainOptions::default(), targets: vec![], asleep: false, port: 80,
+        };
+        let table = Table {
+            routes: vec![spec("*.example.com", "/", "wild"), spec("panel.example.com", "/api/hooks", "panel"), spec("app.example.com", "/", "app"), spec("app.example.com", "/api/speech", "speech")],
+            ..Default::default()
+        };
+        let routes = compile(&table, "local");
+        let to = |host: &str, path: &str| routes.find(host, path).and_then(|r| r.service_id.clone());
+        assert_eq!(to("shop.example.com", "/x").as_deref(), Some("wild"));
+        assert_eq!(to("app.example.com", "/").as_deref(), Some("app"));
+        assert_eq!(to("app.example.com", "/api/speech/ws").as_deref(), Some("speech"));
+        assert_eq!(to("panel.example.com", "/api/hooks/x").as_deref(), Some("panel"));
+        assert_eq!(to("panel.example.com", "/login"), None, "a host with its own routes never falls through");
+        assert_eq!(to("a.b.example.com", "/"), None, "a wildcard covers one level");
+        assert_eq!(to("example.com", "/"), None);
     }
 
     #[test]

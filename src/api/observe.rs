@@ -319,6 +319,44 @@ pub async fn tunnel_disconnect(State(app): State<AppState>, Owner(a): Owner) -> 
     Ok(ok())
 }
 
+/// Every certificate Tugport manages, and whether domains are proven over DNS.
+pub async fn certificates(State(app): State<AppState>, _: Owner) -> ApiResult<Json<Value>> {
+    let certs = app.db.rows(
+        "SELECT host, cert_pem IS NOT NULL, not_after, source, last_error, next_attempt_at FROM certificates ORDER BY host",
+        [],
+        |r| {
+            Ok(json!({
+                "host": r.get::<_, String>(0)?, "issued": r.get::<_, bool>(1)?, "not_after": r.get::<_, Option<i64>>(2)?,
+                "source": r.get::<_, String>(3)?, "last_error": r.get::<_, Option<String>>(4)?, "next_attempt_at": r.get::<_, Option<i64>>(5)?,
+            }))
+        },
+    )?;
+    Ok(Json(json!({ "dns": crate::acme::dns_zones(&app).map(|zones| json!({ "zones": zones })), "certificates": certs })))
+}
+
+pub async fn set_dns_token(State(app): State<AppState>, Owner(a): Owner, Json(b): Json<TunnelBody>) -> ApiResult<Json<Value>> {
+    let zones = crate::acme::set_dns_token(&app, b.api_token.trim()).await.map_err(bad)?;
+    a.audit(&app, "certificates.dns", Some("cloudflare"), None);
+    Ok(Json(json!({ "zones": zones })))
+}
+
+pub async fn clear_dns_token(State(app): State<AppState>, Owner(a): Owner) -> ApiResult<Json<Value>> {
+    crate::acme::clear_dns_token(&app)?;
+    a.audit(&app, "certificates.dns", Some("removed"), None);
+    Ok(ok())
+}
+
+#[derive(Deserialize)]
+pub struct RetryBody {
+    host: Option<String>,
+}
+
+/// Try failed certificates again now instead of after their back-off.
+pub async fn retry_certificates(State(app): State<AppState>, _: Owner, Json(b): Json<RetryBody>) -> ApiResult<Json<Value>> {
+    crate::acme::retry(&app, b.host.as_deref())?;
+    Ok(ok())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

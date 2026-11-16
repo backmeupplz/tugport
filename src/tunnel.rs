@@ -62,7 +62,7 @@ pub async fn run(app: AppState) {
     }
 }
 
-async fn cf(token: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
+pub async fn cf(token: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
     let mut req = util::http(30).build()?.request(method, format!("{API}{path}")).bearer_auth(token);
     if let Some(b) = body {
         req = req.json(&b);
@@ -292,7 +292,7 @@ async fn point_at(token: &str, host: &str, target: &str) -> Result<DnsRecord> {
     Ok(DnsRecord { zone, id })
 }
 
-async fn zone_for(token: &str, host: &str) -> Result<String> {
+pub async fn zone_for(token: &str, host: &str) -> Result<String> {
     // The host itself, then each parent down to (not including) the top-level domain.
     let mut name = host;
     while let Some((_, parent)) = name.split_once('.') {

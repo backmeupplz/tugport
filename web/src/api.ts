@@ -158,6 +158,17 @@ export interface Domain {
   https: boolean;
   via_tunnel: boolean;
   options: Record<string, any>;
+  /** Null for HTTP-only and tunnel domains, and before the first attempt. */
+  certificate?: Certificate | null;
+}
+export interface Certificate {
+  host?: string;
+  issued: boolean;
+  not_after: number | null;
+  /** "acme" (HTTP check), "acme-dns" (DNS check) or "imported". */
+  source: string;
+  last_error: string | null;
+  next_attempt_at: number | null;
 }
 export interface ServiceDetail {
   service: Service;

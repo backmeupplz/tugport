@@ -56,10 +56,12 @@ pub fn forget(app: &App, container: &str) {
     let _ = std::fs::remove_dir_all(app.paths.files().join(container));
 }
 
-/// /run is wiped on reboot: write every managed container's files again before
-/// Docker restarts them.
+/// /run is wiped on reboot: write every managed container's files again. Docker restarts
+/// containers before Tugport is up, so after a reboot those starts fail on the missing
+/// mounts and Docker never retries them: start what should run here, as `nodes::restore`
+/// does on other servers.
 pub async fn rematerialize(app: &App) -> Result<usize> {
-    let mut n = 0;
+    let (mut n, mut started) = (0, 0);
     for s in crate::store::services(app, None)? {
         if s.kind == "compose" {
             continue;
@@ -67,14 +69,31 @@ pub async fn rematerialize(app: &App) -> Result<usize> {
         let mut env = crate::store::resolved_env(app, &s)?;
         crate::runtime::add_port(app, &s, &mut env)?;
         let files = crate::store::files(app, &s.id)?;
+        let live = crate::runtime::live_deploy(app, &s.id);
+        let stopped = crate::nodes::stopped(app, &s.id);
         // Other servers keep their own; the panel sends them again after a reboot there.
         for r in crate::runtime::replicas(app, &s.id).await?.into_iter().filter(|r| r.node == "local") {
             materialize(app, &r.name, &env)?;
             materialize_files(app, &r.name, &files)?;
             n += 1;
+            if should_start(&r.state, &r.deploy, live.as_deref(), stopped) {
+                match crate::runtime::start(app, "local", &r.id).await {
+                    Ok(()) => started += 1,
+                    Err(e) => tracing::warn!("starting {} again: {e:#}", r.name),
+                }
+            }
         }
     }
+    if started > 0 {
+        tracing::info!("started {started} containers that could not start before their secrets were back");
+    }
     Ok(n)
+}
+
+/// A container of the live deploy (any before the first deploy) that is down although
+/// nobody stopped the service and it is not asleep.
+fn should_start(state: &str, deploy: &str, live: Option<&str>, stopped: bool) -> bool {
+    matches!(state, "exited" | "created") && !stopped && live.is_none_or(|l| l == deploy)
 }
 
 /// Replaces secret values with dots in anything shown to people or agents.
@@ -123,5 +142,14 @@ mod tests {
         let m = Masker::new(["supersecretvalue", "abc"].into_iter());
         assert_eq!(m.mask("token=supersecretvalue ok abc"), "token=•••••• ok abc");
         assert_eq!(m.mask("nothing here"), "nothing here");
+    }
+
+    #[test]
+    fn starts_only_live_containers_nobody_stopped() {
+        assert!(should_start("exited", "d1", Some("d1"), false));
+        assert!(should_start("created", "d1", None, false));
+        assert!(!should_start("running", "d1", Some("d1"), false));
+        assert!(!should_start("exited", "d0", Some("d1"), false)); // replaced deploy
+        assert!(!should_start("exited", "d1", Some("d1"), true)); // stopped or asleep
     }
 }

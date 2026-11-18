@@ -81,7 +81,10 @@ fn rewrite(text: &str, s: &Service, deploy_id: &str, network: &str) -> Result<St
         if !svc.contains_key("restart") {
             svc.insert("restart".into(), "unless-stopped".into());
         }
-        if svc.contains_key("network_mode") {
+        // `x-tugport-project-network: false` keeps a service off the project network, for a sandbox
+        // such as a CI runner whose jobs must not reach the project's databases or the host's other networks.
+        let isolated = svc.remove("x-tugport-project-network") == Some(Value::Bool(false));
+        if isolated || svc.contains_key("network_mode") {
             continue;
         }
         let alias = format!("{}-{}", s.name, name.as_str().unwrap_or_default());
@@ -449,5 +452,11 @@ mod tests {
         assert_eq!(v["services"]["web"]["networks"]["tp-shop"]["aliases"][0].as_str(), Some("plausible-web"));
         assert!(v["services"]["db"]["networks"].as_mapping().unwrap().contains_key("internal"));
         assert_eq!(v["networks"]["tp-shop"]["external"].as_bool(), Some(true));
+        let out = rewrite("services:\n  ci:\n    image: docker:dind\n    x-tugport-project-network: false\n    networks: [sandbox]\nnetworks:\n  sandbox: {}\n", &s, "d1", "tp-shop").unwrap();
+        let v: Value = serde_yaml::from_str(&out).unwrap();
+        let ci = v["services"]["ci"].as_mapping().unwrap();
+        assert_eq!(ci["networks"].as_sequence().unwrap().len(), 1, "an isolated service keeps only its own networks");
+        assert!(!ci.contains_key("x-tugport-project-network"));
+        assert_eq!(ci["labels"]["tugport.service"].as_str(), Some(s.id.as_str()), "it is still labelled as the stack's");
     }
 }

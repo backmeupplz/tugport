@@ -1,16 +1,16 @@
 # Deploy Uptime Kuma on a Hetzner VPS with Tugport
 
-Uptime Kuma runs on Tugport as a plain Docker image: create a service from `louislam/uptime-kuma:2` with one volume at `/app/data`, point a domain at the server, deploy, and open the domain to finish Uptime Kuma's own setup. The deploy took 73 seconds on a cold server and HTTPS worked on the first request, with a Let's Encrypt certificate. This page shows each step as I ran it on October 28, 2026, with the commands and the timings.
+You run Uptime Kuma on Tugport straight from its Docker image: point a service at `louislam/uptime-kuma:2`, mount a volume at `/app/data`, attach a domain, and deploy. On a cold server, the deploy finished in 73 seconds and served HTTPS on the first hit with a fresh Let's Encrypt certificate.
 
-Tugport has no one-click app templates (the README says so on purpose), so you type the image, the volume and the port yourself. It is three small calls, and the page lists exactly which ones.
+Tugport deliberately skips one-click app templates, so you pass the image, volume, and port in three API calls.
 
-**Tested on October 28, 2026** with Tugport 0.1.30, Docker 29.9.2 and Uptime Kuma 2.5.8 (Node.js 22.23.4), on a Hetzner dedicated server that already ran Tugport. I did not install Tugport on a fresh VPS for this page, so Step 1 comes from the README and the installer's own output, not from my run. Steps 2 to 7 ran against the panel's API, which is what the panel's New service form calls, and I did not click through that form.
+**Tested on October 28, 2026** with Tugport 0.1.30, Docker 29.9.2, and Uptime Kuma 2.5.8 (Node.js 22.23.4) on a Hetzner dedicated server already running Tugport. Step 1 comes from the README and installer output rather than a fresh VPS, and I ran Steps 2 to 7 directly against the panel's API (the same endpoints behind the New service form) instead of clicking through the UI.
 
 ## What you need
 
-- A Hetzner Cloud VPS, or any Linux server with systemd, that runs Tugport. A small cloud server is enough: Uptime Kuma with one monitor used about 295 MB of memory and under 1% of a core on my server right after a redeploy.
-- A domain you control, with a DNS provider that lets you add an A record.
-- An API key with the `operator` role on a project, from the panel under Access. The commands below use `$PANEL` for the panel address and `$TOKEN` for the key.
+- A Hetzner Cloud VPS (or any Linux box with systemd) running Tugport. A cheap small box works fine: with one monitor running, Uptime Kuma sat around 295 MB of RAM and under 1% of one CPU core right after a redeploy.
+- A domain where you can add an A record.
+- An API key with the `operator` role on your project (grab it under Access in the panel). In the commands below, `$PANEL` is your panel URL and `$TOKEN` is that key.
 
 ## Step 1: Install Tugport on the server
 
@@ -64,9 +64,9 @@ curl -sS -X POST "$PANEL/api/services/monitoring.kuma/deploy" \
 
 Open the domain in a browser. Uptime Kuma 2.x first asks which database to use:
 
-1. Pick **SQLite** for a single small instance. It needs nothing else, and the file lives in the volume from Step 2. The other two choices are an embedded MariaDB and an external MariaDB or MySQL server.
-2. Press **Next** and wait for the database to be prepared.
-3. Create the admin account with a username and a strong password.
+1. Choose **SQLite** for a single instance; it writes straight to the Step 2 volume with zero extra services (embedded MariaDB and external MariaDB/MySQL are the other options).
+2. Click **Next** and let it initialize the database.
+3. Pick a username and strong password for the admin account.
 
 You land on an empty dashboard that says "No Monitors, please add one".
 
@@ -90,8 +90,9 @@ This one took 51 seconds. Afterwards the dashboard still showed the monitor and 
 
 ## Before you rely on it
 
-- **Watch from somewhere else.** Uptime Kuma monitors from the server it runs on, so if that server or its network goes down, it goes down with it and can't tell you. For anything that matters, run it on a different server, or a different provider, than the sites it watches.
-- **Back up the data volume.** Tugport can back up `kuma-data` to S3-compatible storage or a disk on a schedule ([API reference](/docs/api/)); I did not test that for this page.
+Don't monitor a server from itself. If that machine or its network drops, Uptime Kuma goes dark right alongside the apps it's watching and can't alert you, so put it on a separate server or provider for anything you care about.
+
+Set up scheduled backups for `kuma-data` to disk or S3-compatible storage using Tugport's built-in backup support ([API reference](/docs/api/)); I haven't tested that restore flow myself here.
 
 ## Frequently asked questions
 

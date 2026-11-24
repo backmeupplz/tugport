@@ -4,6 +4,9 @@
 
 <h3 align="center">Tugport</h3>
 <p align="center">Deploy your apps to servers you own, from one small Rust binary.</p>
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/backmeupplz/tugport"><img src="https://glama.ai/mcp/servers/backmeupplz/tugport/badges/score.svg" alt="backmeupplz/tugport MCP server" /></a>
+</p>
 
 ---
 

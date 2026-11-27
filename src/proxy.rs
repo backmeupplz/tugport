@@ -321,6 +321,10 @@ pub fn reload(app: &App) {
 async fn build_table(app: &App) -> Result<Table> {
     let mut routes = vec![];
     let services: HashMap<String, store::Service> = store::services(app, None)?.into_iter().map(|s| (s.id.clone(), s)).collect();
+    // Live deploys before the listing: a deploy goes live only once its replicas run, so a later
+    // listing shows them. Read after it, a listing taken before the switch (it can take a second)
+    // shows the new replicas not yet running, and the route would have none.
+    let live: HashMap<&str, Option<String>> = services.keys().map(|id| (id.as_str(), runtime::live_deploy(app, id))).collect();
     let replicas = match runtime::all_replicas(app).await {
         Ok(r) => {
             let r = Arc::new(r);
@@ -338,21 +342,28 @@ async fn build_table(app: &App) -> Result<Table> {
             continue;
         }
         let Some(s) = services.get(&d.service_id) else { continue };
-        let live = runtime::live_deploy(app, &s.id);
         let asleep = crate::sleep::is_asleep(app, &s.id);
-        let targets = replicas
-            .get(&s.id)
-            .into_iter()
-            .flatten()
-            // A sleeping service's requests wait for its wake-up, even while it is still stopping.
-            .filter(|r| r.state == "running" && !asleep && !draining.contains(&r.id))
-            .filter(|r| match (&d.container, s.kind.as_str()) {
-                (Some(c), "compose") => r.compose_service.as_deref() == Some(c.as_str()),
-                (None, "compose") => true,
-                _ => live.as_deref().is_none_or(|l| r.deploy == l),
-            })
-            .filter_map(|r| Some(Target { node: r.node.clone(), addr: SocketAddr::new(r.ip.as_ref()?.parse().ok()?, d.port) }))
-            .collect();
+        let targets_of = |live: Option<&str>| -> Vec<Target> {
+            replicas
+                .get(&s.id)
+                .into_iter()
+                .flatten()
+                // A sleeping service's requests wait for its wake-up, even while it is still stopping.
+                .filter(|r| r.state == "running" && !asleep && !draining.contains(&r.id))
+                .filter(|r| match (&d.container, s.kind.as_str()) {
+                    (Some(c), "compose") => r.compose_service.as_deref() == Some(c.as_str()),
+                    (None, "compose") => true,
+                    _ => live.is_none_or(|l| r.deploy == l),
+                })
+                .filter_map(|r| Some(Target { node: r.node.clone(), addr: SocketAddr::new(r.ip.as_ref()?.parse().ok()?, d.port) }))
+                .collect()
+        };
+        let mut targets = targets_of(live.get(s.id.as_str()).and_then(|l| l.as_deref()));
+        // A stop_first deploy stopped the old version before the listing; the new one may have
+        // gone live since.
+        if targets.is_empty() {
+            targets = targets_of(runtime::live_deploy(app, &s.id).as_deref());
+        }
         routes.push(RouteSpec {
             host: d.host.clone(),
             path: d.path.clone(),
@@ -1085,4 +1096,59 @@ mod tests {
         assert_eq!(upstream_path(&route("/api", true, Some(("^/v1/(.*)", "/v2/$1"))), "/api/v1/a"), "/v2/a");
     }
 
+    /// The targets of a.test, live on deploy `old`, from a container listing of (deploy, state, ip)
+    /// replicas; with `switch`, deploy `new` goes live while that listing is on its way.
+    async fn targets_during_the_listing(listing: &'static [(&'static str, &'static str, &'static str)], switch: bool) -> Vec<Target> {
+        let dir = std::env::temp_dir().join(format!("tugport-test-{}", crate::util::id()));
+        let paths = crate::paths::Paths { etc: dir.join("etc"), data: dir.join("data"), run: dir.join("run") };
+        std::fs::create_dir_all(&paths.data).unwrap();
+        let db = crate::db::Db::open(&paths.db()).unwrap();
+        db.exec("INSERT INTO projects (id, name, created_at) VALUES ('p', 'shop', 0)", []).unwrap();
+        db.exec("INSERT INTO services (id, project_id, name, kind, spec, created_at, updated_at) VALUES ('s', 'p', 'web', 'app', '{}', 0, 0)", []).unwrap();
+        db.exec("INSERT INTO domains (id, service_id, host, port, created_at) VALUES ('d', 's', 'a.test', 80, 0)", []).unwrap();
+        db.set_state("live:s", "old").unwrap();
+        let app_cell: Arc<std::sync::OnceLock<AppState>> = Default::default();
+        let cell = app_cell.clone();
+        let docker_api = axum::Router::new().fallback(move || {
+            let cell = cell.clone();
+            async move {
+                if switch {
+                    crate::runtime::set_live_deploy(cell.get().unwrap(), "s", "new").unwrap();
+                }
+                let containers: Vec<_> = listing
+                    .iter()
+                    .map(|(deploy, state, ip)| {
+                        serde_json::json!({
+                            "Id": deploy, "Names": [format!("/{deploy}")], "State": state, "Created": 0,
+                            "Labels": { "tugport.managed": "true", "tugport.service": "s", "tugport.deploy": deploy },
+                            "NetworkSettings": { "Networks": { "tp-ingress": { "IPAddress": ip } } },
+                        })
+                    })
+                    .collect();
+                axum::Json(containers)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, docker_api).await });
+        let docker = bollard::Docker::connect_with_http(&format!("http://{addr}"), 5, bollard::API_DEFAULT_VERSION).unwrap();
+        let selflog = crate::logs::SelfLog::new(dir.join("self"));
+        let app = App::new(paths, db, crate::crypto::Keyring::new(&[7; 32]), docker, selflog, 1).unwrap();
+        let _ = app_cell.set(app.clone());
+        let table = build_table(&app).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        table.routes.into_iter().find(|r| r.host == "a.test").unwrap().targets
+    }
+
+    /// A switch while a slow listing is on its way never leaves the route with no replica.
+    #[tokio::test]
+    async fn a_switch_during_the_listing_keeps_a_replica() {
+        let target = |ip: &str| vec![Target { node: "local".into(), addr: format!("{ip}:80").parse().unwrap() }];
+        // start_first: the listing predates the new replica's start; the old one keeps serving.
+        assert_eq!(targets_during_the_listing(&[("new", "created", ""), ("old", "running", "172.20.0.2")], true).await, target("172.20.0.2"));
+        // stop_first: the old version is already stopped; the new one serves as soon as it is live.
+        assert_eq!(targets_during_the_listing(&[("new", "running", "172.20.0.3"), ("old", "exited", "")], true).await, target("172.20.0.3"));
+        // ...but not while its health is still being checked.
+        assert_eq!(targets_during_the_listing(&[("new", "running", "172.20.0.3"), ("old", "exited", "")], false).await, vec![]);
+    }
 }

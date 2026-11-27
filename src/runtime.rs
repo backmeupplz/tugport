@@ -211,8 +211,11 @@ pub fn status_of(app: &App, s: &Service, reps: Vec<Replica>) -> serde_json::Valu
         "not deployed"
     } else if current.iter().any(|r| r.state == "restarting") {
         "crashing"
+    } else if crate::sleep::is_asleep(app, &s.id) {
+        // Also while waking up or falling asleep: no requests reach it then.
+        "asleep"
     } else if running == 0 {
-        if crate::sleep::is_asleep(app, &s.id) { "asleep" } else { "stopped" }
+        "stopped"
     } else if current.iter().any(|r| r.health.as_deref() == Some("unhealthy")) {
         "unhealthy"
     } else if (running as u32) < s.spec.replicas {

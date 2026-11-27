@@ -173,15 +173,22 @@ pub async fn stop(State(app): State<AppState>, a: Auth, Path(id): Path<String>) 
     for r in runtime::replicas(&app, &s.id).await? {
         runtime::stop(&app, &r.node, &r.id, 30).await?;
     }
-    // Nothing starts it on its own again (not even a server coming back) until someone does.
+    // Nothing starts it on its own again (not even a server coming back or a request to a
+    // sleeping service) until someone does.
     app.db.set_state(&format!("stopped:{}", s.id), "1")?;
+    app.db.del_state(&format!("asleep:{}", s.id))?;
     a.audit_service(&app, "service.stop", &s, None);
     app.emit("service.status", Some(&s.project_id), Some(&s.id), json!({ "state": "stopped" }));
+    // An asleep service's containers were already stopped, so no Docker event rebuilds its route.
+    crate::proxy::reload(&app);
     Ok(ok())
 }
 
 pub async fn start(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
+    // Not while a wake-up or sleep_idle acts on it, which could stop it again.
+    let gate = crate::sleep::turn(&s.id);
+    let _turn = gate.lock().await;
     let reps = runtime::current(&app, &s).await?;
     if reps.is_empty() {
         return Err(ApiError::bad_request("nothing to start; deploy the service first"));

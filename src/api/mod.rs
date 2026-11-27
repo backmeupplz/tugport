@@ -3,7 +3,7 @@ mod backups;
 mod cloud;
 mod console;
 mod databases;
-mod deploys;
+pub(crate) mod deploys;
 mod git;
 mod hooks;
 mod nodes;

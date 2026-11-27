@@ -109,7 +109,7 @@ Every field has a default. See `src/model.rs`.
 | `auto_update` | `{enabled, interval_minutes, policy: digest\|same_major}` |
 | `placement` | `{node, region, labels}`: `node` is a server id or name; labels must all match. Services with a database, volumes or bind mounts, host ports, host networking or the Docker socket stay on the server they first ran on. Other services spread their replicas over the eligible servers. |
 | `autoscale` | `{min, max, cpu_percent, rps}`: replicas follow total CPU (percent of one core per replica) or requests per second per replica. More start at once; extras leave after five quiet minutes. |
-| `sleep` | `{idle_minutes}`: the service stops after that long without requests and starts again on the next one (web apps only). |
+| `sleep` | `{idle_minutes}`: the service stops after that long without requests and starts again on the next one (web apps only). Requests wait until the app answers on the port of the domain they came to; with domains on several ports, the others may answer a moment later. |
 | Other | `database`, `compose: {file}`, `build_args`, `networks` (extra Docker networks to join; adding one needs `destroy`) |
 
 ### Service endpoints
@@ -164,7 +164,7 @@ Domain `options` contains:
 | GET | `/api/deploys/{id}/log` | SSE stream: `line` events (`{ts, line}`) and `status` events. Ends after the final status. |
 | POST | `/api/deploys/{id}/cancel` | |
 | POST | `/api/services/{id}/rollback` | `{deploy_id?}` (defaults to the previous live image), returns `{deploy_id, image}` |
-| POST | `/api/services/{id}/restart` / `stop` / `start` | |
+| POST | `/api/services/{id}/restart` / `stop` / `start` | `start` or `restart` of a sleeping service wakes it and returns once it answers on its first domain's port (503 if it doesn't in time, and it stays asleep; 409 if a stop came in meanwhile). `restart` of a stopped service starts it, like `start`; both answer 400 when nothing is deployed. `stop` during a wake-up, start or restart waits for it to finish, then stops every replica. |
 | GET | `/api/events?project&service` | SSE stream, see below. |
 
 `POST /api/services/{id}/deploy` takes `{ref?, wait?, timeout_s?, no_cache?}`:

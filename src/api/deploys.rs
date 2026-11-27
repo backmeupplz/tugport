@@ -167,48 +167,100 @@ pub async fn rollback(State(app): State<AppState>, a: Auth, Path(id): Path<Strin
 }
 
 pub async fn restart(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let s = service_or_404(&app, &a, &id, Role::Deployer)?;
-    for r in runtime::current(&app, &s).await? {
-        runtime::restart(&app, &r.node, &r.id).await?;
-    }
-    a.audit_service(&app, "service.restart", &s, None);
-    crate::proxy::reload(&app);
-    Ok(ok())
+    start_or_restart(app, a, id, true).await
 }
 
 pub async fn stop(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
-    for r in runtime::replicas(&app, &s.id).await? {
-        runtime::stop(&app, &r.node, &r.id, 30).await?;
-    }
     // Nothing starts it on its own again (not even a server coming back or a request to a
-    // sleeping service) until someone does.
+    // sleeping service) until someone does. Set first: a wake-up in progress then gives way
+    // within a moment, and the replicas are listed only once it has, so none starts after.
     app.db.set_state(&format!("stopped:{}", s.id), "1")?;
-    app.db.del_state(&format!("asleep:{}", s.id))?;
-    a.audit_service(&app, "service.stop", &s, None);
-    app.emit("service.status", Some(&s.project_id), Some(&s.id), json!({ "state": "stopped" }));
-    // An asleep service's containers were already stopped, so no Docker event rebuilds its route.
+    // Carried through even if the caller goes away meanwhile, which would leave it marked
+    // stopped and running.
+    tokio::spawn(async move {
+        let gate = crate::sleep::turn(&s.id);
+        let mut deadline = gate.lock().await;
+        // Again: a start or restart that had the turn first cleared it.
+        app.db.set_state(&format!("stopped:{}", s.id), "1")?;
+        // Every replica, even when one fails: as few as possible keep running.
+        let mut failed = None;
+        match runtime::replicas(&app, &s.id).await {
+            Ok(reps) => {
+                for r in reps {
+                    if let Err(e) = runtime::stop(&app, &r.node, &r.id, 30).await {
+                        tracing::warn!("stopping {}: {e:#}", r.name);
+                        failed.get_or_insert(e);
+                    }
+                }
+            }
+            Err(e) => failed = Some(e),
+        }
+        app.db.del_state(&format!("asleep:{}", s.id))?;
+        *deadline = None;
+        // An asleep service's containers were already stopped, so no Docker event rebuilds its route.
+        crate::proxy::reload(&app);
+        if let Some(e) = failed {
+            return Err(e.into());
+        }
+        a.audit_service(&app, "service.stop", &s, None);
+        app.emit("service.status", Some(&s.project_id), Some(&s.id), json!({ "state": "stopped" }));
+        Ok(ok())
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!("stopping: {e}")))?
+}
+
+pub async fn start(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    start_or_restart(app, a, id, false).await
+}
+
+/// Carried through even if the caller goes away meanwhile (a sleeping service's wake-up can
+/// take a while), which would leave it half started.
+async fn start_or_restart(app: AppState, a: Auth, id: String, restart: bool) -> ApiResult<Json<Value>> {
+    tokio::spawn(start_or_restart_now(app, a, id, restart)).await.map_err(|e| ApiError::from(anyhow::anyhow!("starting: {e}")))?
+}
+
+async fn start_or_restart_now(app: AppState, a: Auth, id: String, restart: bool) -> ApiResult<Json<Value>> {
+    let s = service_or_404(&app, &a, &id, Role::Deployer)?;
+    // Not while a wake-up or sleep_idle acts on it, which could stop it again.
+    let gate = crate::sleep::turn(&s.id);
+    let mut deadline = gate.lock().await;
+    let reps = runtime::current(&app, &s).await?;
+    if reps.is_empty() {
+        return Err(ApiError::bad_request("nothing to run; deploy the service first"));
+    }
+    // A sleeping service's routes stay without targets meanwhile: requests wait for the wake-up.
+    for r in reps {
+        // Docker's restart starts stopped containers too.
+        if restart { runtime::restart(&app, &r.node, &r.id).await? } else { runtime::start(&app, &r.node, &r.id).await? }
+    }
+    // Running: nothing keeps it down any more, not even a server coming back.
+    app.db.del_state(&format!("stopped:{}", s.id))?;
+    if !wake_asleep(&app, &s, &mut deadline).await? {
+        app.db.del_state(&format!("asleep:{}", s.id))?;
+    }
+    crate::sleep::mark_active(&app, &s.id);
+    a.audit_service(&app, if restart { "service.restart" } else { "service.start" }, &s, None);
     crate::proxy::reload(&app);
     Ok(ok())
 }
 
-pub async fn start(State(app): State<AppState>, a: Auth, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let s = service_or_404(&app, &a, &id, Role::Deployer)?;
-    // Not while a wake-up or sleep_idle acts on it, which could stop it again.
-    let gate = crate::sleep::turn(&s.id);
-    let _turn = gate.lock().await;
-    let reps = runtime::current(&app, &s).await?;
-    if reps.is_empty() {
-        return Err(ApiError::bad_request("nothing to start; deploy the service first"));
+/// Start or restart of a sleeping service (with a domain): wait for it to answer as a wake-up
+/// would, so requests reach it only then. Returns whether it did. On failure it stays asleep
+/// and sleep_idle stops what started, as after a request's failed wake-up.
+async fn wake_asleep(app: &AppState, s: &crate::store::Service, deadline: &mut Option<std::time::Instant>) -> ApiResult<bool> {
+    let Some(d) = crate::store::domains(app, Some(&s.id))?.into_iter().next().filter(|_| crate::sleep::is_asleep(app, &s.id)) else {
+        return Ok(false);
+    };
+    // Asked for: not cut short by an earlier wake-up that gave up.
+    *deadline = None;
+    match crate::sleep::wake_in_turn(app, &s.id, d.port, deadline).await {
+        Ok(_) => Ok(true),
+        // A stop came in meanwhile and goes ahead once this gives way.
+        Err(e) if app.db.state::<String>(&format!("stopped:{}", s.id)).is_some() => Err(ApiError::conflict(format!("{e:#}"))),
+        Err(e) => Err(ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}"))),
     }
-    for r in reps {
-        runtime::start(&app, &r.node, &r.id).await?;
-    }
-    let _ = app.db.exec("DELETE FROM state WHERE key IN (?1, ?2)", [format!("asleep:{}", s.id), format!("stopped:{}", s.id)]);
-    crate::sleep::mark_active(&app, &s.id);
-    a.audit_service(&app, "service.start", &s, None);
-    crate::proxy::reload(&app);
-    Ok(ok())
 }
 
 #[derive(Deserialize, Default)]

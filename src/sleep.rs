@@ -38,6 +38,22 @@ pub fn mark_active(app: &App, service_id: &str) {
 pub async fn wake(app: &App, service_id: &str, port: u16) -> Result<Vec<Upstream>> {
     let gate = turn(service_id);
     let mut deadline = gate.lock().await;
+    wake_in_turn(app, service_id, port, &mut deadline).await
+}
+
+/// API stop sets this before it waits for its turn: a wake-up in progress gives way at once.
+fn stopped(app: &App, service_id: &str) -> bool {
+    app.db.state::<String>(&format!("stopped:{service_id}")).is_some()
+}
+
+/// `wake` for a caller holding the service's turn (`deadline`). It waits for the app to answer
+/// on `port` only: a service with domains on several ports may answer on the others a moment
+/// later. Waiting for all of them would let one port the app never opens stop replicas that
+/// serve the rest.
+pub async fn wake_in_turn(app: &App, service_id: &str, port: u16, deadline: &mut Option<Instant>) -> Result<Vec<Upstream>> {
+    if stopped(app, service_id) {
+        bail!("the service is stopped");
+    }
     let s = store::service(app, service_id)?.ok_or_else(|| anyhow!("this service no longer exists"))?;
     let reps = runtime::current(app, &s).await?;
     if reps.is_empty() {
@@ -71,6 +87,10 @@ pub async fn wake(app: &App, service_id: &str, port: u16) -> Result<Vec<Upstream
     let until = deadline.filter(|_| waking).unwrap_or(started + timeout);
     let proxies = crate::nodes::proxy_addresses(app);
     loop {
+        // Stopped meanwhile: the stop, waiting for this turn, stops what this started.
+        if stopped(app, &s.id) {
+            bail!("the service was stopped");
+        }
         let (mut up, mut quiet) = (vec![], vec![]);
         for r in runtime::current(app, &s).await? {
             let ip = r.ip.as_deref().and_then(|a| a.parse::<std::net::IpAddr>().ok()).filter(|_| r.state == "running");
@@ -191,6 +211,13 @@ mod tests {
     /// of an asleep service (returned; domain a.test on `port`, health timeout `timeout_s`). The
     /// fake records the actions asked of it, as "start c0".
     async fn asleep_app(port: u16, timeout_s: u32, ips: &'static [&'static str]) -> (AppState, String, Arc<Mutex<Vec<String>>>, std::path::PathBuf) {
+        let (app, id, actions, dir, _) = asleep_app_held(port, timeout_s, ips).await;
+        (app, id, actions, dir)
+    }
+
+    /// `asleep_app` whose fake Docker finishes a start only while the returned lock is not
+    /// held for writing (it records the start on arrival).
+    async fn asleep_app_held(port: u16, timeout_s: u32, ips: &'static [&'static str]) -> (AppState, String, Arc<Mutex<Vec<String>>>, std::path::PathBuf, Arc<tokio::sync::RwLock<()>>) {
         let dir = std::env::temp_dir().join(format!("tugport-test-{}", util::id()));
         let paths = crate::paths::Paths { etc: dir.join("etc"), data: dir.join("data"), run: dir.join("run") };
         std::fs::create_dir_all(&paths.data).unwrap();
@@ -205,19 +232,22 @@ mod tests {
         let actions: Arc<Mutex<Vec<String>>> = Default::default();
         let (log, sid) = (actions.clone(), id.clone());
         let running: Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
+        let hold: Arc<tokio::sync::RwLock<()>> = Default::default();
+        let held = hold.clone();
         let docker_api = axum::Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
-            let (log, running, sid) = (log.clone(), running.clone(), sid.clone());
+            let (log, running, sid, held) = (log.clone(), running.clone(), sid.clone(), held.clone());
             async move {
                 if method == axum::http::Method::POST {
                     // /containers/{id}/{action}
                     let mut parts = uri.path().rsplit('/');
                     let (action, c) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default().to_string());
-                    if action == "start" {
+                    util::lock(&log).push(format!("{action} {c}"));
+                    if action == "start" || action == "restart" {
+                        let _ = held.read().await;
                         util::lock(&running).insert(c.clone());
                     } else {
                         util::lock(&running).remove(&c);
                     }
-                    util::lock(&log).push(format!("{action} {c}"));
                     return axum::http::StatusCode::NO_CONTENT.into_response();
                 }
                 let running = util::lock(&running).clone();
@@ -242,7 +272,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, docker_api).await });
         let docker = bollard::Docker::connect_with_http(&format!("http://{addr}"), 5, bollard::API_DEFAULT_VERSION).unwrap();
         let selflog = crate::logs::SelfLog::new(dir.join("self"));
-        (App::new(paths, db, crate::crypto::Keyring::new(&[7; 32]), docker, selflog, 1).unwrap(), id, actions, dir)
+        (App::new(paths, db, crate::crypto::Keyring::new(&[7; 32]), docker, selflog, 1).unwrap(), id, actions, dir, hold)
     }
 
     /// A port nothing listens on (yet). A socket bound to it without listening would keep
@@ -260,6 +290,16 @@ mod tests {
         util::lock(actions).clone()
     }
 
+    /// Until the fake Docker is asked for something (failing rather than hanging if it never is).
+    async fn first_action(actions: &Mutex<Vec<String>>) {
+        let asked = async {
+            while actions_of(actions).is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), asked).await.expect("nothing was asked of Docker");
+    }
+
     /// While the woken app is not listening yet, its route has no targets and it shows as asleep.
     #[tokio::test]
     async fn requests_wait_until_the_woken_app_answers() {
@@ -269,9 +309,7 @@ mod tests {
             let (app, id) = (app.clone(), id.clone());
             async move { wake(&app, &id, port).await }
         });
-        while actions_of(&actions).is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        first_action(&actions).await;
         // The container runs, the app inside does not listen yet.
         assert_eq!(route_targets(&app).await, vec![]);
         assert!(is_asleep(&app, &id));
@@ -328,9 +366,7 @@ mod tests {
             let (app, id) = (app.clone(), id.clone());
             async move { wake(&app, &id, port).await }
         });
-        while actions_of(&actions).is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        first_action(&actions).await;
         // Past the start, probing.
         tokio::time::sleep(Duration::from_millis(300)).await;
         waking.abort();
@@ -359,6 +395,150 @@ mod tests {
         assert_eq!(actions_of(&actions), ["start c0", "start c1", "stop c1"]);
         assert!(!is_asleep(&app, &id));
         assert_eq!(route_targets(&app).await, vec![crate::proxy::Target { node: "local".into(), addr }]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn owner() -> crate::api::Auth {
+        crate::api::Auth(crate::auth::Principal {
+            user_id: "u".into(),
+            name: "test".into(),
+            kind: crate::auth::UserKind::Human,
+            is_owner: true,
+            all_projects_role: None,
+            project_roles: Default::default(),
+            grants: vec![],
+            key_id: None,
+            ip: None,
+        })
+    }
+
+    /// API stop while a wake-up is still starting the containers: the wake-up gives way and the
+    /// stop stops what it started, so the service ends stopped, not running with `stopped:` set.
+    #[tokio::test]
+    async fn a_stop_during_a_wake_up_stops_what_it_started() {
+        use axum::extract::{Path, State};
+        let port = free_port().await;
+        let (app, id, actions, dir, hold) = asleep_app_held(port, 180, &["127.0.0.1"]).await;
+        let held = hold.clone().write_owned().await;
+        let waking = tokio::spawn({
+            let (app, id) = (app.clone(), id.clone());
+            async move { wake(&app, &id, port).await }
+        });
+        first_action(&actions).await;
+        // The start is on its way to Docker: a stop that did not wait its turn listed the replicas
+        // meanwhile and stopped nothing.
+        let stopping = tokio::spawn(crate::api::deploys::stop(State(app.clone()), owner(), Path(id.clone())));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _listening = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        drop(held);
+        let t = Instant::now();
+        assert!(waking.await.unwrap().is_err());
+        let _ = stopping.await.unwrap().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(runtime::replicas(&app, &id).await.unwrap().iter().all(|r| r.state != "running"));
+        assert!(stopped(&app, &id));
+        assert!(!is_asleep(&app, &id));
+        assert_eq!(route_targets(&app).await, vec![]);
+        // A request on a stale route starts nothing.
+        assert!(wake(&app, &id, port).await.is_err());
+        assert_eq!(actions_of(&actions), ["start c0", "stop c0"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// API start or restart of a sleeping service wakes it: requests wait until the app answers.
+    /// A restart also restarts a container an earlier wake-up that gave up left running.
+    async fn waking_through_the_api(restart: bool) {
+        use axum::extract::{Path, State};
+        let port = free_port().await;
+        let (app, id, actions, dir) = asleep_app(port, 180, &["127.0.0.1"]).await;
+        if restart {
+            runtime::start(&app, "local", "c0").await.unwrap();
+            util::lock(&actions).clear();
+        }
+        let (st, a, path) = (State(app.clone()), owner(), Path(id.clone()));
+        let starting = tokio::spawn(async move {
+            if restart { crate::api::deploys::restart(st, a, path).await } else { crate::api::deploys::start(st, a, path).await }
+        });
+        first_action(&actions).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(route_targets(&app).await, vec![]);
+        assert!(is_asleep(&app, &id));
+        let _listening = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let _ = starting.await.unwrap().unwrap();
+        assert!(!is_asleep(&app, &id));
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        assert_eq!(route_targets(&app).await, vec![crate::proxy::Target { node: "local".into(), addr }]);
+        assert_eq!(actions_of(&actions), [if restart { "restart c0" } else { "start c0" }]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A start or restart of a stopped service keeps it marked stopped until its containers have
+    /// started, then restarts the idle clock so sleep_idle leaves it running.
+    async fn unmarking_stopped(restart: bool) {
+        use axum::extract::{Path, State};
+        let port = free_port().await;
+        let (app, id, actions, dir, hold) = asleep_app_held(port, 180, &["127.0.0.1"]).await;
+        app.db.del_state(&format!("asleep:{id}")).unwrap();
+        app.db.set_state(&format!("stopped:{id}"), "1").unwrap();
+        let held = hold.clone().write_owned().await;
+        let (st, a, path) = (State(app.clone()), owner(), Path(id.clone()));
+        let starting = tokio::spawn(async move {
+            if restart { crate::api::deploys::restart(st, a, path).await } else { crate::api::deploys::start(st, a, path).await }
+        });
+        first_action(&actions).await;
+        assert!(stopped(&app, &id));
+        drop(held);
+        let _ = starting.await.unwrap().unwrap();
+        assert!(!stopped(&app, &id));
+        assert!(app.db.state::<String>(&format!("active:{id}")).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_start_unmarks_stopped_only_once_started() {
+        unmarking_stopped(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_unmarks_stopped_only_once_started() {
+        unmarking_stopped(true).await;
+    }
+
+    #[tokio::test]
+    async fn starting_a_sleeping_service_waits_until_it_answers() {
+        waking_through_the_api(false).await;
+    }
+
+    #[tokio::test]
+    async fn restarting_a_sleeping_service_waits_until_it_answers() {
+        waking_through_the_api(true).await;
+    }
+
+    /// A start that gets its turn before a stop (both behind a wake-up) does not undo the stop.
+    #[tokio::test]
+    async fn a_stop_behind_a_start_still_stops() {
+        use axum::extract::{Path, State};
+        let port = free_port().await;
+        let (app, id, actions, dir, hold) = asleep_app_held(port, 180, &["127.0.0.1"]).await;
+        let held = hold.clone().write_owned().await;
+        let waking = tokio::spawn({
+            let (app, id) = (app.clone(), id.clone());
+            async move { wake(&app, &id, port).await }
+        });
+        first_action(&actions).await;
+        // Turns are handed out in order: the start, then the stop.
+        let starting = tokio::spawn(crate::api::deploys::start(State(app.clone()), owner(), Path(id.clone())));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stopping = tokio::spawn(crate::api::deploys::stop(State(app.clone()), owner(), Path(id.clone())));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _listening = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        drop(held);
+        assert!(waking.await.unwrap().is_err());
+        let _ = starting.await.unwrap().unwrap();
+        let _ = stopping.await.unwrap().unwrap();
+        assert!(runtime::replicas(&app, &id).await.unwrap().iter().all(|r| r.state != "running"));
+        assert!(stopped(&app, &id));
+        assert!(!is_asleep(&app, &id));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -170,6 +170,10 @@ async fn drain(grace: Duration) {
     // from before the drain still open now (streams) are cut at the exec, so only late ones wait.
     settle(&[&ACCEPTING], Duration::from_secs(1)).await;
     settle(&[&LATE], LATE_GRACE).await;
+    let late = LATE.load(Ordering::SeqCst);
+    if late > 0 {
+        tracing::info!("{late} connections accepted during the drain are still open and close at the exec");
+    }
 }
 
 async fn settle(counts: &[&AtomicUsize], limit: Duration) {

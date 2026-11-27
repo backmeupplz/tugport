@@ -474,7 +474,8 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
     let a = app.clone();
     // Counted from the accept, so a reload also waits for TLS handshakes in progress.
     tokio::spawn(crate::handoff::accept(http, move |stream, peer| {
-        tokio::spawn(serve_conn(a.clone(), TokioIo::new(stream), peer, false, crate::handoff::ConnGuard::new()));
+        let (app, guard) = (a.clone(), crate::handoff::ConnGuard::new());
+        tokio::spawn(async move { serve_conn(app, TokioIo::new(stream), peer, false, guard.closing()).await });
     }));
     crate::handoff::accept(https, |stream, peer| {
         let (app, tls, guard) = (app.clone(), tls.clone(), crate::handoff::ConnGuard::new());
@@ -486,7 +487,7 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
                 _ = async { crate::handoff::stopped().await; tokio::time::sleep(Duration::from_secs(1)).await } => return,
             };
             if let Ok(Ok(s)) = handshake {
-                serve_conn(app, TokioIo::new(s), peer, true, guard).await
+                serve_conn(app, TokioIo::new(s), peer, true, guard.closing()).await
             }
         });
     })
@@ -517,7 +518,8 @@ async fn bind(port: u16) -> Result<tokio::net::TcpListener> {
     }
 }
 
-async fn serve_conn<I>(app: AppState, io: TokioIo<I>, peer: SocketAddr, tls: bool, guard: crate::handoff::ConnGuard)
+/// Serve one connection until `closing` resolves, then finish its requests in flight and close.
+async fn serve_conn<I>(app: AppState, io: TokioIo<I>, peer: SocketAddr, tls: bool, closing: impl std::future::Future<Output = ()>)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -535,7 +537,7 @@ where
     tokio::pin!(conn);
     tokio::select! {
         _ = conn.as_mut() => {}
-        _ = guard.closing() => {
+        _ = closing => {
             // Shutting down before the first request arrives closes the connection unanswered,
             // so a new one gets a moment to send it.
             let first_request = async {
@@ -549,7 +551,16 @@ where
             }
             // Finish the requests in flight, then close (keep-alive ends here).
             conn.as_mut().graceful_shutdown();
-            let _ = conn.await;
+            if served.load(Ordering::Relaxed) {
+                let _ = conn.await;
+            } else {
+                // Still no whole request: a preconnect or a stalled client, which never finishes
+                // closing and would hold up the exec. It gets a moment to take an h2 GOAWAY, and a
+                // request that still arrives in it is finished.
+                if tokio::time::timeout(Duration::from_millis(250), conn.as_mut()).await.is_err() && served.load(Ordering::Relaxed) {
+                    let _ = conn.await;
+                }
+            }
         }
     }
 }
@@ -981,6 +992,29 @@ mod tests {
         for ip in ["203.0.113.9", "192.168.1.10", "2001:db8::1", "100.64.0.1", "172.16.9.9"] {
             assert!(!internal(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    /// A closing connection with no whole request yet (a stalled client, an unused preconnect)
+    /// closes after its 1 s allowance instead of holding up a reload.
+    #[tokio::test]
+    async fn a_half_sent_request_does_not_hold_a_closing_connection() {
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("tugport-test-{}", crate::util::id()));
+        let paths = crate::paths::Paths { etc: dir.join("etc"), data: dir.join("data"), run: dir.join("run") };
+        std::fs::create_dir_all(&paths.data).unwrap();
+        let db = crate::db::Db::open(&paths.db()).unwrap();
+        let docker = bollard::Docker::connect_with_http("http://127.0.0.1:9", 5, bollard::API_DEFAULT_VERSION).unwrap();
+        let app = App::new(paths, db, crate::crypto::Keyring::new(&[7; 32]), docker, crate::logs::SelfLog::new(dir.join("self")), 1).unwrap();
+        let h2_preconnect: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+        for sent in [&b"GET /slo"[..], b"GET / HTTP/1.1\r\nHost: a.test\r\n", h2_preconnect] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            client.write_all(sent).await.unwrap();
+            let served = serve_conn(app.clone(), TokioIo::new(stream), peer, false, std::future::ready(()));
+            tokio::time::timeout(Duration::from_secs(2), served).await.expect("closed after the allowance");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

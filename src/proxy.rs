@@ -325,6 +325,9 @@ async fn build_table(app: &App) -> Result<Table> {
     // listing shows them. Read after it, a listing taken before the switch (it can take a second)
     // shows the new replicas not yet running, and the route would have none.
     let live: HashMap<&str, Option<String>> = services.keys().map(|id| (id.as_str(), runtime::live_deploy(app, id))).collect();
+    // Likewise a wake-up starts the replicas before it clears `asleep`, so a listing that shows
+    // them stopped started while the service was still asleep.
+    let was_asleep: std::collections::HashSet<&str> = services.keys().map(|id| id.as_str()).filter(|id| crate::sleep::is_asleep(app, id)).collect();
     let replicas = match runtime::all_replicas(app).await {
         Ok(r) => {
             let r = Arc::new(r);
@@ -342,6 +345,8 @@ async fn build_table(app: &App) -> Result<Table> {
             continue;
         }
         let Some(s) = services.get(&d.service_id) else { continue };
+        // Read after the listing (and nothing awaits from here to installing the table): a service
+        // put to sleep since gets no targets, so no request reaches a stopping container.
         let asleep = crate::sleep::is_asleep(app, &s.id);
         let targets_of = |live: Option<&str>| -> Vec<Target> {
             replicas
@@ -364,6 +369,9 @@ async fn build_table(app: &App) -> Result<Table> {
         if targets.is_empty() {
             targets = targets_of(runtime::live_deploy(app, &s.id).as_deref());
         }
+        // Woken during the listing, which may show the replicas still stopped: requests go
+        // through the wake-up, which waits for them to answer, instead of finding no replica.
+        let asleep = asleep || (targets.is_empty() && was_asleep.contains(s.id.as_str()));
         routes.push(RouteSpec {
             host: d.host.clone(),
             path: d.path.clone(),
@@ -1096,9 +1104,9 @@ mod tests {
         assert_eq!(upstream_path(&route("/api", true, Some(("^/v1/(.*)", "/v2/$1"))), "/api/v1/a"), "/v2/a");
     }
 
-    /// The targets of a.test, live on deploy `old`, from a container listing of (deploy, state, ip)
-    /// replicas; with `switch`, deploy `new` goes live while that listing is on its way.
-    async fn targets_during_the_listing(listing: &'static [(&'static str, &'static str, &'static str)], switch: bool) -> Vec<Target> {
+    /// The route of a.test, live on deploy `old` (and asleep with `asleep`), from a container
+    /// listing of (deploy, state, ip) replicas; `during` runs while that listing is on its way.
+    async fn route_during_the_listing(listing: &'static [(&'static str, &'static str, &'static str)], asleep: bool, during: fn(&App)) -> RouteSpec {
         let dir = std::env::temp_dir().join(format!("tugport-test-{}", crate::util::id()));
         let paths = crate::paths::Paths { etc: dir.join("etc"), data: dir.join("data"), run: dir.join("run") };
         std::fs::create_dir_all(&paths.data).unwrap();
@@ -1107,14 +1115,15 @@ mod tests {
         db.exec("INSERT INTO services (id, project_id, name, kind, spec, created_at, updated_at) VALUES ('s', 'p', 'web', 'app', '{}', 0, 0)", []).unwrap();
         db.exec("INSERT INTO domains (id, service_id, host, port, created_at) VALUES ('d', 's', 'a.test', 80, 0)", []).unwrap();
         db.set_state("live:s", "old").unwrap();
+        if asleep {
+            db.set_state("asleep:s", "1").unwrap();
+        }
         let app_cell: Arc<std::sync::OnceLock<AppState>> = Default::default();
         let cell = app_cell.clone();
         let docker_api = axum::Router::new().fallback(move || {
             let cell = cell.clone();
             async move {
-                if switch {
-                    crate::runtime::set_live_deploy(cell.get().unwrap(), "s", "new").unwrap();
-                }
+                during(cell.get().unwrap());
                 let containers: Vec<_> = listing
                     .iter()
                     .map(|(deploy, state, ip)| {
@@ -1137,7 +1146,11 @@ mod tests {
         let _ = app_cell.set(app.clone());
         let table = build_table(&app).await.unwrap();
         let _ = std::fs::remove_dir_all(dir);
-        table.routes.into_iter().find(|r| r.host == "a.test").unwrap().targets
+        table.routes.into_iter().find(|r| r.host == "a.test").unwrap()
+    }
+
+    fn switch(app: &App) {
+        crate::runtime::set_live_deploy(app, "s", "new").unwrap();
     }
 
     /// A switch while a slow listing is on its way never leaves the route with no replica.
@@ -1145,10 +1158,27 @@ mod tests {
     async fn a_switch_during_the_listing_keeps_a_replica() {
         let target = |ip: &str| vec![Target { node: "local".into(), addr: format!("{ip}:80").parse().unwrap() }];
         // start_first: the listing predates the new replica's start; the old one keeps serving.
-        assert_eq!(targets_during_the_listing(&[("new", "created", ""), ("old", "running", "172.20.0.2")], true).await, target("172.20.0.2"));
+        assert_eq!(route_during_the_listing(&[("new", "created", ""), ("old", "running", "172.20.0.2")], false, switch).await.targets, target("172.20.0.2"));
         // stop_first: the old version is already stopped; the new one serves as soon as it is live.
-        assert_eq!(targets_during_the_listing(&[("new", "running", "172.20.0.3"), ("old", "exited", "")], true).await, target("172.20.0.3"));
+        assert_eq!(route_during_the_listing(&[("new", "running", "172.20.0.3"), ("old", "exited", "")], false, switch).await.targets, target("172.20.0.3"));
         // ...but not while its health is still being checked.
-        assert_eq!(targets_during_the_listing(&[("new", "running", "172.20.0.3"), ("old", "exited", "")], false).await, vec![]);
+        assert_eq!(route_during_the_listing(&[("new", "running", "172.20.0.3"), ("old", "exited", "")], false, |_| {}).await.targets, vec![]);
+    }
+
+    /// A wake-up or a sleep while a slow listing is on its way: requests never find a route with no
+    /// replica that is not asleep, and never reach a replica that is stopping.
+    #[tokio::test]
+    async fn sleeping_or_waking_during_the_listing() {
+        let wake = |app: &App| app.db.del_state("asleep:s").unwrap();
+        let sleep = |app: &App| app.db.set_state("asleep:s", "1").unwrap();
+        // Woken: the listing predates the start, so requests go through the wake-up.
+        let r = route_during_the_listing(&[("old", "exited", "")], true, wake).await;
+        assert_eq!((r.targets, r.asleep), (vec![], true));
+        // ...or it shows the replica running already.
+        let r = route_during_the_listing(&[("old", "running", "172.20.0.2")], true, wake).await;
+        assert_eq!(r.targets.len(), 1);
+        // Put to sleep: the replica the listing shows running is about to stop.
+        let r = route_during_the_listing(&[("old", "running", "172.20.0.2")], false, sleep).await;
+        assert_eq!((r.targets, r.asleep), (vec![], true));
     }
 }

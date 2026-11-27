@@ -40,6 +40,10 @@ pub async fn deploy(State(app): State<AppState>, a: Auth, Path(id): Path<String>
     let b = body.map(|b| b.0).unwrap_or_default();
     let s = service_or_404(&app, &a, &id, Role::Deployer)?;
     check_ref(b.git_ref.as_deref())?;
+    // This process execs before the deploy starts, which would cut off the wait.
+    if b.wait && crate::handoff::draining() {
+        return Err(ApiError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "Tugport is restarting; try again in a few seconds"));
+    }
     let mut events = app.events.subscribe();
     let req = Request { trigger: trigger_for(&a).into(), actor: Some(a.0.name.clone()), git_ref: b.git_ref, no_cache: b.no_cache, ..Default::default() };
     let did = deploy::enqueue(&app, &s, req)?;
@@ -48,7 +52,7 @@ pub async fn deploy(State(app): State<AppState>, a: Auth, Path(id): Path<String>
         return Ok(Json(json!({ "deploy_id": did, "status": "queued" })));
     }
     let timeout = Duration::from_secs(b.timeout_s.unwrap_or(1800).min(7200));
-    let _ = tokio::time::timeout(timeout, async {
+    let finished = tokio::time::timeout(timeout, async {
         loop {
             match events.recv().await {
                 Ok(e) if e.kind == "deploy" && e.data["deploy_id"] == did.as_str() && deploy::FINAL.contains(&e.data["status"].as_str().unwrap_or("")) => break,
@@ -56,8 +60,12 @@ pub async fn deploy(State(app): State<AppState>, a: Auth, Path(id): Path<String>
                 _ => {}
             }
         }
-    })
-    .await;
+    });
+    // A reload that starts meanwhile hands the deploy to the next process: answer with where it stands.
+    tokio::select! {
+        _ = finished => {}
+        _ = crate::handoff::drained() => {}
+    }
     let d = deploy::get(&app, &did)?.ok_or_else(|| ApiError::not_found("deploy vanished"))?;
     let log = deploy::read_log(&app, &did);
     let tail: Vec<String> = log[log.len().saturating_sub(40)..].iter().map(|(_, l)| l.clone()).collect();

@@ -171,6 +171,7 @@ Domain `options` contains:
 - **With `no_cache: true`:** the build skips the layer cache and pulls its base images again (BuildKit cache mounts are kept). The panel's "Redeploy without cache" button sends it.
 - **Without `wait`:** returns `{deploy_id, status: "queued"}` straight away.
 - **With `wait: true`:** blocks until the deploy finishes and returns `{deploy, log_tail}`. A deploy finishes once the new version serves; the old one drains (`rollout.drain_s`, start-first services with a domain) and is removed in the background.
+  - **During a reload of Tugport:** it returns 503 "try again in a few seconds". A reload that starts mid-wait makes it return early, with the deploy still `queued` or `building`; the restarted Tugport starts the newest queued deploy of each service.
 
 A deploy record looks like `{id, service_id, status, trigger, actor, ref, commit_sha, commit_message, image, error, created_at, started_at, finished_at, no_cache}`:
 - `status` is `queued`, `building`, `deploying`, `live`, `failed`, `cancelled` or `superseded`.

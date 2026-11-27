@@ -85,7 +85,8 @@ async fn install(app: &AppState, r: Release) -> Result<()> {
     }
     tracing::info!("update to {} downloaded; waiting for running deploys", r.version);
     for _ in 0..600 {
-        if app.deployer.idle() {
+        // A reload draining now execs the binary on disk: install over it and join that handoff.
+        if app.deployer.idle() || crate::handoff::draining() {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

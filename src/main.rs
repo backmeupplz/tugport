@@ -256,6 +256,7 @@ async fn serve() -> Result<()> {
     // Certificates and routes are ready before the first connection (matters after a reload).
     acme::load_stored(&app);
     proxy::initial_routes(&app).await;
+    deploy::resume_queued(&app)?;
     tokio::spawn(proxy::watch(app.clone()));
     tokio::spawn(acme::run(app.clone()));
     tokio::spawn(logs::collect(app.clone()));
@@ -304,9 +305,8 @@ async fn serve() -> Result<()> {
                     && let Ok(l) = handoff::listener("legacy", async { Ok(tokio::net::TcpListener::bind(&legacy).await?) }).await
                 {
                     tracing::info!("also serving deploy webhooks on {legacy}");
-                    let _ = axum::serve(l, api::hooks_router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>())
-                        .with_graceful_shutdown(handoff::DRAIN.notified())
-                        .await;
+                    // Serves until the exec, like the panel: late proxied requests may still come in.
+                    let _ = axum::serve(l, api::hooks_router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>()).await;
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -321,17 +321,8 @@ async fn serve() -> Result<()> {
             tracing::error!("{e:#}");
         }
     }
-    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(async {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = handoff::DRAIN.notified() => {}
-            }
-        })
-        .await?;
-    // The panel stops only for a shutdown or a handoff; give a handoff time to exec.
-    if handoff::draining() {
-        std::future::pending::<()>().await;
-    }
+    // A handoff doesn't stop the panel: the proxy's late connections may still forward to it
+    // until the exec, which closes it.
+    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
     Ok(())
 }

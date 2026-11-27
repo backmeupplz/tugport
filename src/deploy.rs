@@ -27,7 +27,7 @@ impl Deployer {
         util::lock(&self.queues).is_empty()
     }
 
-    /// A deploy of this service is running or waiting.
+    /// A deploy of this service is running or waiting (while a reload drains, for the next process).
     pub fn busy(&self, service_id: &str) -> bool {
         util::lock(&self.queues).contains_key(service_id)
     }
@@ -144,8 +144,11 @@ pub fn enqueue(app: &AppState, s: &Service, req: Request) -> Result<String> {
     let policy = s.spec.deploy_policy.unwrap_or(app.settings().deploy_policy);
     let mut queues = util::lock(&app.deployer.queues);
     let q = queues.entry(s.id.clone()).or_default();
-    if let Some((running, token)) = &q.running {
-        if policy == DeployPolicy::Cancel {
+    // While a reload drains, deploys wait for the next process: the exec would cut them off.
+    if q.running.is_some() || crate::handoff::draining() {
+        if let Some((running, token)) = &q.running
+            && policy == DeployPolicy::Cancel
+        {
             tracing::info!("deploy {id} cancels running deploy {running}");
             token.cancel();
         }
@@ -193,6 +196,21 @@ pub fn cancel_all(app: &App, service_id: &str) {
 
 async fn worker(app: AppState, service_id: String, mut deploy_id: String, mut token: CancellationToken) {
     loop {
+        // A reload's exec would cut the deploy off: it stays queued (and waiting, so the service
+        // counts as busy and it can be cancelled) for the next process.
+        if crate::handoff::draining() {
+            let mut queues = util::lock(&app.deployer.queues);
+            let q = queues.entry(service_id).or_default();
+            q.running = None;
+            if token.is_cancelled() {
+                set_status(&app, &deploy_id, "cancelled", None);
+            } else if q.waiting.is_some() {
+                set_status(&app, &deploy_id, "superseded", Some("a newer deploy was queued"));
+            } else {
+                q.waiting = Some(deploy_id);
+            }
+            return;
+        }
         run(&app, &service_id, &deploy_id, token.clone()).await;
         let mut queues = util::lock(&app.deployer.queues);
         let q = queues.entry(service_id.clone()).or_default();
@@ -535,12 +553,33 @@ pub fn previous_images(app: &App, service_id: &str, limit: u32) -> Result<Vec<(S
     )?)
 }
 
-/// Deploys left mid-way by a crash or restart: mark them failed.
+/// Deploys left mid-way by a crash or restart: mark them failed. Queued ones never started
+/// (a reload queues the deploys asked for while it drains): all but the newest per service are
+/// superseded, and `resume_queued` starts that one.
 pub fn recover_interrupted(app: &App) -> Result<()> {
     app.db.exec(
-        "UPDATE deploys SET status = 'failed', error = 'Tugport restarted during this deploy', finished_at = ?1 WHERE status IN ('queued', 'building', 'deploying')",
+        "UPDATE deploys SET status = 'failed', error = 'Tugport restarted during this deploy', finished_at = ?1 WHERE status IN ('building', 'deploying')",
         [util::now()],
     )?;
+    let queued: Vec<(String, String)> =
+        app.db.rows("SELECT id, service_id FROM deploys WHERE status = 'queued' ORDER BY created_at, rowid", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut newest = HashMap::new();
+    for (id, service_id) in queued {
+        if let Some(old) = newest.insert(service_id, id) {
+            set_status(app, &old, "superseded", Some("a newer deploy was queued"));
+        }
+    }
+    Ok(())
+}
+
+/// Start the deploys `recover_interrupted` kept queued, once secrets and routes are restored.
+pub fn resume_queued(app: &AppState) -> Result<()> {
+    let queued: Vec<(String, String)> = app.db.rows("SELECT id, service_id FROM deploys WHERE status = 'queued'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    for (id, service_id) in queued {
+        let token = CancellationToken::new();
+        util::lock(&app.deployer.queues).insert(service_id.clone(), Queue { running: Some((id.clone(), token.clone())), waiting: None });
+        tokio::spawn(worker(app.clone(), service_id, id, token));
+    }
     Ok(())
 }
 
@@ -559,5 +598,35 @@ mod tests {
         d.commit_sha = Some("ééééé".into());
         d.commit_message = None;
         assert_eq!(summary(&d), "ééééé");
+    }
+
+    #[tokio::test]
+    async fn a_restart_fails_cut_deploys_and_keeps_the_newest_queued_one() {
+        let dir = std::env::temp_dir().join(format!("tugport-test-{}", util::id()));
+        let paths = crate::paths::Paths { etc: dir.join("etc"), data: dir.join("data"), run: dir.join("run") };
+        std::fs::create_dir_all(&paths.data).unwrap();
+        let db = crate::db::Db::open(&paths.db()).unwrap();
+        let selflog = crate::logs::SelfLog::new(dir.join("self"));
+        let docker = bollard::Docker::connect_with_custom_transport(
+            |_: bollard::BollardRequest| async { Err(bollard::errors::Error::RequestTimeoutError) },
+            Some("http://127.0.0.1:1"),
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let app = crate::app::App::new(paths, db, crate::crypto::Keyring::new(&[7; 32]), docker, selflog, 1).unwrap();
+        app.db.exec("INSERT INTO projects (id, name, created_at) VALUES ('p', 'shop', 0)", []).unwrap();
+        app.db.exec("INSERT INTO services (id, project_id, name, kind, spec, created_at, updated_at) VALUES ('s', 'p', 'web', 'app', '{}', 0, 0)", []).unwrap();
+        for (id, status, at) in [("cut", "building", 1), ("older", "queued", 2), ("newest", "queued", 3)] {
+            app.db
+                .exec("INSERT INTO deploys (id, service_id, status, trigger, created_at) VALUES (?1, 's', ?2, 'push', ?3)", params![id, status, at])
+                .unwrap();
+        }
+        recover_interrupted(&app).unwrap();
+        resume_queued(&app).unwrap();
+        let status = |id: &str| get(&app, id).unwrap().unwrap().status;
+        assert_eq!(status("cut"), "failed");
+        assert_eq!(status("older"), "superseded");
+        assert!(util::lock(&app.deployer.queues).contains_key("s"), "the newest queued deploy starts");
     }
 }

@@ -472,34 +472,26 @@ pub async fn serve(app: AppState, http_port: u16, https_port: u16) -> Result<()>
     tracing::info!("proxy listening on :{http_port} and :{https_port}");
     app.proxy.listening.store(true, Ordering::Relaxed);
     let a = app.clone();
-    tokio::spawn(accept(http, move |stream, peer| {
-        tokio::spawn(serve_conn(a.clone(), TokioIo::new(stream), peer, false));
+    // Counted from the accept, so a reload also waits for TLS handshakes in progress.
+    tokio::spawn(crate::handoff::accept(http, move |stream, peer| {
+        tokio::spawn(serve_conn(a.clone(), TokioIo::new(stream), peer, false, crate::handoff::ConnGuard::new()));
     }));
-    accept(https, |stream, peer| {
-        let (app, tls) = (app.clone(), tls.clone());
+    crate::handoff::accept(https, |stream, peer| {
+        let (app, tls, guard) = (app.clone(), tls.clone(), crate::handoff::ConnGuard::new());
         tokio::spawn(async move {
-            if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
-                serve_conn(app, TokioIo::new(s), peer, true).await
+            // Once accepting stops, a handshake gets the same moment as a first request, so a
+            // client that never sends its hello can't hold up the exec.
+            let handshake = tokio::select! {
+                r = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)) => r,
+                _ = async { crate::handoff::stopped().await; tokio::time::sleep(Duration::from_secs(1)).await } => return,
+            };
+            if let Ok(Ok(s)) = handshake {
+                serve_conn(app, TokioIo::new(s), peer, true, guard).await
             }
         });
     })
     .await;
     Ok(())
-}
-
-/// Hand each connection to `on` until the process hands its listeners over.
-async fn accept(listener: tokio::net::TcpListener, on: impl Fn(tokio::net::TcpStream, SocketAddr)) {
-    while !crate::handoff::draining() {
-        let accepted = tokio::select! {
-            r = listener.accept() => r,
-            _ = crate::handoff::DRAIN.notified() => break,
-        };
-        match accepted {
-            Ok((stream, peer)) => on(stream, peer),
-            // Out of file descriptors, say: back off instead of spinning.
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
-    }
 }
 
 /// Bind, waiting while another proxy (Traefik during a migration) still holds the port.
@@ -525,14 +517,16 @@ async fn bind(port: u16) -> Result<tokio::net::TcpListener> {
     }
 }
 
-async fn serve_conn<I>(app: AppState, io: TokioIo<I>, peer: SocketAddr, tls: bool)
+async fn serve_conn<I>(app: AppState, io: TokioIo<I>, peer: SocketAddr, tls: bool, guard: crate::handoff::ConnGuard)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let _guard = crate::handoff::ConnGuard::new();
     // Dual-stack listeners see IPv4 clients as ::ffff:a.b.c.d; trust checks need a.b.c.d.
     let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+    let served = Arc::new(AtomicBool::new(false));
+    let first = served.clone();
     let svc = hyper::service::service_fn(move |req| {
+        first.store(true, Ordering::Relaxed);
         let app = app.clone();
         async move { Ok::<_, std::convert::Infallible>(handle(app, req, peer, tls).await) }
     });
@@ -541,7 +535,18 @@ where
     tokio::pin!(conn);
     tokio::select! {
         _ = conn.as_mut() => {}
-        _ = crate::handoff::DRAIN.notified() => {
+        _ = guard.closing() => {
+            // Shutting down before the first request arrives closes the connection unanswered,
+            // so a new one gets a moment to send it.
+            let first_request = async {
+                while !served.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                _ = tokio::time::timeout(Duration::from_secs(1), first_request) => {}
+            }
             // Finish the requests in flight, then close (keep-alive ends here).
             conn.as_mut().graceful_shutdown();
             let _ = conn.await;
